@@ -313,10 +313,22 @@ body {
     line-height: 1.3;
 }
 
+.service-card .service-details {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
 .service-card .price {
     color: var(--primary-color);
     font-weight: 600;
     font-size: 1rem;
+}
+
+.service-card .labor-hours {
+    color: var(--text-secondary);
+    font-size: 0.875rem;
 }
 
 .no-results {

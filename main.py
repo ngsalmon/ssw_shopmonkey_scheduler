@@ -1,18 +1,22 @@
 """FastAPI application for Shopmonkey scheduling APIs."""
 
-import logging
+import asyncio
 import os
+import re
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Annotated, Any
 
+import structlog
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 from availability import (
     calculate_available_slots,
@@ -20,24 +24,152 @@ from availability import (
     get_service_duration_minutes,
     is_slot_available,
     load_config,
+    validate_config,
 )
 from sheets_client import SheetsClient
-from shopmonkey_client import ShopmonkeyClient
+from shopmonkey_client import ShopmonkeyClient, ShopmonkeyAPIError
 
 # Load environment variables
 load_dotenv()
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
+# Configure structlog for JSON output in production
+def configure_logging():
+    """Configure structured logging with JSON output."""
+    processors = [
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+    ]
+
+    # Use JSON in production, pretty console output in development
+    if os.getenv("ENVIRONMENT", "development") == "production":
+        processors.append(structlog.processors.JSONRenderer())
+    else:
+        processors.append(structlog.dev.ConsoleRenderer())
+
+    structlog.configure(
+        processors=processors,
+        wrapper_class=structlog.make_filtering_bound_logger(
+            int(os.getenv("LOG_LEVEL", "20"))  # INFO = 20
+        ),
+        context_class=dict,
+        logger_factory=structlog.PrintLoggerFactory(),
+        cache_logger_on_first_use=True,
+    )
+
+
+configure_logging()
+logger = structlog.get_logger(__name__)
 
 # Global instances
 shopmonkey_client: ShopmonkeyClient | None = None
 sheets_client: SheetsClient | None = None
 config: dict[str, Any] = {}
+
+# Booking lock to prevent race conditions (in-process only)
+# NOTE: For multi-instance deployments, use a distributed lock (e.g., Redis)
+booking_lock = asyncio.Lock()
+
+# Round-robin tracker for tech assignment within same priority level
+# Key: department name, Value: index of last assigned tech within that priority group
+# NOTE: Resets on server restart. For persistence, use Redis or database.
+round_robin_tracker: dict[str, dict[int, int]] = {}
+
+
+def select_tech_by_priority(
+    qualified_techs: list[dict],
+    available_tech_ids: list[str],
+    department: str,
+) -> str | None:
+    """
+    Select a technician based on priority and round-robin within same priority.
+
+    Args:
+        qualified_techs: List of {tech_id, tech_name, priority} sorted by priority
+        available_tech_ids: List of tech IDs that are available for the slot
+        department: Department name for round-robin tracking
+
+    Returns:
+        Selected tech_id, or None if no techs available
+    """
+    # Filter to only available techs, preserving priority order
+    available_techs = [t for t in qualified_techs if t["tech_id"] in available_tech_ids]
+
+    if not available_techs:
+        return None
+
+    # Find the highest priority (lowest number) among available techs
+    highest_priority = available_techs[0]["priority"]
+
+    # Get all techs at that priority level
+    same_priority_techs = [t for t in available_techs if t["priority"] == highest_priority]
+
+    if len(same_priority_techs) == 1:
+        # Only one tech at this priority, no round-robin needed
+        return same_priority_techs[0]["tech_id"]
+
+    # Round-robin among techs with same priority
+    if department not in round_robin_tracker:
+        round_robin_tracker[department] = {}
+
+    dept_tracker = round_robin_tracker[department]
+    last_index = dept_tracker.get(highest_priority, -1)
+
+    # Find next tech in rotation
+    next_index = (last_index + 1) % len(same_priority_techs)
+    selected_tech = same_priority_techs[next_index]
+
+    # Update tracker
+    dept_tracker[highest_priority] = next_index
+
+    logger.debug(
+        "tech_selected_by_priority",
+        department=department,
+        priority=highest_priority,
+        selected_tech=selected_tech["tech_name"],
+        round_robin_index=next_index,
+    )
+
+    return selected_tech["tech_id"]
+
+
+# API Key authentication
+API_KEY = os.getenv("API_KEY")
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def verify_api_key(api_key: str | None = Security(api_key_header)) -> str | None:
+    """
+    Verify API key if one is configured.
+
+    If API_KEY is not set in environment, authentication is disabled (backwards compatible).
+    If API_KEY is set, requests must include a valid X-API-Key header.
+    """
+    if not API_KEY:
+        # No API key configured - authentication disabled
+        return None
+
+    if not api_key:
+        logger.warning("api_key_missing")
+        raise HTTPException(
+            status_code=401,
+            detail="API key required. Include X-API-Key header.",
+        )
+
+    if api_key != API_KEY:
+        logger.warning("api_key_invalid")
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key",
+        )
+
+    return api_key
+
+
+# Type alias for authenticated endpoints
+ApiKeyDep = Annotated[str | None, Depends(verify_api_key)]
 
 
 @asynccontextmanager
@@ -45,25 +177,37 @@ async def lifespan(app: FastAPI):
     """Initialize and cleanup resources."""
     global shopmonkey_client, sheets_client, config
 
-    logger.info("Starting Shopmonkey Scheduling API")
+    logger.info("application_starting")
 
-    # Load configuration
+    # Load and validate configuration
     config_path = os.getenv("CONFIG_PATH", "config.yaml")
-    config = load_config(config_path)
-    logger.info("Loaded configuration from %s", config_path)
+    try:
+        config = load_config(config_path)
+        validate_config(config)
+        logger.info("config_loaded", config_path=config_path)
+    except FileNotFoundError:
+        logger.error("config_file_not_found", config_path=config_path)
+        raise RuntimeError(f"Configuration file not found: {config_path}")
+    except ValueError as e:
+        logger.error("config_validation_failed", error=str(e))
+        raise RuntimeError(f"Invalid configuration: {e}")
 
     # Initialize clients
-    shopmonkey_client = ShopmonkeyClient()
-    sheets_client = SheetsClient()
-    logger.info("Initialized Shopmonkey and Sheets clients")
+    try:
+        shopmonkey_client = ShopmonkeyClient()
+        sheets_client = SheetsClient()
+        logger.info("clients_initialized")
+    except ValueError as e:
+        logger.error("client_initialization_failed", error=str(e))
+        raise RuntimeError(f"Failed to initialize clients: {e}")
 
     yield
 
     # Cleanup
-    logger.info("Shutting down Shopmonkey Scheduling API")
+    logger.info("application_shutting_down")
     if shopmonkey_client:
         await shopmonkey_client.close()
-        logger.debug("Closed Shopmonkey client")
+        logger.debug("shopmonkey_client_closed")
 
 
 app = FastAPI(
@@ -73,14 +217,62 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS middleware for embedded widget support
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Configure specific origins in production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+# CORS middleware configuration
+def get_cors_origins() -> list[str]:
+    """Get allowed CORS origins from environment."""
+    origins_str = os.getenv("ALLOWED_ORIGINS", "")
+    if not origins_str:
+        return []
+    if origins_str == "*":
+        return ["*"]
+    return [origin.strip() for origin in origins_str.split(",") if origin.strip()]
+
+
+allowed_origins = get_cors_origins()
+if allowed_origins:
+    # Only add CORS middleware if origins are configured
+    cors_config = {
+        "allow_origins": allowed_origins,
+        "allow_methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["*"],
+    }
+    # Don't allow credentials with wildcard origins (security issue)
+    if allowed_origins != ["*"]:
+        cors_config["allow_credentials"] = True
+
+    app.add_middleware(CORSMiddleware, **cors_config)
+    logger.info("cors_configured", origins=allowed_origins)
+else:
+    logger.info("cors_disabled", reason="ALLOWED_ORIGINS not set")
+
+
+# Request logging middleware
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    """Log all HTTP requests with timing and request ID."""
+    request_id = str(uuid.uuid4())[:8]
+    start_time = time.monotonic()
+
+    # Bind request_id to structlog context
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(request_id=request_id)
+
+    # Add request_id to response headers
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+
+    elapsed_ms = (time.monotonic() - start_time) * 1000
+    logger.info(
+        "http_request",
+        method=request.method,
+        path=request.url.path,
+        status_code=response.status_code,
+        elapsed_ms=round(elapsed_ms, 2),
+    )
+
+    return response
+
 
 # Mount static files directory
 static_dir = os.path.join(os.path.dirname(__file__), "static")
@@ -95,6 +287,7 @@ class ServiceResponse(BaseModel):
     totalCents: int | None = None
     bookable: bool = True
     category: str | None = None
+    laborHours: float | None = None
 
 
 class ServicesListResponse(BaseModel):
@@ -116,21 +309,32 @@ class AvailabilityResponse(BaseModel):
 
 
 class CustomerInfo(BaseModel):
-    firstName: str
-    lastName: str
+    firstName: str = Field(..., min_length=1, max_length=100)
+    lastName: str = Field(..., min_length=1, max_length=100)
     email: EmailStr | None = None
-    phone: str | None = None
+    phone: str | None = Field(None, max_length=20)
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        # Remove common formatting characters and validate
+        cleaned = re.sub(r"[\s\-\(\)\.]", "", v)
+        if cleaned and not re.match(r"^\+?\d{7,15}$", cleaned):
+            raise ValueError("Invalid phone number format")
+        return v
 
 
 class VehicleInfo(BaseModel):
     year: int = Field(..., ge=1900, le=2100)
-    make: str
-    model: str
-    vin: str | None = None
+    make: str = Field(..., min_length=1, max_length=50)
+    model: str = Field(..., min_length=1, max_length=50)
+    vin: str | None = Field(None, max_length=17)
 
 
 class BookingRequest(BaseModel):
-    service_id: str
+    service_id: str = Field(..., max_length=100)
     slot_start: str  # ISO format: 2026-01-20T09:00:00
     slot_end: str  # ISO format: 2026-01-20T10:00:00
     customer: CustomerInfo
@@ -141,6 +345,17 @@ class BookingResponse(BaseModel):
     success: bool
     appointment_id: str
     confirmation_number: str
+
+
+class HealthResponse(BaseModel):
+    status: str
+
+
+class ReadinessResponse(BaseModel):
+    status: str
+    shopmonkey: str
+    sheets: str
+    sheets_cache: dict | None = None
 
 
 # Label to Tech/Dept column mapping
@@ -166,29 +381,109 @@ def get_department_from_service(service: dict[str, Any]) -> str | None:
     return LABEL_TO_DEPARTMENT.get(label_name, label_name)
 
 
+async def get_qualified_techs_for_service(
+    service_id: str,
+) -> tuple[dict[str, Any], str, list[dict[str, str]]]:
+    """
+    Get service details and qualified technicians.
+
+    This is a helper that consolidates the common logic used by both
+    /availability and /book endpoints.
+
+    Args:
+        service_id: The Shopmonkey service ID
+
+    Returns:
+        Tuple of (service, department, qualified_techs)
+
+    Raises:
+        HTTPException: On various error conditions (404, 500)
+    """
+    if not shopmonkey_client or not sheets_client:
+        logger.error("clients_not_initialized")
+        raise HTTPException(status_code=500, detail="Service temporarily unavailable")
+
+    # Get the service from Shopmonkey
+    try:
+        service = await shopmonkey_client.get_canned_service(service_id)
+    except ShopmonkeyAPIError as e:
+        logger.error("shopmonkey_api_error", service_id=service_id, error=str(e))
+        raise HTTPException(status_code=502, detail="Unable to reach scheduling service")
+
+    if not service:
+        logger.warning("service_not_found", service_id=service_id)
+        raise HTTPException(
+            status_code=404,
+            detail=f"Service not found",
+        )
+
+    service_name = service.get("name", "")
+    logger.debug("service_found", service_id=service_id, service_name=service_name)
+
+    # Get department from Shopmonkey service label
+    department = get_department_from_service(service)
+    if not department:
+        logger.warning("service_no_department", service_id=service_id, service_name=service_name)
+        raise HTTPException(
+            status_code=404,
+            detail=f"Service configuration incomplete",
+        )
+
+    logger.debug("department_resolved", department=department)
+
+    # Get qualified technicians for this department
+    try:
+        qualified_techs = await sheets_client.get_techs_for_department(department)
+    except Exception as e:
+        logger.error("sheets_api_error", department=department, error=str(e))
+        raise HTTPException(status_code=502, detail="Unable to reach scheduling service")
+
+    if not qualified_techs:
+        logger.warning("no_techs_for_department", department=department)
+        raise HTTPException(
+            status_code=404,
+            detail=f"No availability for this service",
+        )
+
+    logger.debug(
+        "qualified_techs_found",
+        department=department,
+        tech_count=len(qualified_techs),
+    )
+
+    return service, department, qualified_techs
+
+
 # API Endpoints
 @app.get("/services", response_model=ServicesListResponse)
-async def list_services():
+async def list_services(_: ApiKeyDep):
     """
     List all bookable canned services from Shopmonkey.
 
     Returns a list of services that are marked as bookable, including
     their ID, name, and pricing information.
     """
-    logger.debug("Fetching bookable services")
+    logger.debug("fetching_bookable_services")
     if not shopmonkey_client:
-        logger.error("Shopmonkey client not initialized")
-        raise HTTPException(status_code=500, detail="Shopmonkey client not initialized")
+        logger.error("shopmonkey_client_not_initialized")
+        raise HTTPException(status_code=500, detail="Service temporarily unavailable")
 
     try:
         services = await shopmonkey_client.get_bookable_canned_services()
-        logger.info("Retrieved %d bookable services", len(services))
+        logger.info("services_fetched", count=len(services))
 
         def get_category(svc: dict) -> str | None:
             labels = svc.get("labels", [])
             if labels and labels[0].get("name"):
                 return labels[0].get("name")
             return None
+
+        def get_labor_hours(svc: dict) -> float | None:
+            labors = svc.get("labors", [])
+            if not labors:
+                return None
+            total_hours = sum(labor.get("hours", 0) for labor in labors)
+            return round(total_hours, 1) if total_hours > 0 else None
 
         return ServicesListResponse(
             services=[
@@ -198,17 +493,22 @@ async def list_services():
                     totalCents=svc.get("totalCents") or svc.get("priceCents"),
                     bookable=True,
                     category=get_category(svc),
+                    laborHours=get_labor_hours(svc),
                 )
                 for svc in services
             ]
         )
+    except ShopmonkeyAPIError as e:
+        logger.error("shopmonkey_api_error", error=str(e))
+        raise HTTPException(status_code=502, detail="Unable to reach scheduling service")
     except Exception as e:
-        logger.exception("Error fetching services")
-        raise HTTPException(status_code=500, detail=f"Error fetching services: {str(e)}")
+        logger.exception("unexpected_error_fetching_services")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred")
 
 
 @app.get("/availability", response_model=AvailabilityResponse)
 async def get_availability(
+    _: ApiKeyDep,
     service_id: str = Query(..., description="The ID of the service to check availability for"),
     date: str = Query(..., description="Date in YYYY-MM-DD format"),
 ):
@@ -221,66 +521,31 @@ async def get_availability(
     3. Checks existing Shopmonkey appointments for those techs
     4. Returns available time slots where at least one tech is free
     """
-    logger.debug("Checking availability for service_id=%s, date=%s", service_id, date)
-    if not shopmonkey_client or not sheets_client:
-        logger.error("Clients not initialized")
-        raise HTTPException(status_code=500, detail="Clients not initialized")
+    logger.debug("checking_availability", service_id=service_id, date=date)
 
     # Parse and validate date
     try:
         target_date = datetime.strptime(date, "%Y-%m-%d")
     except ValueError:
-        logger.warning("Invalid date format: %s", date)
+        logger.warning("invalid_date_format", date=date)
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
 
     try:
-        # First, get the service from Shopmonkey to get its name
-        service = await shopmonkey_client.get_canned_service(service_id)
-        if not service:
-            logger.warning("Service not found: %s", service_id)
-            raise HTTPException(
-                status_code=404,
-                detail=f"Service {service_id} not found in Shopmonkey",
-            )
-
-        service_name = service.get("name", "")
-        logger.debug("Found service: %s", service_name)
-
-        # Get department from Shopmonkey service label
-        department = get_department_from_service(service)
-        if not department:
-            logger.warning("Service '%s' has no department label", service_name)
-            raise HTTPException(
-                status_code=404,
-                detail=f"Service '{service_name}' has no department label in Shopmonkey",
-            )
-
-        logger.debug("Department for service: %s", department)
-
-        # Get qualified technicians for this department
-        qualified_techs = sheets_client.get_techs_for_department(department)
-        if not qualified_techs:
-            logger.warning("No technicians found for department: %s", department)
-            raise HTTPException(
-                status_code=404,
-                detail=f"No technicians found for department: {department}",
-            )
-
+        # Get service and qualified techs using shared helper
+        service, department, qualified_techs = await get_qualified_techs_for_service(service_id)
         tech_ids = [t["tech_id"] for t in qualified_techs]
-        logger.debug("Found %d qualified techs: %s", len(tech_ids), [t["tech_name"] for t in qualified_techs])
 
         # Get existing appointments for the date
         appointments = await shopmonkey_client.get_appointments_for_date(date, tech_ids)
-        logger.debug("Found %d existing appointments for date", len(appointments))
+        logger.debug("existing_appointments_fetched", count=len(appointments))
 
         # Get service duration
         slot_duration = get_service_duration_minutes(service, config.get("default_slot_duration_minutes", 60))
-        logger.debug("Service duration: %d minutes", slot_duration)
+        logger.debug("service_duration", minutes=slot_duration)
 
         # For multi-day services, fetch appointments for upcoming days
         future_appointments: dict[str, list] = {}
         if slot_duration > 300:  # Only fetch future days for services > 5 hours
-            # Fetch up to 5 future business days
             check_date = target_date
             for _ in range(5):
                 check_date = check_date + timedelta(days=1)
@@ -290,8 +555,9 @@ async def get_availability(
                         date_str, tech_ids
                     )
                     future_appointments[date_str] = future_appts
-                except Exception:
-                    pass  # Continue even if future date fetch fails
+                except ShopmonkeyAPIError:
+                    logger.warning("future_appointments_fetch_failed", date=date_str)
+                    # Continue even if future date fetch fails
 
         # Calculate available slots
         available_slots = calculate_available_slots(
@@ -308,8 +574,12 @@ async def get_availability(
         close_time = business_hours.close_time.strftime("%H:%M") if business_hours.is_open else "18:00"
 
         logger.info(
-            "Availability check: service=%s, date=%s, department=%s, duration=%d min, slots=%d",
-            service_name, date, department, slot_duration, len(available_slots)
+            "availability_checked",
+            service_id=service_id,
+            date=date,
+            department=department,
+            duration_minutes=slot_duration,
+            slot_count=len(available_slots),
         )
 
         return AvailabilityResponse(
@@ -330,12 +600,12 @@ async def get_availability(
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("Error checking availability for service %s", service_id)
-        raise HTTPException(status_code=500, detail=f"Error checking availability: {str(e)}")
+        logger.exception("unexpected_error_checking_availability", service_id=service_id)
+        raise HTTPException(status_code=500, detail="An unexpected error occurred")
 
 
 @app.post("/book", response_model=BookingResponse)
-async def book_appointment(request: BookingRequest):
+async def book_appointment(_: ApiKeyDep, request: BookingRequest):
     """
     Book an appointment for a service at a specific time slot.
 
@@ -346,133 +616,131 @@ async def book_appointment(request: BookingRequest):
     4. Creates the appointment in Shopmonkey
     """
     logger.info(
-        "Booking request: service=%s, slot=%s to %s, customer=%s %s",
-        request.service_id, request.slot_start, request.slot_end,
-        request.customer.firstName, request.customer.lastName
+        "booking_requested",
+        service_id=request.service_id,
+        slot_start=request.slot_start,
+        slot_end=request.slot_end,
+        customer_name=f"{request.customer.firstName} {request.customer.lastName}",
     )
+
     if not shopmonkey_client or not sheets_client:
-        logger.error("Clients not initialized")
-        raise HTTPException(status_code=500, detail="Clients not initialized")
+        logger.error("clients_not_initialized")
+        raise HTTPException(status_code=500, detail="Service temporarily unavailable")
 
-    try:
-        # Parse slot times
-        slot_start_dt = datetime.fromisoformat(request.slot_start.replace("Z", "+00:00"))
-        slot_end_dt = datetime.fromisoformat(request.slot_end.replace("Z", "+00:00"))
-        date_str = slot_start_dt.strftime("%Y-%m-%d")
+    # Use lock to prevent race conditions during booking
+    # NOTE: This only works for single-instance deployments.
+    # For multi-instance, use a distributed lock (e.g., Redis).
+    async with booking_lock:
+        try:
+            # Parse slot times
+            slot_start_dt = datetime.fromisoformat(request.slot_start.replace("Z", "+00:00"))
+            slot_end_dt = datetime.fromisoformat(request.slot_end.replace("Z", "+00:00"))
+            date_str = slot_start_dt.strftime("%Y-%m-%d")
 
-        # First, get the service from Shopmonkey to get its name
-        service = await shopmonkey_client.get_canned_service(request.service_id)
-        if not service:
-            logger.warning("Service not found: %s", request.service_id)
-            raise HTTPException(
-                status_code=404,
-                detail=f"Service {request.service_id} not found in Shopmonkey",
+            # Get service and qualified techs using shared helper
+            service, department, qualified_techs = await get_qualified_techs_for_service(
+                request.service_id
+            )
+            service_name = service.get("name", "Service")
+            tech_ids = [t["tech_id"] for t in qualified_techs]
+
+            # Re-check availability (inside lock to prevent race conditions)
+            appointments = await shopmonkey_client.get_appointments_for_date(date_str, tech_ids)
+            is_available, available_tech_ids = is_slot_available(
+                date=slot_start_dt,
+                slot_start=slot_start_dt.time(),
+                slot_end=slot_end_dt.time(),
+                tech_ids=tech_ids,
+                appointments=appointments,
             )
 
-        service_name = service.get("name", "Service")
+            if not is_available:
+                logger.warning(
+                    "slot_no_longer_available",
+                    slot_start=request.slot_start,
+                    slot_end=request.slot_end,
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail="The selected time slot is no longer available",
+                )
 
-        # Get department from Shopmonkey service label
-        department = get_department_from_service(service)
-        if not department:
-            logger.warning("Service '%s' has no department label", service_name)
-            raise HTTPException(
-                status_code=404,
-                detail=f"Service '{service_name}' has no department label in Shopmonkey",
+            # Find or create customer
+            logger.debug("creating_customer")
+            customer = await shopmonkey_client.find_or_create_customer(
+                first_name=request.customer.firstName,
+                last_name=request.customer.lastName,
+                email=request.customer.email,
+                phone=request.customer.phone,
+            )
+            customer_id = customer.get("id")
+            if not customer_id:
+                logger.error("customer_creation_failed")
+                raise HTTPException(status_code=500, detail="Unable to process booking")
+            logger.debug("customer_ready", customer_id=customer_id)
+
+            # Find or create vehicle
+            logger.debug("creating_vehicle")
+            vehicle = await shopmonkey_client.find_or_create_vehicle(
+                customer_id=customer_id,
+                year=request.vehicle.year,
+                make=request.vehicle.make,
+                model=request.vehicle.model,
+                vin=request.vehicle.vin,
+            )
+            vehicle_id = vehicle.get("id")
+            if not vehicle_id:
+                logger.error("vehicle_creation_failed")
+                raise HTTPException(status_code=500, detail="Unable to process booking")
+            logger.debug("vehicle_ready", vehicle_id=vehicle_id)
+
+            # Create appointment - assign tech by priority + round-robin
+            assigned_tech_id = select_tech_by_priority(
+                qualified_techs=qualified_techs,
+                available_tech_ids=available_tech_ids,
+                department=department,
+            )
+            logger.debug("creating_appointment", technician_id=assigned_tech_id)
+
+            appointment = await shopmonkey_client.create_appointment(
+                customer_id=customer_id,
+                vehicle_id=vehicle_id,
+                start_date=request.slot_start,
+                end_date=request.slot_end,
+                title=f"Online Booking: {service_name}",
+                notes=f"Service requested: {service_name}\nBooked online via scheduling API.",
+                technician_id=assigned_tech_id,
             )
 
-        qualified_techs = sheets_client.get_techs_for_department(department)
-        if not qualified_techs:
-            logger.warning("No technicians found for department: %s", department)
-            raise HTTPException(
-                status_code=404,
-                detail=f"No technicians found for department: {department}",
+            appointment_id = appointment.get("id", "")
+
+            # Generate confirmation number
+            date_part = slot_start_dt.strftime("%Y%m%d")
+            unique_part = uuid.uuid4().hex[:6].upper()
+            confirmation_number = f"SM-{date_part}-{unique_part}"
+
+            logger.info(
+                "booking_successful",
+                appointment_id=appointment_id,
+                confirmation_number=confirmation_number,
+                service_name=service_name,
+                technician_id=assigned_tech_id,
             )
 
-        tech_ids = [t["tech_id"] for t in qualified_techs]
-
-        # Re-check availability
-        appointments = await shopmonkey_client.get_appointments_for_date(date_str, tech_ids)
-        is_available, available_tech_ids = is_slot_available(
-            date=slot_start_dt,
-            slot_start=slot_start_dt.time(),
-            slot_end=slot_end_dt.time(),
-            tech_ids=tech_ids,
-            appointments=appointments,
-        )
-
-        if not is_available:
-            logger.warning("Slot no longer available: %s to %s", request.slot_start, request.slot_end)
-            raise HTTPException(
-                status_code=409,
-                detail="The selected time slot is no longer available",
+            return BookingResponse(
+                success=True,
+                appointment_id=appointment_id,
+                confirmation_number=confirmation_number,
             )
 
-        # Find or create customer
-        logger.debug("Finding or creating customer: %s %s", request.customer.firstName, request.customer.lastName)
-        customer = await shopmonkey_client.find_or_create_customer(
-            first_name=request.customer.firstName,
-            last_name=request.customer.lastName,
-            email=request.customer.email,
-            phone=request.customer.phone,
-        )
-        customer_id = customer.get("id")
-        if not customer_id:
-            logger.error("Failed to create customer")
-            raise HTTPException(status_code=500, detail="Failed to create customer")
-        logger.debug("Customer ID: %s", customer_id)
-
-        # Find or create vehicle
-        logger.debug("Finding or creating vehicle: %s %s %s", request.vehicle.year, request.vehicle.make, request.vehicle.model)
-        vehicle = await shopmonkey_client.find_or_create_vehicle(
-            customer_id=customer_id,
-            year=request.vehicle.year,
-            make=request.vehicle.make,
-            model=request.vehicle.model,
-            vin=request.vehicle.vin,
-        )
-        vehicle_id = vehicle.get("id")
-        if not vehicle_id:
-            logger.error("Failed to create vehicle")
-            raise HTTPException(status_code=500, detail="Failed to create vehicle")
-        logger.debug("Vehicle ID: %s", vehicle_id)
-
-        # Create appointment - assign to first available tech
-        assigned_tech_id = available_tech_ids[0] if available_tech_ids else None
-        logger.debug("Assigning to technician: %s", assigned_tech_id)
-
-        appointment = await shopmonkey_client.create_appointment(
-            customer_id=customer_id,
-            vehicle_id=vehicle_id,
-            start_date=request.slot_start,
-            end_date=request.slot_end,
-            title=f"Online Booking: {service_name}",
-            notes=f"Service requested: {service_name}\nService ID: {request.service_id}\nBooked online via scheduling API.",
-            technician_id=assigned_tech_id,
-        )
-
-        appointment_id = appointment.get("id", "")
-
-        # Generate confirmation number
-        date_part = slot_start_dt.strftime("%Y%m%d")
-        unique_part = uuid.uuid4().hex[:6].upper()
-        confirmation_number = f"SM-{date_part}-{unique_part}"
-
-        logger.info(
-            "Booking successful: appointment_id=%s, confirmation=%s, service=%s, tech=%s",
-            appointment_id, confirmation_number, service_name, assigned_tech_id
-        )
-
-        return BookingResponse(
-            success=True,
-            appointment_id=appointment_id,
-            confirmation_number=confirmation_number,
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Error booking appointment for service %s", request.service_id)
-        raise HTTPException(status_code=500, detail=f"Error booking appointment: {str(e)}")
+        except HTTPException:
+            raise
+        except ShopmonkeyAPIError as e:
+            logger.error("shopmonkey_api_error_during_booking", error=str(e))
+            raise HTTPException(status_code=502, detail="Unable to complete booking")
+        except Exception as e:
+            logger.exception("unexpected_error_booking", service_id=request.service_id)
+            raise HTTPException(status_code=500, detail="An unexpected error occurred")
 
 
 @app.get("/schedule")
@@ -484,10 +752,70 @@ async def schedule_page():
     return FileResponse(widget_path, media_type="text/html")
 
 
-@app.get("/health")
+# Health check endpoints
+@app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Health check endpoint for Cloud Run."""
-    return {"status": "healthy"}
+    """
+    Basic liveness probe for Cloud Run / Kubernetes.
+
+    Always returns 200 if the application is running.
+    """
+    return HealthResponse(status="healthy")
+
+
+@app.get("/health/live", response_model=HealthResponse)
+async def liveness_check():
+    """
+    Liveness probe - always returns 200 if the application is running.
+
+    Use this for Kubernetes liveness probes.
+    """
+    return HealthResponse(status="healthy")
+
+
+@app.get("/health/ready", response_model=ReadinessResponse)
+async def readiness_check():
+    """
+    Readiness probe - checks if dependencies are available.
+
+    Use this for Kubernetes readiness probes. Returns 503 if
+    any critical dependency is unavailable.
+    """
+    shopmonkey_status = "unknown"
+    sheets_status = "unknown"
+    sheets_cache = None
+
+    if shopmonkey_client:
+        try:
+            shopmonkey_healthy = await shopmonkey_client.health_check()
+            shopmonkey_status = "healthy" if shopmonkey_healthy else "unhealthy"
+        except Exception:
+            shopmonkey_status = "unhealthy"
+
+    if sheets_client:
+        try:
+            sheets_healthy = await sheets_client.health_check()
+            sheets_status = "healthy" if sheets_healthy else "unhealthy"
+            sheets_cache = sheets_client.get_cache_status()
+        except Exception:
+            sheets_status = "unhealthy"
+
+    overall_status = "healthy" if (shopmonkey_status == "healthy" and sheets_status == "healthy") else "degraded"
+
+    response = ReadinessResponse(
+        status=overall_status,
+        shopmonkey=shopmonkey_status,
+        sheets=sheets_status,
+        sheets_cache=sheets_cache,
+    )
+
+    if overall_status != "healthy":
+        return JSONResponse(
+            status_code=503,
+            content=response.model_dump(),
+        )
+
+    return response
 
 
 if __name__ == "__main__":

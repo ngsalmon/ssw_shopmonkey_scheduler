@@ -2,9 +2,42 @@
 
 import json
 import os
+import time
 from typing import Any
 
 import httpx
+import structlog
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+
+logger = structlog.get_logger(__name__)
+
+
+class ShopmonkeyAPIError(Exception):
+    """Base exception for Shopmonkey API errors."""
+
+    def __init__(self, message: str, status_code: int | None = None, response_body: str | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.response_body = response_body
+
+
+class ShopmonkeyTimeoutError(ShopmonkeyAPIError):
+    """Exception raised when Shopmonkey API request times out."""
+
+    def __init__(self, message: str = "Request to Shopmonkey API timed out"):
+        super().__init__(message)
+
+
+class ShopmonkeyNetworkError(ShopmonkeyAPIError):
+    """Exception raised for network-related errors."""
+
+    def __init__(self, message: str = "Network error communicating with Shopmonkey API"):
+        super().__init__(message)
 
 
 class ShopmonkeyClient:
@@ -15,6 +48,7 @@ class ShopmonkeyClient:
         api_token: str | None = None,
         base_url: str | None = None,
         location_id: str | None = None,
+        timeout: float = 30.0,
     ):
         self.api_token = api_token or os.getenv("SHOPMONKEY_API_TOKEN")
         self.base_url = (
@@ -22,6 +56,7 @@ class ShopmonkeyClient:
             or os.getenv("SHOPMONKEY_API_BASE_URL", "https://api.shopmonkey.cloud")
         ).rstrip("/")
         self.location_id = location_id or os.getenv("SHOPMONKEY_LOCATION_ID")
+        self.timeout = timeout
 
         if not self.api_token:
             raise ValueError("SHOPMONKEY_API_TOKEN is required")
@@ -36,7 +71,7 @@ class ShopmonkeyClient:
                     "Authorization": f"Bearer {self.api_token}",
                     "Content-Type": "application/json",
                 },
-                timeout=30.0,
+                timeout=self.timeout,
             )
         return self._client
 
@@ -45,6 +80,12 @@ class ShopmonkeyClient:
             await self._client.aclose()
             self._client = None
 
+    @retry(
+        retry=retry_if_exception_type((ShopmonkeyTimeoutError, ShopmonkeyNetworkError)),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=4),
+        reraise=True,
+    )
     async def _request(
         self,
         method: str,
@@ -52,15 +93,71 @@ class ShopmonkeyClient:
         params: dict[str, Any] | None = None,
         json_data: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """
+        Make an HTTP request to the Shopmonkey API with retry logic.
+
+        Retries on timeout and network errors with exponential backoff.
+        Does not retry on 4xx client errors.
+        """
         client = await self._get_client()
-        response = await client.request(
+        start_time = time.monotonic()
+
+        log = logger.bind(
             method=method,
-            url=endpoint,
-            params=params,
-            json=json_data,
+            endpoint=endpoint,
+            has_params=params is not None,
+            has_body=json_data is not None,
         )
-        response.raise_for_status()
-        return response.json()
+
+        try:
+            response = await client.request(
+                method=method,
+                url=endpoint,
+                params=params,
+                json=json_data,
+            )
+            elapsed_ms = (time.monotonic() - start_time) * 1000
+
+            log.debug(
+                "shopmonkey_api_request",
+                status_code=response.status_code,
+                elapsed_ms=round(elapsed_ms, 2),
+            )
+
+            response.raise_for_status()
+            return response.json()
+
+        except httpx.TimeoutException as e:
+            elapsed_ms = (time.monotonic() - start_time) * 1000
+            log.warning(
+                "shopmonkey_api_timeout",
+                elapsed_ms=round(elapsed_ms, 2),
+                error=str(e),
+            )
+            raise ShopmonkeyTimeoutError(f"Request to {endpoint} timed out after {self.timeout}s") from e
+
+        except httpx.NetworkError as e:
+            elapsed_ms = (time.monotonic() - start_time) * 1000
+            log.warning(
+                "shopmonkey_api_network_error",
+                elapsed_ms=round(elapsed_ms, 2),
+                error=str(e),
+            )
+            raise ShopmonkeyNetworkError(f"Network error calling {endpoint}: {str(e)}") from e
+
+        except httpx.HTTPStatusError as e:
+            elapsed_ms = (time.monotonic() - start_time) * 1000
+            log.error(
+                "shopmonkey_api_error",
+                status_code=e.response.status_code,
+                elapsed_ms=round(elapsed_ms, 2),
+                response_text=e.response.text[:500] if e.response.text else None,
+            )
+            raise ShopmonkeyAPIError(
+                f"Shopmonkey API error: {e.response.status_code}",
+                status_code=e.response.status_code,
+                response_body=e.response.text,
+            ) from e
 
     async def get_bookable_canned_services(self) -> list[dict[str, Any]]:
         """Fetch all canned services marked as bookable."""
@@ -78,8 +175,8 @@ class ShopmonkeyClient:
         try:
             result = await self._request("GET", f"/v3/canned_service/{service_id}")
             return result.get("data")
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
+        except ShopmonkeyAPIError as e:
+            if e.status_code == 404:
                 return None
             raise
 
@@ -212,6 +309,7 @@ class ShopmonkeyClient:
             "year": year,
             "make": make,
             "model": model,
+            "size": "Medium",  # Required by Shopmonkey API
         }
         if vin:
             vehicle_data["vin"] = vin
@@ -261,3 +359,16 @@ class ShopmonkeyClient:
 
         result = await self._request("GET", "/v3/user", params=params if params else None)
         return result.get("data", [])
+
+    async def health_check(self) -> bool:
+        """
+        Perform a lightweight health check against the Shopmonkey API.
+
+        Returns True if the API is reachable, False otherwise.
+        """
+        try:
+            # Try to list users with a limit of 1 as a lightweight check
+            await self._request("GET", "/v3/user", params={"limit": "1"})
+            return True
+        except (ShopmonkeyAPIError, ShopmonkeyTimeoutError, ShopmonkeyNetworkError):
+            return False

@@ -41,13 +41,13 @@ class TestGoogleSheetsIntegration:
 
     def test_can_connect_to_sheets(self, sheets_client):
         """Should be able to connect to Google Sheets."""
-        departments = sheets_client.get_all_departments()
+        departments = sheets_client._sync_get_all_departments()
         assert isinstance(departments, list)
         assert len(departments) > 0
 
     def test_can_get_tech_departments(self, sheets_client):
         """Should be able to get technician department mappings."""
-        tech_data = sheets_client.get_tech_departments()
+        tech_data = sheets_client._sync_get_tech_departments()
         assert isinstance(tech_data, dict)
         assert len(tech_data) > 0
 
@@ -59,14 +59,15 @@ class TestGoogleSheetsIntegration:
 
     def test_can_get_techs_for_department(self, sheets_client):
         """Should be able to get techs for a specific department."""
-        departments = sheets_client.get_all_departments()
+        departments = sheets_client._sync_get_all_departments()
         if departments:
             # Test with first available department
-            techs = sheets_client.get_techs_for_department(departments[0])
+            techs = sheets_client._sync_get_techs_for_department(departments[0])
             assert isinstance(techs, list)
             for tech in techs:
                 assert "tech_id" in tech
                 assert "tech_name" in tech
+                assert "priority" in tech
 
 
 class TestShopmonkeyIntegration:
@@ -143,7 +144,7 @@ class TestEndToEndFlow:
         print(f"  Department: {department}")
 
         # Get qualified technicians
-        techs = sheets_client.get_techs_for_department(department)
+        techs = sheets_client._sync_get_techs_for_department(department)
         print(f"  Qualified techs: {[t['tech_name'] for t in techs]}")
 
         # We should have at least one tech (or this department needs setup)
@@ -156,7 +157,7 @@ class TestEndToEndFlow:
         from main import get_department_from_service
 
         services = await shopmonkey_client.get_bookable_canned_services()
-        available_depts = set(sheets_client.get_all_departments())
+        available_depts = set(sheets_client._sync_get_all_departments())
 
         issues = []
         for svc in services:
@@ -164,7 +165,7 @@ class TestEndToEndFlow:
             if dept and dept not in available_depts:
                 issues.append(f"{svc.get('name')}: department '{dept}' not in sheet")
             elif dept:
-                techs = sheets_client.get_techs_for_department(dept)
+                techs = sheets_client._sync_get_techs_for_department(dept)
                 if not techs:
                     issues.append(f"{svc.get('name')}: no techs for '{dept}'")
 

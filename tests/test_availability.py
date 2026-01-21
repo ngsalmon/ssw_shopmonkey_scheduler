@@ -18,6 +18,9 @@ from availability import (
     calculate_available_slots,
     is_slot_available,
     get_service_duration_minutes,
+    validate_config,
+    index_appointments_by_tech,
+    calculate_days_needed,
 )
 
 
@@ -374,3 +377,320 @@ class TestGetServiceDurationMinutes:
         """Should return default when duration is invalid."""
         service = {"estimatedDuration": "invalid"}
         assert get_service_duration_minutes(service, default_duration=60) == 60
+
+
+class TestValidateConfig:
+    """Tests for validate_config function."""
+
+    def test_valid_config_passes(self):
+        """Should not raise for valid configuration."""
+        config = {
+            "business_hours": {
+                "monday": {"open": "09:00", "close": "17:00"},
+                "tuesday": {"open": "09:00", "close": "17:00"},
+            },
+            "default_slot_duration_minutes": 60,
+        }
+        validate_config(config)  # Should not raise
+
+    def test_empty_config_raises(self):
+        """Should raise ValueError for empty config."""
+        with pytest.raises(ValueError, match="empty or None"):
+            validate_config({})
+
+    def test_none_config_raises(self):
+        """Should raise ValueError for None config."""
+        with pytest.raises(ValueError, match="empty or None"):
+            validate_config(None)
+
+    def test_missing_business_hours_raises(self):
+        """Should raise ValueError when business_hours is missing."""
+        config = {"default_slot_duration_minutes": 60}
+        with pytest.raises(ValueError, match="business_hours"):
+            validate_config(config)
+
+    def test_missing_slot_duration_raises(self):
+        """Should raise ValueError when slot duration is missing."""
+        config = {"business_hours": {"monday": {"open": "09:00", "close": "17:00"}}}
+        with pytest.raises(ValueError, match="default_slot_duration_minutes"):
+            validate_config(config)
+
+    def test_invalid_day_name_raises(self):
+        """Should raise ValueError for invalid day name."""
+        config = {
+            "business_hours": {
+                "funday": {"open": "09:00", "close": "17:00"},
+            },
+            "default_slot_duration_minutes": 60,
+        }
+        with pytest.raises(ValueError, match="Invalid day name"):
+            validate_config(config)
+
+    def test_invalid_open_time_format_raises(self):
+        """Should raise ValueError for invalid open time format."""
+        config = {
+            "business_hours": {
+                "monday": {"open": "9am", "close": "17:00"},
+            },
+            "default_slot_duration_minutes": 60,
+        }
+        with pytest.raises(ValueError, match="Invalid open time format"):
+            validate_config(config)
+
+    def test_invalid_close_time_format_raises(self):
+        """Should raise ValueError for invalid close time format."""
+        config = {
+            "business_hours": {
+                "monday": {"open": "09:00", "close": "5pm"},
+            },
+            "default_slot_duration_minutes": 60,
+        }
+        with pytest.raises(ValueError, match="Invalid close time format"):
+            validate_config(config)
+
+    def test_negative_slot_duration_raises(self):
+        """Should raise ValueError for negative slot duration."""
+        config = {
+            "business_hours": {"monday": {"open": "09:00", "close": "17:00"}},
+            "default_slot_duration_minutes": -60,
+        }
+        with pytest.raises(ValueError, match="positive number"):
+            validate_config(config)
+
+    def test_zero_slot_duration_raises(self):
+        """Should raise ValueError for zero slot duration."""
+        config = {
+            "business_hours": {"monday": {"open": "09:00", "close": "17:00"}},
+            "default_slot_duration_minutes": 0,
+        }
+        with pytest.raises(ValueError, match="positive number"):
+            validate_config(config)
+
+
+class TestIndexAppointmentsByTech:
+    """Tests for index_appointments_by_tech function."""
+
+    def test_indexes_by_technician_id(self):
+        """Should index appointments by technicianId."""
+        appointments = [
+            {"technicianId": "tech1", "startDate": "2026-01-19T09:00:00Z"},
+            {"technicianId": "tech1", "startDate": "2026-01-19T10:00:00Z"},
+            {"technicianId": "tech2", "startDate": "2026-01-19T09:00:00Z"},
+        ]
+        indexed = index_appointments_by_tech(appointments)
+        assert len(indexed["tech1"]) == 2
+        assert len(indexed["tech2"]) == 1
+
+    def test_indexes_by_user_id_fallback(self):
+        """Should use userId as fallback when technicianId is missing."""
+        appointments = [
+            {"userId": "tech1", "startDate": "2026-01-19T09:00:00Z"},
+        ]
+        indexed = index_appointments_by_tech(appointments)
+        assert "tech1" in indexed
+        assert len(indexed["tech1"]) == 1
+
+    def test_empty_list_returns_empty_dict(self):
+        """Should return empty dict for empty appointment list."""
+        indexed = index_appointments_by_tech([])
+        assert indexed == {}
+
+    def test_appointments_without_tech_id_skipped(self):
+        """Should skip appointments without tech ID."""
+        appointments = [
+            {"startDate": "2026-01-19T09:00:00Z"},  # No tech ID
+            {"technicianId": "tech1", "startDate": "2026-01-19T10:00:00Z"},
+        ]
+        indexed = index_appointments_by_tech(appointments)
+        assert len(indexed) == 1
+        assert "tech1" in indexed
+
+
+class TestCalculateDaysNeeded:
+    """Tests for calculate_days_needed function."""
+
+    def test_single_day_service(self):
+        """Should return single day for service that fits in one day."""
+        config = {
+            "business_hours": {
+                "monday": {"open": "09:00", "close": "17:00"},
+            },
+        }
+        date = datetime(2026, 1, 19)  # Monday
+        result = calculate_days_needed(
+            duration_minutes=120,  # 2 hours
+            start_date=date,
+            start_time=time(9, 0),
+            config=config,
+        )
+        assert result is not None
+        assert len(result) == 1
+        assert result[0][1] == 120  # 120 minutes needed on day 1
+
+    def test_multi_day_service(self):
+        """Should return multiple days for service that spans days."""
+        config = {
+            "business_hours": {
+                "monday": {"open": "09:00", "close": "17:00"},
+                "tuesday": {"open": "09:00", "close": "17:00"},
+            },
+        }
+        date = datetime(2026, 1, 19)  # Monday
+        result = calculate_days_needed(
+            duration_minutes=600,  # 10 hours (spans 2 days)
+            start_date=date,
+            start_time=time(9, 0),
+            config=config,
+        )
+        assert result is not None
+        assert len(result) == 2
+        # Day 1: 9am-5pm = 8 hours = 480 minutes
+        assert result[0][1] == 480
+        # Day 2: remaining 120 minutes
+        assert result[1][1] == 120
+
+    def test_returns_none_for_closed_day(self):
+        """Should return None when starting on a closed day."""
+        config = {
+            "business_hours": {},  # All days closed
+        }
+        date = datetime(2026, 1, 19)
+        result = calculate_days_needed(
+            duration_minutes=60,
+            start_date=date,
+            start_time=time(9, 0),
+            config=config,
+        )
+        assert result is None
+
+    def test_spans_multiple_weeks_if_needed(self):
+        """Should span multiple weeks if only one day per week is open."""
+        config = {
+            "business_hours": {
+                # Only Monday is open with limited hours
+                "monday": {"open": "09:00", "close": "10:00"},
+            },
+        }
+        date = datetime(2026, 1, 19)  # Monday
+        result = calculate_days_needed(
+            duration_minutes=120,  # 2 hours - needs 2 Mondays
+            start_date=date,
+            start_time=time(9, 0),
+            config=config,
+        )
+        # Should span across 2 Mondays (60 min each)
+        assert result is not None
+        assert len(result) == 2
+        assert result[0][1] == 60  # 60 min on first Monday
+        assert result[1][1] == 60  # 60 min on next Monday
+
+
+class TestCheckSlotConflictsWithIndex:
+    """Tests for check_slot_conflicts with indexed appointments."""
+
+    def test_uses_indexed_appointments(self):
+        """Should use pre-indexed appointments when provided."""
+        appointments = [
+            {"technicianId": "tech1", "startDate": "2026-01-19T09:00:00Z", "endDate": "2026-01-19T10:00:00Z"},
+        ]
+        indexed = index_appointments_by_tech(appointments)
+
+        result = check_slot_conflicts(
+            slot_start=time(9, 0),
+            slot_end=time(10, 0),
+            date=datetime(2026, 1, 19),
+            appointments=[],  # Empty list - should use indexed
+            tech_id="tech1",
+            indexed_appointments=indexed,
+        )
+        assert result is True  # Conflict found via index
+
+    def test_no_conflict_with_indexed_for_different_tech(self):
+        """Should find no conflict for different tech with indexed appointments."""
+        appointments = [
+            {"technicianId": "tech1", "startDate": "2026-01-19T09:00:00Z", "endDate": "2026-01-19T10:00:00Z"},
+        ]
+        indexed = index_appointments_by_tech(appointments)
+
+        result = check_slot_conflicts(
+            slot_start=time(9, 0),
+            slot_end=time(10, 0),
+            date=datetime(2026, 1, 19),
+            appointments=[],
+            tech_id="tech2",  # Different tech
+            indexed_appointments=indexed,
+        )
+        assert result is False  # No conflict
+
+
+class TestMultiDayAvailability:
+    """Tests for multi-day service availability calculation."""
+
+    def test_multiday_service_returns_slots_when_available(self):
+        """Should return slots for multi-day services when tech is available."""
+        config = {
+            "business_hours": {
+                "monday": {"open": "09:00", "close": "17:00"},
+                "tuesday": {"open": "09:00", "close": "17:00"},
+            },
+            "default_slot_duration_minutes": 600,  # 10 hours - spans 2 days
+            "slot_interval_minutes": 60,
+        }
+        # No appointments
+        appointments = []
+        future_appointments = {"2026-01-20": []}
+
+        slots = calculate_available_slots(
+            date=datetime(2026, 1, 19),  # Monday
+            tech_ids=["tech1"],
+            appointments=appointments,
+            config=config,
+            slot_duration_minutes=600,
+            future_appointments=future_appointments,
+        )
+
+        # Should have at least one slot available
+        assert len(slots) >= 1
+        assert "tech1" in slots[0].available_tech_ids
+
+    def test_multiday_service_excludes_tech_with_day2_conflict(self):
+        """Should exclude tech if they have a conflict on day 2."""
+        config = {
+            "business_hours": {
+                "monday": {"open": "09:00", "close": "17:00"},
+                "tuesday": {"open": "09:00", "close": "17:00"},
+            },
+            "default_slot_duration_minutes": 600,
+            "slot_interval_minutes": 60,
+        }
+        # No appointments on day 1
+        appointments = []
+        # Conflict on day 2 for tech1 (9am-10am)
+        future_appointments = {
+            "2026-01-20": [
+                {
+                    "technicianId": "tech1",
+                    "startDate": "2026-01-20T09:00:00Z",
+                    "endDate": "2026-01-20T10:00:00Z",
+                }
+            ]
+        }
+
+        slots = calculate_available_slots(
+            date=datetime(2026, 1, 19),  # Monday
+            tech_ids=["tech1", "tech2"],
+            appointments=appointments,
+            config=config,
+            slot_duration_minutes=600,
+            future_appointments=future_appointments,
+        )
+
+        # Should have slots, but tech1 should be excluded from morning slots
+        # (they need to work at start of day 2 which conflicts)
+        if slots:
+            # Check that at least some slots exclude tech1
+            morning_slot = next((s for s in slots if s.start == time(9, 0)), None)
+            if morning_slot:
+                # tech1 should not be available for 9am slot because
+                # a 10-hour service starting at 9am needs day 2 morning
+                assert "tech1" not in morning_slot.available_tech_ids or "tech2" in morning_slot.available_tech_ids

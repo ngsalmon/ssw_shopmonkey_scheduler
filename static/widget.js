@@ -289,12 +289,29 @@
 
     function renderServiceCard(service) {
         const isSelected = state.selectedService && state.selectedService.id === service.id;
+        const laborHoursHtml = service.laborHours
+            ? `<p class="labor-hours">${formatLaborHours(service.laborHours)}</p>`
+            : '';
         return `
             <div class="service-card ${isSelected ? 'selected' : ''}" data-service-id="${service.id}">
                 <h3>${escapeHtml(service.name)}</h3>
-                ${service.totalCents ? `<p class="price">${formatPrice(service.totalCents)}</p>` : ''}
+                <div class="service-details">
+                    ${service.totalCents ? `<p class="price">${formatPrice(service.totalCents)}</p>` : ''}
+                    ${laborHoursHtml}
+                </div>
             </div>
         `;
+    }
+
+    function formatLaborHours(hours) {
+        if (hours < 1) {
+            const minutes = Math.round(hours * 60);
+            return `~${minutes} min`;
+        } else if (hours === 1) {
+            return '~1 hour';
+        } else {
+            return `~${hours} hours`;
+        }
     }
 
     function renderCalendar() {

@@ -1,15 +1,15 @@
 """Google Sheets client for reading service/tech department mappings."""
 
-import logging
+import asyncio
 import os
-import time
 from functools import lru_cache
 
+import structlog
 from cachetools import TTLCache
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 # Default cache TTL in seconds (5 minutes)
 DEFAULT_CACHE_TTL = 300
@@ -42,9 +42,9 @@ class SheetsClient:
         self._cache: TTLCache = TTLCache(maxsize=100, ttl=cache_ttl)
 
         logger.debug(
-            "SheetsClient initialized with spreadsheet_id=%s, cache_ttl=%d",
-            self.spreadsheet_id,
-            cache_ttl,
+            "sheets_client_initialized",
+            spreadsheet_id=self.spreadsheet_id,
+            cache_ttl=cache_ttl,
         )
 
     def _get_service(self):
@@ -65,16 +65,16 @@ class SheetsClient:
             self._service = build("sheets", "v4", credentials=credentials)
         return self._service
 
-    def _read_sheet(self, range_name: str, use_cache: bool = True) -> list[list[str]]:
-        """Read data from a sheet range with optional caching."""
+    def _sync_read_sheet(self, range_name: str, use_cache: bool = True) -> list[list[str]]:
+        """Synchronous implementation of sheet reading with caching."""
         cache_key = f"sheet:{range_name}"
 
         # Check cache first
         if use_cache and cache_key in self._cache:
-            logger.debug("Cache hit for %s", range_name)
+            logger.debug("sheets_cache_hit", range_name=range_name)
             return self._cache[cache_key]
 
-        logger.debug("Cache miss for %s, fetching from API", range_name)
+        logger.debug("sheets_cache_miss", range_name=range_name)
         service = self._get_service()
         result = (
             service.spreadsheets()
@@ -87,28 +87,23 @@ class SheetsClient:
         # Store in cache
         if use_cache:
             self._cache[cache_key] = data
-            logger.debug("Cached %s with %d rows", range_name, len(data))
+            logger.debug("sheets_data_cached", range_name=range_name, row_count=len(data))
 
         return data
+
+    async def _read_sheet(self, range_name: str, use_cache: bool = True) -> list[list[str]]:
+        """Read data from a sheet range with optional caching (async wrapper)."""
+        return await asyncio.to_thread(self._sync_read_sheet, range_name, use_cache)
 
     def clear_cache(self) -> None:
         """Clear all cached data. Call this after making changes to the sheet."""
         self._cache.clear()
-        logger.info("Sheet cache cleared")
+        logger.info("sheets_cache_cleared")
 
-    def get_service_departments(self) -> dict[str, str]:
-        """
-        Read Bookable Canned Services tab and return mapping.
-
-        Actual schema:
-            Column A: Bookable Service Name
-            Column B: Department
-
-        Returns:
-            Dict mapping service_name to department
-        """
+    def _sync_get_service_departments(self) -> dict[str, str]:
+        """Synchronous implementation of get_service_departments."""
         range_name = f"'{self.SERVICE_DEPARTMENTS_TAB}'!A:B"
-        rows = self._read_sheet(range_name)
+        rows = self._sync_read_sheet(range_name)
 
         if not rows:
             return {}
@@ -123,6 +118,19 @@ class SheetsClient:
                     result[service_name] = department
 
         return result
+
+    async def get_service_departments(self) -> dict[str, str]:
+        """
+        Read Bookable Canned Services tab and return mapping.
+
+        Actual schema:
+            Column A: Bookable Service Name
+            Column B: Department
+
+        Returns:
+            Dict mapping service_name to department
+        """
+        return await asyncio.to_thread(self._sync_get_service_departments)
 
     def _normalize_department(self, department: str) -> str:
         """
@@ -140,28 +148,23 @@ class SheetsClient:
 
         return dept_mapping.get(department, department)
 
-    def get_department_for_service(self, service_name: str) -> str | None:
-        """Get the normalized department for a specific service name."""
-        mappings = self.get_service_departments()
+    def _sync_get_department_for_service(self, service_name: str) -> str | None:
+        """Synchronous implementation of get_department_for_service."""
+        mappings = self._sync_get_service_departments()
         department = mappings.get(service_name)
         if department:
             return self._normalize_department(department)
         return None
 
-    def get_tech_departments(self) -> dict[str, dict]:
-        """
-        Read Tech/Dept tab and return mapping.
+    async def get_department_for_service(self, service_name: str) -> str | None:
+        """Get the normalized department for a specific service name."""
+        return await asyncio.to_thread(self._sync_get_department_for_service, service_name)
 
-        Actual schema:
-        | Name  | ID      | Primary Role | Vinyl | Alignment | Tint | Detail | Bedliner | Status |
-        | John  | user123 | Technician   | TRUE  | FALSE     | ...  | ...    | ...      | Active |
-
-        Returns:
-            Dict mapping tech_id to {tech_name, role, departments: {dept_name: bool}, status}
-        """
-        logger.debug("Fetching tech departments")
+    def _sync_get_tech_departments(self) -> dict[str, dict]:
+        """Synchronous implementation of get_tech_departments."""
+        logger.debug("fetching_tech_departments")
         range_name = f"'{self.TECH_DEPARTMENTS_TAB}'!A:Z"
-        rows = self._read_sheet(range_name)
+        rows = self._sync_read_sheet(range_name)
 
         if not rows or len(rows) < 2:
             return {}
@@ -204,15 +207,24 @@ class SheetsClient:
                 if not tech_id:
                     continue
 
-                # Parse department flags (TRUE/FALSE)
+                # Parse department priorities (0=not qualified, 1+=priority, lower=higher)
                 departments = {}
                 for i, dept_name in enumerate(department_names):
                     col_index = dept_start_index + i
                     if col_index < len(row):
                         value = row[col_index].strip().upper()
-                        departments[dept_name] = value in ("TRUE", "YES", "1", "X")
+                        # Support both old boolean format and new priority format
+                        if value in ("TRUE", "YES", "X"):
+                            departments[dept_name] = 1  # Treat as priority 1
+                        elif value in ("FALSE", "NO", ""):
+                            departments[dept_name] = 0  # Not qualified
+                        else:
+                            try:
+                                departments[dept_name] = int(value)
+                            except ValueError:
+                                departments[dept_name] = 0
                     else:
-                        departments[dept_name] = False
+                        departments[dept_name] = 0
 
                 result[tech_id] = {
                     "tech_name": tech_name,
@@ -223,36 +235,65 @@ class SheetsClient:
 
         return result
 
-    def get_techs_for_department(self, department: str) -> list[dict[str, str]]:
+    async def get_tech_departments(self) -> dict[str, dict]:
         """
-        Get all technicians qualified for a specific department.
+        Read Tech/Dept tab and return mapping.
+
+        Actual schema:
+        | Name  | ID      | Primary Role | Vinyl | Alignment | Tint | Detail | Bedliner | Status |
+        | John  | user123 | Technician   | 1     | 0         | ...  | ...    | ...      | Active |
+
+        Priority values: 0=not qualified, 1=highest priority, 2=second priority, etc.
+
+        Returns:
+            Dict mapping tech_id to {tech_name, role, departments: {dept_name: int}, status}
+        """
+        return await asyncio.to_thread(self._sync_get_tech_departments)
+
+    def _sync_get_techs_for_department(self, department: str) -> list[dict]:
+        """Synchronous implementation of get_techs_for_department."""
+        logger.debug("getting_techs_for_department", department=department)
+        tech_mappings = self._sync_get_tech_departments()
+
+        qualified_techs = []
+        for tech_id, tech_info in tech_mappings.items():
+            priority = tech_info["departments"].get(department, 0)
+            if priority > 0:  # 0 means not qualified
+                qualified_techs.append(
+                    {
+                        "tech_id": tech_id,
+                        "tech_name": tech_info["tech_name"],
+                        "priority": priority,
+                    }
+                )
+
+        # Sort by priority (1 is highest priority, lower numbers first)
+        qualified_techs.sort(key=lambda t: t["priority"])
+
+        logger.debug(
+            "found_qualified_techs",
+            department=department,
+            tech_count=len(qualified_techs),
+        )
+        return qualified_techs
+
+    async def get_techs_for_department(self, department: str) -> list[dict]:
+        """
+        Get all technicians qualified for a specific department, sorted by priority.
 
         Args:
             department: Department name to filter by
 
         Returns:
-            List of {tech_id, tech_name} for qualified technicians
+            List of {tech_id, tech_name, priority} for qualified technicians,
+            sorted by priority (1=highest priority first)
         """
-        logger.debug("Getting techs for department: %s", department)
-        tech_mappings = self.get_tech_departments()
+        return await asyncio.to_thread(self._sync_get_techs_for_department, department)
 
-        qualified_techs = []
-        for tech_id, tech_info in tech_mappings.items():
-            if tech_info["departments"].get(department, False):
-                qualified_techs.append(
-                    {
-                        "tech_id": tech_id,
-                        "tech_name": tech_info["tech_name"],
-                    }
-                )
-
-        logger.debug("Found %d qualified techs for %s", len(qualified_techs), department)
-        return qualified_techs
-
-    def get_all_departments(self) -> list[str]:
-        """Get list of all department names from the Tech/Dept tab."""
+    def _sync_get_all_departments(self) -> list[str]:
+        """Synchronous implementation of get_all_departments."""
         range_name = f"'{self.TECH_DEPARTMENTS_TAB}'!A1:Z1"
-        rows = self._read_sheet(range_name)
+        rows = self._sync_read_sheet(range_name)
 
         if not rows:
             return []
@@ -270,6 +311,32 @@ class SheetsClient:
         dept_start_index = 3
         dept_end_index = status_col_index if status_col_index else len(header)
         return [d.strip() for d in header[dept_start_index:dept_end_index] if d.strip()]
+
+    async def get_all_departments(self) -> list[str]:
+        """Get list of all department names from the Tech/Dept tab."""
+        return await asyncio.to_thread(self._sync_get_all_departments)
+
+    async def health_check(self) -> bool:
+        """
+        Perform a lightweight health check against the Google Sheets API.
+
+        Returns True if the sheet is accessible, False otherwise.
+        """
+        try:
+            # Try to read just the header row
+            range_name = f"'{self.TECH_DEPARTMENTS_TAB}'!A1:A1"
+            await self._read_sheet(range_name, use_cache=False)
+            return True
+        except Exception:
+            return False
+
+    def get_cache_status(self) -> dict:
+        """Return information about the current cache state."""
+        return {
+            "cache_size": len(self._cache),
+            "cache_ttl_seconds": self._cache_ttl,
+            "cache_maxsize": self._cache.maxsize,
+        }
 
 
 # Cached instance for reuse
