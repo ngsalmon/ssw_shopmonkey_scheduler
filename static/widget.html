@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Schedule Your Appointment - Salmonspeedworx</title>
+    <link rel="stylesheet" href="/static/widget.css">
+</head>
+<body>
+    <div class="widget-container">
+        <header class="widget-header">
+            <h1>Schedule Your Appointment</h1>
+            <p class="subtitle">Book your service in just a few steps</p>
+        </header>
+
+        <!-- Progress Bar -->
+        <div class="progress-container">
+            <div class="progress-bar">
+                <div class="progress-fill" id="progressFill"></div>
+            </div>
+            <div class="progress-steps">
+                <div class="step active" data-step="1">
+                    <span class="step-number">1</span>
+                    <span class="step-label">Service</span>
+                </div>
+                <div class="step" data-step="2">
+                    <span class="step-number">2</span>
+                    <span class="step-label">Date</span>
+                </div>
+                <div class="step" data-step="3">
+                    <span class="step-number">3</span>
+                    <span class="step-label">Time</span>
+                </div>
+                <div class="step" data-step="4">
+                    <span class="step-number">4</span>
+                    <span class="step-label">Info</span>
+                </div>
+                <div class="step" data-step="5">
+                    <span class="step-number">5</span>
+                    <span class="step-label">Vehicle</span>
+                </div>
+                <div class="step" data-step="6">
+                    <span class="step-number">6</span>
+                    <span class="step-label">Confirm</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Step Content -->
+        <main class="widget-content">
+            <!-- Step 1: Service Selection -->
+            <section class="step-panel active" id="step1">
+                <h2>Select a Service</h2>
+                <p class="step-description">Choose the service you'd like to book</p>
+                <div class="search-container">
+                    <input type="text"
+                           id="serviceSearch"
+                           class="search-input"
+                           placeholder="Search services..."
+                           autocomplete="off">
+                    <span class="search-icon">&#128269;</span>
+                </div>
+                <div class="services-container" id="servicesContainer">
+                    <div class="loading-spinner">
+                        <div class="spinner"></div>
+                        <span>Loading services...</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Step 2: Date Selection -->
+            <section class="step-panel" id="step2">
+                <h2>Select a Date</h2>
+                <p class="step-description">Choose your preferred appointment date</p>
+                <div class="calendar-container">
+                    <div class="calendar-header">
+                        <button type="button" class="calendar-nav" id="prevMonth">&lt;</button>
+                        <span class="calendar-title" id="calendarTitle"></span>
+                        <button type="button" class="calendar-nav" id="nextMonth">&gt;</button>
+                    </div>
+                    <div class="calendar-weekdays">
+                        <span>Sun</span>
+                        <span>Mon</span>
+                        <span>Tue</span>
+                        <span>Wed</span>
+                        <span>Thu</span>
+                        <span>Fri</span>
+                        <span>Sat</span>
+                    </div>
+                    <div class="calendar-grid" id="calendarGrid"></div>
+                </div>
+            </section>
+
+            <!-- Step 3: Time Selection -->
+            <section class="step-panel" id="step3">
+                <h2>Select a Time</h2>
+                <p class="step-description">Available time slots for <span id="selectedDateText"></span></p>
+                <div class="time-slots-container" id="timeSlotsContainer">
+                    <div class="loading-spinner">
+                        <div class="spinner"></div>
+                        <span>Loading available times...</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Step 4: Customer Information -->
+            <section class="step-panel" id="step4">
+                <h2>Your Information</h2>
+                <p class="step-description">Please provide your contact details</p>
+                <form class="customer-form" id="customerForm">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="firstName">First Name *</label>
+                            <input type="text" id="firstName" name="firstName" required>
+                            <span class="error-message" id="firstNameError"></span>
+                        </div>
+                        <div class="form-group">
+                            <label for="lastName">Last Name *</label>
+                            <input type="text" id="lastName" name="lastName" required>
+                            <span class="error-message" id="lastNameError"></span>
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="email">Email</label>
+                            <input type="email" id="email" name="email">
+                            <span class="error-message" id="emailError"></span>
+                        </div>
+                        <div class="form-group">
+                            <label for="phone">Phone</label>
+                            <input type="tel" id="phone" name="phone">
+                            <span class="error-message" id="phoneError"></span>
+                        </div>
+                    </div>
+                </form>
+            </section>
+
+            <!-- Step 5: Vehicle Information -->
+            <section class="step-panel" id="step5">
+                <h2>Vehicle Information</h2>
+                <p class="step-description">Tell us about your vehicle</p>
+                <form class="vehicle-form" id="vehicleForm">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="vehicleYear">Year *</label>
+                            <input type="number" id="vehicleYear" name="year" min="1900" max="2100" required>
+                            <span class="error-message" id="yearError"></span>
+                        </div>
+                        <div class="form-group">
+                            <label for="vehicleMake">Make *</label>
+                            <input type="text" id="vehicleMake" name="make" required placeholder="e.g., Toyota">
+                            <span class="error-message" id="makeError"></span>
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="vehicleModel">Model *</label>
+                            <input type="text" id="vehicleModel" name="model" required placeholder="e.g., Camry">
+                            <span class="error-message" id="modelError"></span>
+                        </div>
+                        <div class="form-group">
+                            <label for="vehicleVin">VIN (Optional)</label>
+                            <input type="text" id="vehicleVin" name="vin" maxlength="17" placeholder="17-character VIN">
+                            <span class="error-message" id="vinError"></span>
+                        </div>
+                    </div>
+                </form>
+            </section>
+
+            <!-- Step 6: Confirmation -->
+            <section class="step-panel" id="step6">
+                <h2>Review & Confirm</h2>
+                <p class="step-description">Please review your appointment details</p>
+                <div class="confirmation-summary" id="confirmationSummary">
+                    <div class="summary-section">
+                        <h3>Service</h3>
+                        <p id="summaryService">-</p>
+                    </div>
+                    <div class="summary-section">
+                        <h3>Date & Time</h3>
+                        <p id="summaryDateTime">-</p>
+                    </div>
+                    <div class="summary-section">
+                        <h3>Contact Information</h3>
+                        <p id="summaryCustomer">-</p>
+                    </div>
+                    <div class="summary-section">
+                        <h3>Vehicle</h3>
+                        <p id="summaryVehicle">-</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Success Screen -->
+            <section class="step-panel" id="successPanel">
+                <div class="success-content">
+                    <div class="success-icon">&#10003;</div>
+                    <h2>Appointment Booked!</h2>
+                    <p class="confirmation-number">Confirmation: <strong id="confirmationNumber"></strong></p>
+                    <p class="success-message">You will receive a confirmation email shortly.</p>
+                    <button type="button" class="btn btn-primary" onclick="location.reload()">Book Another Appointment</button>
+                </div>
+            </section>
+        </main>
+
+        <!-- Navigation Buttons -->
+        <footer class="widget-footer" id="widgetFooter">
+            <button type="button" class="btn btn-secondary" id="backBtn" style="display: none;">Back</button>
+            <button type="button" class="btn btn-primary" id="nextBtn" disabled>Continue</button>
+        </footer>
+
+        <!-- Error Toast -->
+        <div class="toast-container" id="toastContainer"></div>
+    </div>
+
+    <script src="/static/widget.js"></script>
+</body>
+</html>

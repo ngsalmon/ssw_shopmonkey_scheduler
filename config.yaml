@@ -1,0 +1,23 @@
+business_hours:
+  monday:
+    open: "08:00"
+    close: "18:00"
+  tuesday:
+    open: "08:00"
+    close: "18:00"
+  wednesday:
+    open: "08:00"
+    close: "18:00"
+  thursday:
+    open: "08:00"
+    close: "18:00"
+  friday:
+    open: "08:00"
+    close: "18:00"
+  saturday:
+    open: "09:00"
+    close: "14:00"
+  sunday: null  # closed
+
+# Default slot duration in minutes (used if service doesn't specify)
+default_slot_duration_minutes: 60
