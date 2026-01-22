@@ -26,6 +26,7 @@ from availability import (
     load_config,
     validate_config,
 )
+from email_client import BookingDetails, get_email_client
 from sheets_client import SheetsClient
 from shopmonkey_client import ShopmonkeyClient, ShopmonkeyAPIError
 
@@ -702,22 +703,42 @@ async def book_appointment(_: ApiKeyDep, request: BookingRequest):
             )
             logger.debug("creating_appointment", technician_id=assigned_tech_id)
 
+            # Generate confirmation number BEFORE creating appointment
+            date_part = slot_start_dt.strftime("%Y%m%d")
+            unique_part = uuid.uuid4().hex[:6].upper()
+            confirmation_number = f"SM-{date_part}-{unique_part}"
+
+            # Get assigned tech name for notes
+            assigned_tech_name = None
+            for tech in qualified_techs:
+                if tech["tech_id"] == assigned_tech_id:
+                    assigned_tech_name = tech["tech_name"]
+                    break
+
+            # Create enhanced work order notes
+            tech_line = f"\nAssign to: {assigned_tech_name}" if assigned_tech_name else ""
+            work_order_notes = f"""*** ONLINE BOOKING ***
+Confirmation: {confirmation_number}
+{tech_line}
+Service requested: {service_name}
+Booked online via scheduling API."""
+
+            # Format dates as ISO8601 with Central timezone for Shopmonkey API
+            # TODO: Make timezone configurable via config.yaml
+            start_date_iso = slot_start_dt.strftime("%Y-%m-%dT%H:%M:%S") + ".000-06:00"
+            end_date_iso = slot_end_dt.strftime("%Y-%m-%dT%H:%M:%S") + ".000-06:00"
+
             appointment = await shopmonkey_client.create_appointment(
                 customer_id=customer_id,
                 vehicle_id=vehicle_id,
-                start_date=request.slot_start,
-                end_date=request.slot_end,
+                start_date=start_date_iso,
+                end_date=end_date_iso,
                 title=f"Online Booking: {service_name}",
-                notes=f"Service requested: {service_name}\nBooked online via scheduling API.",
+                notes=work_order_notes,
                 technician_id=assigned_tech_id,
             )
 
             appointment_id = appointment.get("id", "")
-
-            # Generate confirmation number
-            date_part = slot_start_dt.strftime("%Y%m%d")
-            unique_part = uuid.uuid4().hex[:6].upper()
-            confirmation_number = f"SM-{date_part}-{unique_part}"
 
             logger.info(
                 "booking_successful",
@@ -726,6 +747,27 @@ async def book_appointment(_: ApiKeyDep, request: BookingRequest):
                 service_name=service_name,
                 technician_id=assigned_tech_id,
             )
+
+            # Send email notification (fire-and-forget, doesn't block response)
+            email_client = get_email_client()
+            if email_client.enabled:
+                booking_details = BookingDetails(
+                    confirmation_number=confirmation_number,
+                    service_name=service_name,
+                    start_time=slot_start_dt,
+                    end_time=slot_end_dt,
+                    technician_name=assigned_tech_name,
+                    customer_first_name=request.customer.firstName,
+                    customer_last_name=request.customer.lastName,
+                    customer_email=request.customer.email,
+                    customer_phone=request.customer.phone,
+                    vehicle_year=request.vehicle.year,
+                    vehicle_make=request.vehicle.make,
+                    vehicle_model=request.vehicle.model,
+                )
+                asyncio.create_task(
+                    email_client.send_booking_notification(booking_details)
+                )
 
             return BookingResponse(
                 success=True,

@@ -304,12 +304,13 @@ class ShopmonkeyClient:
             return vehicles[0]
 
         # Create new vehicle
+        # Size is required by Shopmonkey API. Valid values: LightDuty, MediumDuty, HeavyDuty, Other
         vehicle_data: dict[str, Any] = {
             "customerId": customer_id,
             "year": year,
             "make": make,
             "model": model,
-            "size": "Medium",  # Required by Shopmonkey API
+            "size": "LightDuty",
         }
         if vin:
             vehicle_data["vin"] = vin
@@ -328,6 +329,7 @@ class ShopmonkeyClient:
         title: str | None = None,
         notes: str | None = None,
         technician_id: str | None = None,
+        color: str = "blue",
     ) -> dict[str, Any]:
         """Create a new appointment."""
         appointment_data: dict[str, Any] = {
@@ -335,10 +337,10 @@ class ShopmonkeyClient:
             "vehicleId": vehicle_id,
             "startDate": start_date,
             "endDate": end_date,
+            "color": color,  # Required by Shopmonkey API
+            "name": title or "Online Booking",  # Required by Shopmonkey API
         }
 
-        if title:
-            appointment_data["title"] = title
         if notes:
             appointment_data["note"] = notes
         if technician_id:
@@ -372,3 +374,49 @@ class ShopmonkeyClient:
             return True
         except (ShopmonkeyAPIError, ShopmonkeyTimeoutError, ShopmonkeyNetworkError):
             return False
+
+    async def get_appointment(self, appointment_id: str) -> dict[str, Any] | None:
+        """
+        Fetch an appointment by ID.
+
+        Args:
+            appointment_id: The appointment ID to fetch.
+
+        Returns:
+            The appointment data, or None if not found.
+        """
+        try:
+            result = await self._request("GET", f"/v3/appointment/{appointment_id}")
+            return result.get("data")
+        except ShopmonkeyAPIError as e:
+            if e.status_code == 404:
+                return None
+            raise
+
+    async def delete_appointment(self, appointment_id: str) -> bool:
+        """
+        Delete an appointment by ID.
+
+        Args:
+            appointment_id: The appointment ID to delete.
+
+        Returns:
+            True if deleted successfully, False if not found or deletion failed.
+        """
+        try:
+            # Pass empty object since API rejects empty body with Content-Type header
+            await self._request("DELETE", f"/v3/appointment/{appointment_id}", json_data={})
+            logger.info("appointment_deleted", appointment_id=appointment_id)
+            return True
+        except ShopmonkeyAPIError as e:
+            if e.status_code == 404:
+                logger.warning("appointment_not_found_for_delete", appointment_id=appointment_id)
+                return False
+            if e.status_code == 403:
+                logger.warning(
+                    "appointment_delete_forbidden",
+                    appointment_id=appointment_id,
+                    message="API token may lack delete permission",
+                )
+                return False
+            raise
