@@ -51,3 +51,7 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Google Cloud SDK (installed locally)
+google-cloud-sdk/
+google-cloud-cli-*.tar.gz

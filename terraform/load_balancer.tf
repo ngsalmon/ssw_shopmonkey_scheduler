@@ -53,9 +53,21 @@ resource "google_compute_url_map" "scheduler" {
     name            = "scheduler-api"
     default_service = google_compute_backend_service.scheduler.id
 
-    path_rule {
-      paths   = ["/scheduler", "/scheduler/*"]
-      service = google_compute_backend_service.scheduler.id
+    # Rewrite /scheduler/* to /* (strip prefix)
+    route_rules {
+      priority = 1
+      match_rules {
+        prefix_match = "/scheduler"
+      }
+      route_action {
+        url_rewrite {
+          path_prefix_rewrite = "/"
+        }
+        weighted_backend_services {
+          backend_service = google_compute_backend_service.scheduler.id
+          weight          = 100
+        }
+      }
     }
   }
 }

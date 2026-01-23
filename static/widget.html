@@ -213,6 +213,22 @@
         <div class="toast-container" id="toastContainer"></div>
     </div>
 
+    <script>
+        // Configure API URL based on environment
+        // In production: api.salmonspeedworx.com/scheduler
+        // In development: same origin (empty string)
+        (function() {
+            const hostname = window.location.hostname;
+            if (hostname === 'scheduler.salmonspeedworx.com') {
+                window.WIDGET_API_URL = 'https://api.salmonspeedworx.com/scheduler';
+            } else if (hostname === 'localhost' || hostname === '127.0.0.1') {
+                window.WIDGET_API_URL = ''; // Use same origin for local dev
+            } else {
+                // For other environments (e.g., Cloud Run URL), use same origin
+                window.WIDGET_API_URL = '';
+            }
+        })();
+    </script>
     <script src="/static/widget.js"></script>
 </body>
 </html>
