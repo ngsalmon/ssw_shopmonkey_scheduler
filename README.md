@@ -161,6 +161,23 @@ https://scheduler.salmonspeedworx.com?service_id=SERVICE_ID_HERE
 https://scheduler.salmonspeedworx.com?service_name=Oil%20Change
 ```
 
+**Finding Service IDs and Names:**
+
+Query the `/services` endpoint to get all available services:
+
+```bash
+curl -s "https://api.salmonspeedworx.com/scheduler/services" | jq '.services[] | {id, name}'
+```
+
+Example output:
+```json
+{"id": "abc123", "name": "Detail - Interior Level 1 - Sedan"}
+{"id": "def456", "name": "Window Tint - Full Sedan/Truck - Ceramic"}
+{"id": "ghi789", "name": "Wheel Alignment - 4 Wheel"}
+```
+
+Use either the `id` (exact match) or `name` (partial match supported) for deeplinking.
+
 ### Embed Options
 
 | Attribute | Values | Description |
