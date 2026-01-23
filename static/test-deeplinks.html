@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Service Deeplink Test Page</title>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            margin: 0;
+            padding: 20px;
+        }
+        h1 {
+            color: #FF6B00;
+            margin-bottom: 10px;
+        }
+        .subtitle {
+            color: #888;
+            margin-bottom: 30px;
+        }
+        .category {
+            margin-bottom: 30px;
+        }
+        .category-header {
+            background: #252542;
+            padding: 12px 16px;
+            border-radius: 8px 8px 0 0;
+            font-weight: 600;
+            color: #FF6B00;
+            display: flex;
+            justify-content: space-between;
+        }
+        .category-count {
+            background: rgba(255, 107, 0, 0.2);
+            padding: 2px 10px;
+            border-radius: 12px;
+            font-size: 0.875rem;
+        }
+        .services-list {
+            background: #16162a;
+            border: 1px solid #333;
+            border-top: none;
+            border-radius: 0 0 8px 8px;
+        }
+        .service-row {
+            display: grid;
+            grid-template-columns: 1fr auto auto;
+            gap: 16px;
+            padding: 12px 16px;
+            border-bottom: 1px solid #2a2a4a;
+            align-items: center;
+        }
+        .service-row:last-child {
+            border-bottom: none;
+        }
+        .service-name {
+            font-size: 0.9375rem;
+        }
+        .service-id {
+            font-family: monospace;
+            font-size: 0.75rem;
+            color: #666;
+            background: #1a1a2e;
+            padding: 4px 8px;
+            border-radius: 4px;
+        }
+        .deeplink-btns {
+            display: flex;
+            gap: 8px;
+        }
+        .btn {
+            padding: 6px 12px;
+            border-radius: 6px;
+            text-decoration: none;
+            font-size: 0.8125rem;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+        .btn-id {
+            background: #FF6B00;
+            color: white;
+        }
+        .btn-id:hover {
+            background: #ff8533;
+        }
+        .btn-name {
+            background: #333;
+            color: #ccc;
+            border: 1px solid #444;
+        }
+        .btn-name:hover {
+            background: #444;
+            color: white;
+        }
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #888;
+        }
+        .error {
+            background: #4a1a1a;
+            color: #ff6b6b;
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+        }
+        @media (max-width: 768px) {
+            .service-row {
+                grid-template-columns: 1fr;
+                gap: 8px;
+            }
+            .service-id {
+                display: none;
+            }
+        }
+    </style>
+</head>
+<body>
+    <h1>Service Deeplink Test Page</h1>
+    <p class="subtitle">Click any link to test service pre-selection. "By ID" uses exact match, "By Name" uses partial match.</p>
+
+    <div id="content">
+        <div class="loading">Loading services...</div>
+    </div>
+
+    <script>
+        const API_BASE = window.location.origin;
+        const SCHEDULER_URL = window.location.origin;
+
+        async function loadServices() {
+            try {
+                const response = await fetch(`${API_BASE}/services`);
+                if (!response.ok) throw new Error('Failed to load services');
+                const data = await response.json();
+                renderServices(data.services);
+            } catch (error) {
+                document.getElementById('content').innerHTML = `
+                    <div class="error">Failed to load services: ${error.message}</div>
+                `;
+            }
+        }
+
+        function groupByCategory(services) {
+            const groups = {};
+            services.forEach(service => {
+                const category = service.category || 'Other';
+                if (!groups[category]) groups[category] = [];
+                groups[category].push(service);
+            });
+            // Sort categories
+            const order = ['Bedliner', 'Custom Exhaust Consultation', 'Sales Consultation', 'Window Tint', 'Alignment', 'Detail'];
+            return Object.entries(groups).sort((a, b) => {
+                const aIdx = order.indexOf(a[0]);
+                const bIdx = order.indexOf(b[0]);
+                if (aIdx === -1 && bIdx === -1) return a[0].localeCompare(b[0]);
+                if (aIdx === -1) return 1;
+                if (bIdx === -1) return -1;
+                return aIdx - bIdx;
+            });
+        }
+
+        function renderServices(services) {
+            const grouped = groupByCategory(services);
+
+            let html = '';
+            grouped.forEach(([category, categoryServices]) => {
+                // Sort services alphabetically within category
+                categoryServices.sort((a, b) => a.name.localeCompare(b.name));
+
+                html += `
+                    <div class="category">
+                        <div class="category-header">
+                            <span>${escapeHtml(category)}</span>
+                            <span class="category-count">${categoryServices.length}</span>
+                        </div>
+                        <div class="services-list">
+                            ${categoryServices.map(service => `
+                                <div class="service-row">
+                                    <div class="service-name">${escapeHtml(service.name)}</div>
+                                    <div class="service-id">${service.id}</div>
+                                    <div class="deeplink-btns">
+                                        <a href="${SCHEDULER_URL}/?service_id=${service.id}"
+                                           class="btn btn-id"
+                                           target="_blank">By ID</a>
+                                        <a href="${SCHEDULER_URL}/?service_name=${encodeURIComponent(service.name)}"
+                                           class="btn btn-name"
+                                           target="_blank">By Name</a>
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                `;
+            });
+
+            document.getElementById('content').innerHTML = html;
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        loadServices();
+    </script>
+</body>
+</html>
