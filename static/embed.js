@@ -16,6 +16,28 @@
  *      primaryColor: '#FF6B00',
  *      mode: 'button' // 'button', 'inline', or 'modal'
  *    });
+ *
+ * 3. Pre-select a specific service:
+ *    <script src="https://your-api-domain.com/static/embed.js"
+ *            data-service-id="SERVICE_ID_HERE"
+ *            data-button-text="Book Oil Change">
+ *    </script>
+ *
+ *    Or by service name:
+ *    <script src="https://your-api-domain.com/static/embed.js"
+ *            data-service-name="Oil Change"
+ *            data-button-text="Book Oil Change">
+ *    </script>
+ *
+ * Available data attributes:
+ *   data-api-url         - API base URL (auto-detected from script src)
+ *   data-button-text     - Button label (default: "Book Appointment")
+ *   data-primary-color   - Accent color hex (default: "#FF6B00")
+ *   data-mode            - Display mode: "button", "inline", or "modal"
+ *   data-container-id    - Container element ID for inline mode
+ *   data-button-position - "bottom-right" or "bottom-left"
+ *   data-service-id      - Pre-select service by ID (skips to date selection)
+ *   data-service-name    - Pre-select service by name (skips to date selection)
  */
 
 (function() {
@@ -29,7 +51,9 @@
             primaryColor: '#FF6B00',
             mode: 'button', // 'button', 'inline', or 'modal'
             containerId: null,
-            buttonPosition: 'bottom-right' // 'bottom-right', 'bottom-left'
+            buttonPosition: 'bottom-right', // 'bottom-right', 'bottom-left'
+            serviceId: null, // Pre-select a specific service by ID
+            serviceName: null // Pre-select a specific service by name
         },
 
         init: function(options = {}) {
@@ -53,6 +77,8 @@
                     if (script.dataset.mode) this.config.mode = script.dataset.mode;
                     if (script.dataset.containerId) this.config.containerId = script.dataset.containerId;
                     if (script.dataset.buttonPosition) this.config.buttonPosition = script.dataset.buttonPosition;
+                    if (script.dataset.serviceId) this.config.serviceId = script.dataset.serviceId;
+                    if (script.dataset.serviceName) this.config.serviceName = script.dataset.serviceName;
                 }
             }
 
@@ -223,7 +249,7 @@
             overlay.innerHTML = `
                 <div class="sw-modal-container">
                     <button class="sw-modal-close" aria-label="Close">&times;</button>
-                    <iframe class="sw-modal-iframe" src="${this.config.apiUrl}/schedule" title="Schedule Appointment"></iframe>
+                    <iframe class="sw-modal-iframe" src="${this.getScheduleUrl()}" title="Schedule Appointment"></iframe>
                 </div>
             `;
 
@@ -255,7 +281,7 @@
 
             container.className = 'sw-inline-container';
             container.innerHTML = `
-                <iframe class="sw-inline-iframe" src="${this.config.apiUrl}/schedule" title="Schedule Appointment"></iframe>
+                <iframe class="sw-inline-iframe" src="${this.getScheduleUrl()}" title="Schedule Appointment"></iframe>
             `;
         },
 
@@ -279,6 +305,21 @@
             const div = document.createElement('div');
             div.textContent = text;
             return div.innerHTML;
+        },
+
+        getScheduleUrl: function() {
+            let url = `${this.config.apiUrl}/schedule`;
+            const params = new URLSearchParams();
+
+            if (this.config.serviceId) {
+                params.set('service_id', this.config.serviceId);
+            }
+            if (this.config.serviceName) {
+                params.set('service_name', this.config.serviceName);
+            }
+
+            const queryString = params.toString();
+            return queryString ? `${url}?${queryString}` : url;
         }
     };
 

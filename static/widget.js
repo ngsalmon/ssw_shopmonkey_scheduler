@@ -811,6 +811,41 @@
         });
     }
 
+    // Parse URL parameters
+    function getUrlParams() {
+        const params = new URLSearchParams(window.location.search);
+        return {
+            serviceId: params.get('service') || params.get('service_id'),
+            serviceName: params.get('service_name')
+        };
+    }
+
+    // Pre-select service by ID or name
+    async function preselectService(services, serviceId, serviceName) {
+        let service = null;
+
+        if (serviceId) {
+            service = services.find(s => s.id === serviceId);
+        }
+
+        if (!service && serviceName) {
+            // Try exact match first, then partial match
+            const lowerName = serviceName.toLowerCase();
+            service = services.find(s => s.name.toLowerCase() === lowerName) ||
+                      services.find(s => s.name.toLowerCase().includes(lowerName));
+        }
+
+        if (service) {
+            state.selectedService = service;
+            renderServices(services);
+            // Skip to date selection (step 2)
+            goToStep(2);
+            return true;
+        }
+
+        return false;
+    }
+
     // Initialize
     async function init() {
         setupEventListeners();
@@ -821,6 +856,12 @@
         try {
             state.services = await fetchServices();
             renderServices(state.services);
+
+            // Check for pre-selected service from URL params
+            const urlParams = getUrlParams();
+            if (urlParams.serviceId || urlParams.serviceName) {
+                await preselectService(state.services, urlParams.serviceId, urlParams.serviceName);
+            }
         } catch (error) {
             // Error already handled in fetchServices
         }
