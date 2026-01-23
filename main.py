@@ -785,6 +785,7 @@ Booked online via scheduling API."""
             raise HTTPException(status_code=500, detail="An unexpected error occurred")
 
 
+@app.get("/")
 @app.get("/schedule")
 async def schedule_page():
     """Serve the scheduling widget page."""
