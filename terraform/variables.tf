@@ -24,3 +24,21 @@ variable "domains" {
     "api.salmonspeedworx.com"
   ]
 }
+
+variable "smtp_user" {
+  description = "SMTP username for email notifications"
+  type        = string
+  default     = "nathan@salmonspeedworx.com"
+}
+
+variable "email_from" {
+  description = "Email address to send notifications from"
+  type        = string
+  default     = "sales@salmonspeedworx.com"
+}
+
+variable "notification_email" {
+  description = "Email address to send booking notifications to"
+  type        = string
+  default     = "sales@salmonspeedworx.com"
+}

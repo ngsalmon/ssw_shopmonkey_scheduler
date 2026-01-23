@@ -74,7 +74,7 @@ resource "google_compute_url_map" "scheduler" {
 
 # Managed SSL certificate
 resource "google_compute_managed_ssl_certificate" "scheduler" {
-  name = "scheduler-ssl-cert"
+  name = "scheduler-ssl-cert-v2"
 
   managed {
     domains = [

@@ -27,6 +27,7 @@ resource "google_project_service" "apis" {
     "compute.googleapis.com",
     "iamcredentials.googleapis.com",
     "cloudresourcemanager.googleapis.com",
+    "orgpolicy.googleapis.com",
   ])
   service            = each.value
   disable_on_destroy = false
@@ -61,6 +62,14 @@ resource "google_secret_manager_secret" "google_sheets_id" {
 
 resource "google_secret_manager_secret" "google_credentials_json" {
   secret_id = "GOOGLE_CREDENTIALS_JSON"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret" "smtp_password" {
+  secret_id = "SMTP_PASSWORD"
   replication {
     auto {}
   }
@@ -102,6 +111,51 @@ resource "google_cloud_run_v2_service" "scheduler" {
         value_source {
           secret_key_ref {
             secret  = google_secret_manager_secret.google_sheets_id.secret_id
+            version = "latest"
+          }
+        }
+      }
+
+      env {
+        name  = "ALLOWED_ORIGINS"
+        value = "https://scheduler.salmonspeedworx.com"
+      }
+
+      env {
+        name  = "SMTP_HOST"
+        value = "smtp.gmail.com"
+      }
+
+      env {
+        name  = "SMTP_PORT"
+        value = "587"
+      }
+
+      env {
+        name  = "SMTP_USER"
+        value = var.smtp_user
+      }
+
+      env {
+        name  = "SMTP_USE_TLS"
+        value = "true"
+      }
+
+      env {
+        name  = "EMAIL_FROM"
+        value = var.email_from
+      }
+
+      env {
+        name  = "NOTIFICATION_EMAIL"
+        value = var.notification_email
+      }
+
+      env {
+        name = "SMTP_PASSWORD"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.smtp_password.secret_id
             version = "latest"
           }
         }
@@ -157,4 +211,30 @@ resource "google_secret_manager_secret_iam_member" "credentials_access" {
   secret_id = google_secret_manager_secret.google_credentials_json.secret_id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_service_account.cloud_run.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "smtp_password_access" {
+  secret_id = google_secret_manager_secret.smtp_password.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.cloud_run.email}"
+}
+
+# Allow public access to Cloud Run
+resource "google_cloud_run_v2_service_iam_member" "public_access" {
+  name     = google_cloud_run_v2_service.scheduler.name
+  location = var.region
+  role     = "roles/run.invoker"
+  member   = "allUsers"
+}
+
+# Org policy to allow allUsers (required for public Cloud Run)
+resource "google_org_policy_policy" "allow_all_users" {
+  name   = "projects/${var.project_id}/policies/iam.allowedPolicyMemberDomains"
+  parent = "projects/${var.project_id}"
+
+  spec {
+    rules {
+      allow_all = "TRUE"
+    }
+  }
 }
