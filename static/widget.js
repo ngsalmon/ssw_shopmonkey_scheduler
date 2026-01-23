@@ -29,13 +29,213 @@
             vin: ''
         },
         services: [],
+        parsedServices: [],
         availableSlots: [],
         serviceDurationMinutes: 60,
         businessHoursClose: '18:00',
         calendarDate: new Date(),
         searchQuery: '',
-        collapsedCategories: new Set()
+        collapsedCategories: new Set(),
+        selectedCategory: null,
+        filters: {
+            detail: { vehicleSize: null, serviceType: null },
+            windowTint: { tintType: null, tintArea: null }
+        }
     };
+
+    // Category definitions - ordered by margin (Detail last)
+    const CATEGORIES = {
+        bedliner: { label: 'Bedliner', priority: 1 },
+        consultation: { label: 'Consultation', priority: 2 },
+        windowTint: { label: 'Window Tint', priority: 3 },
+        alignment: { label: 'Alignment', priority: 4 },
+        detail: { label: 'Detail', priority: 5 },
+        other: { label: 'Other', priority: 99 }
+    };
+
+    // Service name parser - extracts metadata from service names
+    function parseServiceName(serviceName, category) {
+        const result = {
+            originalName: serviceName,
+            displayName: serviceName,
+            vehicleSize: null,
+            vehicleSizeRaw: null,
+            serviceType: null,
+            tintType: null,
+            tintArea: null,
+            level: null,
+            isCombo: false,
+            categoryKey: 'other'
+        };
+
+        const lowerName = serviceName.toLowerCase();
+        const lowerCategory = (category || '').toLowerCase();
+
+        // Determine category key
+        if (lowerCategory.includes('bedliner') || lowerName.includes('bedliner') || lowerName.includes('bed liner')) {
+            result.categoryKey = 'bedliner';
+        } else if (lowerCategory.includes('consultation') || lowerName.includes('consultation')) {
+            result.categoryKey = 'consultation';
+        } else if (lowerCategory.includes('window tint') || lowerCategory.includes('tint') || lowerName.includes('window tint')) {
+            result.categoryKey = 'windowTint';
+        } else if (lowerCategory.includes('alignment') || lowerName.includes('alignment')) {
+            result.categoryKey = 'alignment';
+        } else if (lowerCategory.includes('detail') || lowerName.startsWith('detail')) {
+            result.categoryKey = 'detail';
+        }
+
+        // Parse Window Tint services: "Window Tint - [Area] - [Type]"
+        if (result.categoryKey === 'windowTint' || lowerName.includes('window tint')) {
+            const tintMatch = serviceName.match(/Window Tint\s*-\s*(.+?)\s*-\s*(Carbon|Ceramic)/i);
+            if (tintMatch) {
+                result.tintArea = tintMatch[1].trim();
+                result.tintType = tintMatch[2].toLowerCase();
+                result.displayName = tintMatch[1].trim();
+            } else {
+                // Try simpler pattern: "Window Tint - [Area]"
+                const simpleMatch = serviceName.match(/Window Tint\s*-\s*(.+)/i);
+                if (simpleMatch) {
+                    result.tintArea = simpleMatch[1].trim();
+                    result.displayName = simpleMatch[1].trim();
+                    // Check if area contains tint type
+                    if (result.tintArea.toLowerCase().includes('ceramic')) {
+                        result.tintType = 'ceramic';
+                    } else if (result.tintArea.toLowerCase().includes('carbon')) {
+                        result.tintType = 'carbon';
+                    }
+                }
+            }
+            result.categoryKey = 'windowTint';
+        }
+
+        // Parse Detail services: "Detail - [Type] [Level] - [VehicleSize]"
+        if (result.categoryKey === 'detail' || lowerName.startsWith('detail')) {
+            result.categoryKey = 'detail';
+
+            // Check for combo services
+            if (lowerName.includes('combo') || (lowerName.includes('interior') && lowerName.includes('exterior') && lowerName.includes('&'))) {
+                result.isCombo = true;
+                result.serviceType = 'combo';
+            } else if (lowerName.includes('interior') && !lowerName.includes('exterior')) {
+                result.serviceType = 'interior';
+            } else if (lowerName.includes('exterior') && !lowerName.includes('interior')) {
+                result.serviceType = 'exterior';
+            } else if (lowerName.includes('express')) {
+                result.serviceType = 'express';
+            }
+
+            // Extract level
+            const levelMatch = lowerName.match(/level\s*(\d+)/i);
+            if (levelMatch) {
+                result.level = parseInt(levelMatch[1], 10);
+            }
+
+            // Extract vehicle size - look for it at the end after the last dash
+            const parts = serviceName.split('-').map(p => p.trim());
+            if (parts.length >= 2) {
+                const lastPart = parts[parts.length - 1];
+                result.vehicleSizeRaw = lastPart;
+                result.vehicleSize = normalizeVehicleSize(lastPart);
+
+                // Build display name from middle parts
+                if (parts.length >= 3) {
+                    result.displayName = parts.slice(1, -1).join(' ').trim();
+                } else {
+                    result.displayName = parts[1] || serviceName;
+                }
+            }
+        }
+
+        return result;
+    }
+
+    function normalizeVehicleSize(raw) {
+        if (!raw) return null;
+        const lower = raw.toLowerCase().trim();
+
+        if (lower.includes('coupe') || lower.includes('two door') || lower === '2 door truck') {
+            return 'coupe';
+        }
+        if (lower.includes('sedan') || lower.includes('four door') || lower === '4 door truck') {
+            return 'sedan';
+        }
+        if (lower.includes('xl suv') || lower.includes('van') || lower.includes('xlsuv')) {
+            return 'xlsuv';
+        }
+        if (lower.includes('suv') || lower.includes('truck')) {
+            return 'suv';
+        }
+        return null;
+    }
+
+    function getVehicleSizeLabel(size) {
+        const labels = {
+            coupe: 'Coupe',
+            sedan: 'Sedan',
+            suv: 'SUV',
+            xlsuv: 'XL SUV/Van'
+        };
+        return labels[size] || size;
+    }
+
+    function getServiceTypeLabel(type) {
+        const labels = {
+            interior: 'Interior',
+            exterior: 'Exterior',
+            combo: 'Combo',
+            express: 'Express'
+        };
+        return labels[type] || type;
+    }
+
+    function getTintTypeLabel(type) {
+        const labels = {
+            carbon: 'Carbon',
+            ceramic: 'Ceramic'
+        };
+        return labels[type] || type;
+    }
+
+    // Sort services consistently within a category
+    function sortServices(services, categoryKey) {
+        return [...services].sort((a, b) => {
+            const pA = a.parsed;
+            const pB = b.parsed;
+
+            if (categoryKey === 'windowTint') {
+                // Sort by: area (alphabetically), then tint type (carbon before ceramic)
+                const areaCompare = (pA.tintArea || '').localeCompare(pB.tintArea || '');
+                if (areaCompare !== 0) return areaCompare;
+
+                // Carbon before Ceramic
+                const tintOrder = { carbon: 1, ceramic: 2 };
+                const tintA = tintOrder[pA.tintType] || 99;
+                const tintB = tintOrder[pB.tintType] || 99;
+                return tintA - tintB;
+            }
+
+            if (categoryKey === 'detail') {
+                // Sort by: vehicle size, then service type, then level
+                const sizeOrder = { coupe: 1, sedan: 2, suv: 3, xlsuv: 4 };
+                const sizeA = sizeOrder[pA.vehicleSize] || 99;
+                const sizeB = sizeOrder[pB.vehicleSize] || 99;
+                if (sizeA !== sizeB) return sizeA - sizeB;
+
+                const typeOrder = { express: 1, interior: 2, exterior: 3, combo: 4 };
+                const typeA = typeOrder[pA.serviceType] || 99;
+                const typeB = typeOrder[pB.serviceType] || 99;
+                if (typeA !== typeB) return typeA - typeB;
+
+                // Then by level
+                const levelA = pA.level || 99;
+                const levelB = pB.level || 99;
+                return levelA - levelB;
+            }
+
+            // Default: alphabetical by name
+            return a.name.localeCompare(b.name);
+        });
+    }
 
     // DOM Elements
     const elements = {
@@ -46,6 +246,8 @@
         backBtn: document.getElementById('backBtn'),
         servicesContainer: document.getElementById('servicesContainer'),
         serviceSearch: document.getElementById('serviceSearch'),
+        categoryTabs: document.getElementById('categoryTabs'),
+        subFilters: document.getElementById('subFilters'),
         calendarGrid: document.getElementById('calendarGrid'),
         calendarTitle: document.getElementById('calendarTitle'),
         prevMonth: document.getElementById('prevMonth'),
@@ -161,43 +363,87 @@
     }
 
     // Rendering Functions
-    function groupServicesByCategory(services) {
-        const groups = {};
-        const uncategorized = [];
 
-        services.forEach(service => {
-            const category = service.category || null;
-            if (category) {
-                if (!groups[category]) {
-                    groups[category] = [];
-                }
-                groups[category].push(service);
+    // Parse all services and group by category
+    function parseAndGroupServices(services) {
+        const parsed = services.map(service => ({
+            ...service,
+            parsed: parseServiceName(service.name, service.category)
+        }));
+
+        // Group by category key
+        const groups = {
+            bedliner: [],
+            consultation: [],
+            windowTint: [],
+            alignment: [],
+            detail: [],
+            other: []
+        };
+
+        parsed.forEach(service => {
+            const key = service.parsed.categoryKey;
+            if (groups[key]) {
+                groups[key].push(service);
             } else {
-                uncategorized.push(service);
+                groups.other.push(service);
             }
         });
 
-        // Sort categories alphabetically
-        const sortedCategories = Object.keys(groups).sort();
-        const result = sortedCategories.map(cat => ({
-            name: cat,
-            services: groups[cat]
-        }));
-
-        // Add uncategorized at the end if any
-        if (uncategorized.length > 0) {
-            result.push({
-                name: 'Other Services',
-                services: uncategorized
-            });
-        }
-
-        return result;
+        return { parsed, groups };
     }
 
-    function filterServices(services, query) {
-        if (!query.trim()) return services;
+    // Get unique filter values for a category
+    function getFilterOptions(services, categoryKey) {
+        const options = {
+            vehicleSizes: new Set(),
+            serviceTypes: new Set(),
+            tintTypes: new Set(),
+            tintAreas: new Set()
+        };
 
+        services.forEach(service => {
+            const p = service.parsed;
+            if (p.vehicleSize) options.vehicleSizes.add(p.vehicleSize);
+            if (p.serviceType) options.serviceTypes.add(p.serviceType);
+            if (p.tintType) options.tintTypes.add(p.tintType);
+            if (p.tintArea) options.tintAreas.add(p.tintArea);
+        });
+
+        return {
+            vehicleSizes: Array.from(options.vehicleSizes),
+            serviceTypes: Array.from(options.serviceTypes),
+            tintTypes: Array.from(options.tintTypes),
+            tintAreas: Array.from(options.tintAreas)
+        };
+    }
+
+    // Apply filters to services
+    function applyFilters(services, categoryKey) {
+        if (!categoryKey) return services;
+
+        return services.filter(service => {
+            const p = service.parsed;
+
+            if (categoryKey === 'detail') {
+                const filters = state.filters.detail;
+                if (filters.vehicleSize && p.vehicleSize !== filters.vehicleSize) return false;
+                if (filters.serviceType && p.serviceType !== filters.serviceType) return false;
+            }
+
+            if (categoryKey === 'windowTint') {
+                const filters = state.filters.windowTint;
+                if (filters.tintType && p.tintType !== filters.tintType) return false;
+                if (filters.tintArea && p.tintArea !== filters.tintArea) return false;
+            }
+
+            return true;
+        });
+    }
+
+    // Search filter
+    function filterBySearch(services, query) {
+        if (!query.trim()) return services;
         const lowerQuery = query.toLowerCase().trim();
         return services.filter(service =>
             service.name.toLowerCase().includes(lowerQuery) ||
@@ -205,8 +451,209 @@
         );
     }
 
-    function renderServices(services) {
-        if (!services.length) {
+    // Render category tabs
+    function renderCategoryTabs(groups) {
+        if (!elements.categoryTabs) return;
+
+        const tabs = [];
+
+        // Get all category keys sorted by priority
+        const sortedCategories = Object.keys(CATEGORIES).sort((a, b) =>
+            CATEGORIES[a].priority - CATEGORIES[b].priority
+        );
+
+        // Build tabs for categories that have services
+        sortedCategories.forEach(key => {
+            if (groups[key] && groups[key].length > 0) {
+                tabs.push({
+                    key,
+                    label: CATEGORIES[key].label,
+                    count: groups[key].length
+                });
+            }
+        });
+
+        // Auto-select first tab if none selected
+        if (!state.selectedCategory && tabs.length > 0) {
+            state.selectedCategory = tabs[0].key;
+        }
+
+        elements.categoryTabs.innerHTML = tabs.map(tab => `
+            <button type="button"
+                    class="category-tab ${state.selectedCategory === tab.key ? 'active' : ''}"
+                    data-category="${tab.key}">
+                ${escapeHtml(tab.label)}
+                <span class="tab-count">${tab.count}</span>
+            </button>
+        `).join('');
+
+        // Add click handlers
+        elements.categoryTabs.querySelectorAll('.category-tab').forEach(tabBtn => {
+            tabBtn.addEventListener('click', () => {
+                state.selectedCategory = tabBtn.dataset.category;
+                // Reset filters when switching categories
+                state.filters.detail = { vehicleSize: null, serviceType: null };
+                state.filters.windowTint = { tintType: null, tintArea: null };
+                renderServiceSelection();
+            });
+        });
+    }
+
+    // Render sub-filters for current category
+    function renderSubFilters(services, categoryKey) {
+        if (!elements.subFilters) return;
+
+        if (!categoryKey || categoryKey === 'alignment' || categoryKey === 'other') {
+            elements.subFilters.innerHTML = '';
+            elements.subFilters.style.display = 'none';
+            return;
+        }
+
+        const options = getFilterOptions(services, categoryKey);
+        let filtersHtml = '';
+
+        if (categoryKey === 'detail') {
+            // Vehicle size filter
+            if (options.vehicleSizes.length > 1) {
+                const sizeOrder = ['coupe', 'sedan', 'suv', 'xlsuv'];
+                const sortedSizes = options.vehicleSizes.sort((a, b) =>
+                    sizeOrder.indexOf(a) - sizeOrder.indexOf(b)
+                );
+
+                filtersHtml += `
+                    <div class="filter-group">
+                        <span class="filter-label">Vehicle:</span>
+                        <div class="filter-chips">
+                            <button type="button" class="filter-chip ${!state.filters.detail.vehicleSize ? 'active' : ''}"
+                                    data-filter="vehicleSize" data-value="">Any</button>
+                            ${sortedSizes.map(size => `
+                                <button type="button"
+                                        class="filter-chip ${state.filters.detail.vehicleSize === size ? 'active' : ''}"
+                                        data-filter="vehicleSize"
+                                        data-value="${size}">
+                                    ${getVehicleSizeLabel(size)}
+                                </button>
+                            `).join('')}
+                        </div>
+                    </div>
+                `;
+            }
+
+            // Service type filter
+            if (options.serviceTypes.length > 1) {
+                const typeOrder = ['express', 'interior', 'exterior', 'combo'];
+                const sortedTypes = options.serviceTypes.sort((a, b) =>
+                    typeOrder.indexOf(a) - typeOrder.indexOf(b)
+                );
+
+                filtersHtml += `
+                    <div class="filter-group">
+                        <span class="filter-label">Type:</span>
+                        <div class="filter-chips">
+                            <button type="button" class="filter-chip ${!state.filters.detail.serviceType ? 'active' : ''}"
+                                    data-filter="serviceType" data-value="">Any</button>
+                            ${sortedTypes.map(type => `
+                                <button type="button"
+                                        class="filter-chip ${state.filters.detail.serviceType === type ? 'active' : ''}"
+                                        data-filter="serviceType"
+                                        data-value="${type}">
+                                    ${getServiceTypeLabel(type)}
+                                </button>
+                            `).join('')}
+                        </div>
+                    </div>
+                `;
+            }
+        }
+
+        if (categoryKey === 'windowTint') {
+            // Tint type filter
+            if (options.tintTypes.length > 1) {
+                filtersHtml += `
+                    <div class="filter-group">
+                        <span class="filter-label">Type:</span>
+                        <div class="filter-chips">
+                            <button type="button" class="filter-chip ${!state.filters.windowTint.tintType ? 'active' : ''}"
+                                    data-filter="tintType" data-value="">Any</button>
+                            ${options.tintTypes.map(type => `
+                                <button type="button"
+                                        class="filter-chip ${state.filters.windowTint.tintType === type ? 'active' : ''}"
+                                        data-filter="tintType"
+                                        data-value="${type}">
+                                    ${getTintTypeLabel(type)}${type === 'ceramic' ? ' ★' : ''}
+                                </button>
+                            `).join('')}
+                        </div>
+                    </div>
+                `;
+            }
+
+            // Tint area filter - group similar areas
+            if (options.tintAreas.length > 1) {
+                // Simplify areas into groups
+                const areaGroups = [];
+                const seenGroups = new Set();
+
+                options.tintAreas.forEach(area => {
+                    const lower = area.toLowerCase();
+                    let groupKey = area;
+
+                    if (lower.includes('full')) groupKey = 'Full Vehicle';
+                    else if (lower.includes('windshield') && !lower.includes('strip')) groupKey = 'Windshield';
+                    else if (lower.includes('sunstrip') || lower.includes('sun strip')) groupKey = 'Sunstrip';
+                    else if (lower.includes('door') || lower.includes('front')) groupKey = 'Front Doors';
+
+                    if (!seenGroups.has(groupKey)) {
+                        seenGroups.add(groupKey);
+                        areaGroups.push({ key: area, label: groupKey });
+                    }
+                });
+
+                if (areaGroups.length > 1) {
+                    filtersHtml += `
+                        <div class="filter-group">
+                            <span class="filter-label">Area:</span>
+                            <div class="filter-chips">
+                                <button type="button" class="filter-chip ${!state.filters.windowTint.tintArea ? 'active' : ''}"
+                                        data-filter="tintArea" data-value="">Any</button>
+                                ${areaGroups.slice(0, 4).map(area => `
+                                    <button type="button"
+                                            class="filter-chip ${state.filters.windowTint.tintArea === area.key ? 'active' : ''}"
+                                            data-filter="tintArea"
+                                            data-value="${escapeHtml(area.key)}">
+                                        ${escapeHtml(area.label)}
+                                    </button>
+                                `).join('')}
+                            </div>
+                        </div>
+                    `;
+                }
+            }
+        }
+
+        elements.subFilters.innerHTML = filtersHtml;
+        elements.subFilters.style.display = filtersHtml ? 'block' : 'none';
+
+        // Add click handlers for filter chips
+        elements.subFilters.querySelectorAll('.filter-chip').forEach(chip => {
+            chip.addEventListener('click', () => {
+                const filterName = chip.dataset.filter;
+                const value = chip.dataset.value || null;
+
+                if (categoryKey === 'detail') {
+                    state.filters.detail[filterName] = value;
+                } else if (categoryKey === 'windowTint') {
+                    state.filters.windowTint[filterName] = value;
+                }
+
+                renderServiceSelection();
+            });
+        });
+    }
+
+    // Main render function for service selection
+    function renderServiceSelection() {
+        if (!state.services.length) {
             elements.servicesContainer.innerHTML = `
                 <div class="no-results">
                     <div class="no-results-icon">&#128269;</div>
@@ -216,64 +663,81 @@
             return;
         }
 
-        // Filter based on search query
-        const filteredServices = filterServices(services, state.searchQuery);
+        // Parse and group services
+        const { parsed, groups } = parseAndGroupServices(state.services);
+        state.parsedServices = parsed;
+
+        // If search is active, show flat search results
+        if (state.searchQuery.trim()) {
+            let searchResults = filterBySearch(parsed, state.searchQuery);
+            if (elements.categoryTabs) elements.categoryTabs.style.display = 'none';
+            if (elements.subFilters) elements.subFilters.style.display = 'none';
+
+            if (!searchResults.length) {
+                elements.servicesContainer.innerHTML = `
+                    <div class="no-results">
+                        <div class="no-results-icon">&#128269;</div>
+                        <p>No services match "${escapeHtml(state.searchQuery)}"</p>
+                        <button type="button" class="btn-clear-search" onclick="document.getElementById('serviceSearch').value=''; this.closest('.widget-container').querySelector('#serviceSearch').dispatchEvent(new Event('input'));">Clear search</button>
+                    </div>
+                `;
+                return;
+            }
+
+            // Sort search results alphabetically
+            searchResults = searchResults.sort((a, b) => a.name.localeCompare(b.name));
+            renderServiceCards(searchResults);
+            return;
+        }
+
+        // Show tabs and filters
+        if (elements.categoryTabs) elements.categoryTabs.style.display = 'flex';
+
+        // Render tabs
+        renderCategoryTabs(groups);
+
+        // Get services for selected category and sort them
+        const categoryServices = sortServices(groups[state.selectedCategory] || [], state.selectedCategory);
+
+        // Render sub-filters
+        renderSubFilters(categoryServices, state.selectedCategory);
+
+        // Apply filters (sorting is preserved)
+        const filteredServices = applyFilters(categoryServices, state.selectedCategory);
 
         if (!filteredServices.length) {
             elements.servicesContainer.innerHTML = `
                 <div class="no-results">
                     <div class="no-results-icon">&#128269;</div>
-                    <p>No services match "${escapeHtml(state.searchQuery)}"</p>
+                    <p>No services match your filters</p>
+                    <button type="button" class="btn-clear-filters">Clear filters</button>
                 </div>
             `;
+
+            // Add clear filters handler
+            const clearBtn = elements.servicesContainer.querySelector('.btn-clear-filters');
+            if (clearBtn) {
+                clearBtn.addEventListener('click', () => {
+                    state.filters.detail = { vehicleSize: null, serviceType: null };
+                    state.filters.windowTint = { tintType: null, tintArea: null };
+                    renderServiceSelection();
+                });
+            }
             return;
         }
 
-        // Group by category
-        const groups = groupServicesByCategory(filteredServices);
+        renderServiceCards(filteredServices);
+    }
 
-        // If searching and only one group with few items, or all in one category, show flat
-        const showFlat = state.searchQuery.trim() && filteredServices.length <= 6;
+    // Render service cards
+    function renderServiceCards(services) {
+        elements.servicesContainer.innerHTML = `
+            <div class="services-grid">
+                ${services.map(service => renderServiceCard(service)).join('')}
+            </div>
+        `;
 
-        if (showFlat || groups.length === 1) {
-            // Flat view for search results or single category
-            elements.servicesContainer.innerHTML = `
-                <div class="category-services" style="padding-left: 0;">
-                    ${filteredServices.map(service => renderServiceCard(service)).join('')}
-                </div>
-            `;
-        } else {
-            // Grouped view
-            elements.servicesContainer.innerHTML = groups.map(group => `
-                <div class="category-group ${state.collapsedCategories.has(group.name) ? 'collapsed' : ''}"
-                     data-category="${escapeHtml(group.name)}">
-                    <div class="category-header">
-                        <span class="category-toggle">&#9660;</span>
-                        <span class="category-title">${escapeHtml(group.name)}</span>
-                        <span class="category-count">${group.services.length}</span>
-                    </div>
-                    <div class="category-services">
-                        ${group.services.map(service => renderServiceCard(service)).join('')}
-                    </div>
-                </div>
-            `).join('');
-
-            // Add category toggle handlers
-            elements.servicesContainer.querySelectorAll('.category-header').forEach(header => {
-                header.addEventListener('click', () => {
-                    const group = header.parentElement;
-                    const category = group.dataset.category;
-                    group.classList.toggle('collapsed');
-                    if (group.classList.contains('collapsed')) {
-                        state.collapsedCategories.add(category);
-                    } else {
-                        state.collapsedCategories.delete(category);
-                    }
-                });
-            });
-        }
-
-        // Add click handlers for service cards
+        // Add click handlers
         elements.servicesContainer.querySelectorAll('.service-card').forEach(card => {
             card.addEventListener('click', () => selectService(card.dataset.serviceId));
         });
@@ -287,20 +751,62 @@
         }
     }
 
+    // Render individual service card with enhanced display
     function renderServiceCard(service) {
         const isSelected = state.selectedService && state.selectedService.id === service.id;
-        const laborHoursHtml = service.laborHours
-            ? `<p class="labor-hours">${formatLaborHours(service.laborHours)}</p>`
+        const p = service.parsed;
+
+        // Build badges
+        const badges = [];
+        if (p.tintType) {
+            badges.push(`<span class="badge badge-${p.tintType}">${getTintTypeLabel(p.tintType)}</span>`);
+        }
+        if (p.level) {
+            badges.push(`<span class="badge badge-level">Lvl ${p.level}</span>`);
+        }
+        if (p.isCombo) {
+            badges.push(`<span class="badge badge-combo">Combo</span>`);
+        }
+
+        // Display name - use parsed if available, otherwise original
+        let displayName = p.displayName || service.name;
+
+        // For Detail services, show a cleaner name
+        if (p.categoryKey === 'detail' && p.serviceType) {
+            const typePart = getServiceTypeLabel(p.serviceType);
+            const levelPart = p.level ? ` Level ${p.level}` : '';
+            displayName = `${typePart}${levelPart}`;
+        }
+
+        // Vehicle size indicator
+        const vehicleSizeHtml = p.vehicleSizeRaw
+            ? `<span class="vehicle-size">${escapeHtml(p.vehicleSizeRaw)}</span>`
             : '';
+
+        const laborHoursHtml = service.laborHours
+            ? `<span class="labor-hours">${formatLaborHours(service.laborHours)}</span>`
+            : '';
+
+        const priceHtml = service.totalCents
+            ? `<span class="price">${formatPrice(service.totalCents)}</span>`
+            : '';
+
         return `
             <div class="service-card ${isSelected ? 'selected' : ''}" data-service-id="${service.id}">
-                <h3>${escapeHtml(service.name)}</h3>
-                <div class="service-details">
-                    ${service.totalCents ? `<p class="price">${formatPrice(service.totalCents)}</p>` : ''}
+                ${badges.length ? `<div class="card-badges">${badges.join('')}</div>` : ''}
+                <h3 class="card-title">${escapeHtml(displayName)}</h3>
+                ${vehicleSizeHtml ? `<div class="card-vehicle">${vehicleSizeHtml}</div>` : ''}
+                <div class="card-meta">
+                    ${priceHtml}
                     ${laborHoursHtml}
                 </div>
             </div>
         `;
+    }
+
+    // Legacy function for compatibility
+    function renderServices(services) {
+        renderServiceSelection();
     }
 
     function formatLaborHours(hours) {
@@ -774,7 +1280,7 @@
                 clearTimeout(debounceTimer);
                 debounceTimer = setTimeout(() => {
                     state.searchQuery = e.target.value;
-                    renderServices(state.services);
+                    renderServiceSelection();
                 }, 150);
             });
 
@@ -783,7 +1289,7 @@
                 if (e.key === 'Escape') {
                     e.target.value = '';
                     state.searchQuery = '';
-                    renderServices(state.services);
+                    renderServiceSelection();
                 }
             });
         }
@@ -837,7 +1343,14 @@
 
         if (service) {
             state.selectedService = service;
-            renderServices(services);
+
+            // Parse the service to get its category
+            const parsed = parseServiceName(service.name, service.category);
+
+            // Auto-select the appropriate category tab
+            state.selectedCategory = parsed.categoryKey;
+
+            renderServiceSelection();
             // Skip to date selection (step 2)
             goToStep(2);
             return true;
@@ -855,7 +1368,7 @@
         // Load services
         try {
             state.services = await fetchServices();
-            renderServices(state.services);
+            renderServiceSelection();
 
             // Check for pre-selected service from URL params
             const urlParams = getUrlParams();

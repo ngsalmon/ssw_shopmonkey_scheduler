@@ -52,14 +52,24 @@
             <section class="step-panel active" id="step1">
                 <h2>Select a Service</h2>
                 <p class="step-description">Choose the service you'd like to book</p>
+
+                <!-- Search -->
                 <div class="search-container">
                     <input type="text"
                            id="serviceSearch"
                            class="search-input"
-                           placeholder="Search services..."
+                           placeholder="Search all services..."
                            autocomplete="off">
                     <span class="search-icon">&#128269;</span>
                 </div>
+
+                <!-- Category Tabs -->
+                <div class="category-tabs" id="categoryTabs"></div>
+
+                <!-- Sub-Filters (Dynamic based on category) -->
+                <div class="sub-filters" id="subFilters"></div>
+
+                <!-- Services Grid -->
                 <div class="services-container" id="servicesContainer">
                     <div class="loading-spinner">
                         <div class="spinner"></div>
