@@ -78,6 +78,7 @@ jobs:
           env_vars: |
             SHOPMONKEY_API_BASE_URL=https://api.shopmonkey.cloud
             GOOGLE_APPLICATION_CREDENTIALS=/secrets/google-credentials.json
+            ALLOWED_ORIGINS=https://scheduler.salmonspeedworx.com
           secrets: |
             SHOPMONKEY_API_TOKEN=SHOPMONKEY_API_TOKEN:latest
             GOOGLE_SHEETS_ID=GOOGLE_SHEETS_ID:latest
