@@ -79,7 +79,14 @@ jobs:
             SHOPMONKEY_API_BASE_URL=https://api.shopmonkey.cloud
             GOOGLE_APPLICATION_CREDENTIALS=/secrets/google-credentials.json
             ALLOWED_ORIGINS=https://scheduler.salmonspeedworx.com
+            SMTP_HOST=smtp.gmail.com
+            SMTP_PORT=587
+            SMTP_USER=nathan@salmonspeedworx.com
+            SMTP_USE_TLS=true
+            EMAIL_FROM=sales@salmonspeedworx.com
+            NOTIFICATION_EMAIL=sales@salmonspeedworx.com
           secrets: |
             SHOPMONKEY_API_TOKEN=SHOPMONKEY_API_TOKEN:latest
             GOOGLE_SHEETS_ID=GOOGLE_SHEETS_ID:latest
             /secrets/google-credentials.json=GOOGLE_CREDENTIALS_JSON:latest
+            SMTP_PASSWORD=SMTP_PASSWORD:latest
