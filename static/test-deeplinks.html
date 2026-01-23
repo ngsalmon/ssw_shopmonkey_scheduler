@@ -21,7 +21,25 @@
         }
         .subtitle {
             color: #888;
-            margin-bottom: 30px;
+            margin-bottom: 20px;
+        }
+        .legend {
+            background: #252542;
+            padding: 16px;
+            border-radius: 8px;
+            margin-bottom: 24px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 16px;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.875rem;
+        }
+        .legend-item .btn {
+            pointer-events: none;
         }
         .category {
             margin-bottom: 30px;
@@ -49,7 +67,7 @@
         }
         .service-row {
             display: grid;
-            grid-template-columns: 1fr auto auto;
+            grid-template-columns: 1fr auto;
             gap: 16px;
             padding: 12px 16px;
             border-bottom: 1px solid #2a2a4a;
@@ -58,28 +76,35 @@
         .service-row:last-child {
             border-bottom: none;
         }
+        .service-info {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
         .service-name {
             font-size: 0.9375rem;
         }
         .service-id {
             font-family: monospace;
-            font-size: 0.75rem;
+            font-size: 0.6875rem;
             color: #666;
-            background: #1a1a2e;
-            padding: 4px 8px;
-            border-radius: 4px;
         }
         .deeplink-btns {
             display: flex;
-            gap: 8px;
+            gap: 6px;
+            flex-wrap: wrap;
+            justify-content: flex-end;
         }
         .btn {
-            padding: 6px 12px;
+            padding: 6px 10px;
             border-radius: 6px;
             text-decoration: none;
-            font-size: 0.8125rem;
+            font-size: 0.75rem;
             font-weight: 500;
             transition: all 0.2s;
+            cursor: pointer;
+            border: none;
+            white-space: nowrap;
         }
         .btn-id {
             background: #FF6B00;
@@ -97,6 +122,21 @@
             background: #444;
             color: white;
         }
+        .btn-modal-id {
+            background: #7c3aed;
+            color: white;
+        }
+        .btn-modal-id:hover {
+            background: #8b5cf6;
+        }
+        .btn-modal-name {
+            background: #1e1e3f;
+            color: #a78bfa;
+            border: 1px solid #7c3aed;
+        }
+        .btn-modal-name:hover {
+            background: #2d2d5a;
+        }
         .loading {
             text-align: center;
             padding: 40px;
@@ -109,23 +149,128 @@
             border-radius: 8px;
             text-align: center;
         }
+        /* Modal styles */
+        .test-modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: rgba(0, 0, 0, 0.8);
+            z-index: 9999;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            opacity: 0;
+            visibility: hidden;
+            transition: opacity 0.3s, visibility 0.3s;
+        }
+        .test-modal-overlay.active {
+            opacity: 1;
+            visibility: visible;
+        }
+        .test-modal-container {
+            background-color: #1a1a1a;
+            border-radius: 12px;
+            width: 100%;
+            max-width: 900px;
+            max-height: 90vh;
+            overflow: hidden;
+            position: relative;
+            transform: scale(0.9);
+            transition: transform 0.3s;
+        }
+        .test-modal-overlay.active .test-modal-container {
+            transform: scale(1);
+        }
+        .test-modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 16px;
+            background: #252542;
+            border-bottom: 1px solid #333;
+        }
+        .test-modal-title {
+            font-size: 0.875rem;
+            color: #888;
+        }
+        .test-modal-title strong {
+            color: #FF6B00;
+        }
+        .test-modal-close {
+            background: rgba(255, 255, 255, 0.1);
+            border: none;
+            color: white;
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            cursor: pointer;
+            font-size: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .test-modal-close:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+        .test-modal-iframe {
+            width: 100%;
+            height: 75vh;
+            border: none;
+        }
         @media (max-width: 768px) {
             .service-row {
                 grid-template-columns: 1fr;
-                gap: 8px;
+                gap: 10px;
             }
-            .service-id {
-                display: none;
+            .deeplink-btns {
+                justify-content: flex-start;
+            }
+            .legend {
+                flex-direction: column;
+                gap: 8px;
             }
         }
     </style>
 </head>
 <body>
     <h1>Service Deeplink Test Page</h1>
-    <p class="subtitle">Click any link to test service pre-selection. "By ID" uses exact match, "By Name" uses partial match.</p>
+    <p class="subtitle">Test service pre-selection via direct links or modal embedding.</p>
+
+    <div class="legend">
+        <div class="legend-item">
+            <span class="btn btn-id">Link: ID</span>
+            <span>Direct link with service_id param</span>
+        </div>
+        <div class="legend-item">
+            <span class="btn btn-name">Link: Name</span>
+            <span>Direct link with service_name param</span>
+        </div>
+        <div class="legend-item">
+            <span class="btn btn-modal-id">Modal: ID</span>
+            <span>Opens modal with service_id</span>
+        </div>
+        <div class="legend-item">
+            <span class="btn btn-modal-name">Modal: Name</span>
+            <span>Opens modal with service_name</span>
+        </div>
+    </div>
 
     <div id="content">
         <div class="loading">Loading services...</div>
+    </div>
+
+    <!-- Test Modal -->
+    <div class="test-modal-overlay" id="testModal">
+        <div class="test-modal-container">
+            <div class="test-modal-header">
+                <div class="test-modal-title">Testing: <strong id="modalServiceName"></strong></div>
+                <button class="test-modal-close" onclick="closeTestModal()">&times;</button>
+            </div>
+            <iframe class="test-modal-iframe" id="modalIframe" src="about:blank"></iframe>
+        </div>
     </div>
 
     <script>
@@ -152,7 +297,7 @@
                 if (!groups[category]) groups[category] = [];
                 groups[category].push(service);
             });
-            // Sort categories
+            // Sort categories by margin priority
             const order = ['Bedliner', 'Custom Exhaust Consultation', 'Sales Consultation', 'Window Tint', 'Alignment', 'Detail'];
             return Object.entries(groups).sort((a, b) => {
                 const aIdx = order.indexOf(a[0]);
@@ -181,15 +326,25 @@
                         <div class="services-list">
                             ${categoryServices.map(service => `
                                 <div class="service-row">
-                                    <div class="service-name">${escapeHtml(service.name)}</div>
-                                    <div class="service-id">${service.id}</div>
+                                    <div class="service-info">
+                                        <div class="service-name">${escapeHtml(service.name)}</div>
+                                        <div class="service-id">${service.id}</div>
+                                    </div>
                                     <div class="deeplink-btns">
                                         <a href="${SCHEDULER_URL}/?service_id=${service.id}"
                                            class="btn btn-id"
-                                           target="_blank">By ID</a>
+                                           target="_blank"
+                                           title="Open in new tab with service_id">Link: ID</a>
                                         <a href="${SCHEDULER_URL}/?service_name=${encodeURIComponent(service.name)}"
                                            class="btn btn-name"
-                                           target="_blank">By Name</a>
+                                           target="_blank"
+                                           title="Open in new tab with service_name">Link: Name</a>
+                                        <button class="btn btn-modal-id"
+                                                onclick="openTestModal('${service.id}', null, '${escapeJs(service.name)}')"
+                                                title="Open modal with service_id">Modal: ID</button>
+                                        <button class="btn btn-modal-name"
+                                                onclick="openTestModal(null, '${escapeJs(service.name)}', '${escapeJs(service.name)}')"
+                                                title="Open modal with service_name">Modal: Name</button>
                                     </div>
                                 </div>
                             `).join('')}
@@ -201,10 +356,57 @@
             document.getElementById('content').innerHTML = html;
         }
 
+        function openTestModal(serviceId, serviceName, displayName) {
+            const modal = document.getElementById('testModal');
+            const iframe = document.getElementById('modalIframe');
+            const title = document.getElementById('modalServiceName');
+
+            // Build URL with appropriate param
+            let url = `${SCHEDULER_URL}/`;
+            if (serviceId) {
+                url += `?service_id=${serviceId}`;
+                title.textContent = `${displayName} (by ID)`;
+            } else if (serviceName) {
+                url += `?service_name=${encodeURIComponent(serviceName)}`;
+                title.textContent = `${displayName} (by Name)`;
+            }
+
+            iframe.src = url;
+            modal.classList.add('active');
+            document.body.style.overflow = 'hidden';
+        }
+
+        function closeTestModal() {
+            const modal = document.getElementById('testModal');
+            const iframe = document.getElementById('modalIframe');
+
+            modal.classList.remove('active');
+            document.body.style.overflow = '';
+
+            // Clear iframe to stop any activity
+            setTimeout(() => {
+                iframe.src = 'about:blank';
+            }, 300);
+        }
+
+        // Close modal on escape key
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeTestModal();
+        });
+
+        // Close modal on overlay click
+        document.getElementById('testModal').addEventListener('click', (e) => {
+            if (e.target.id === 'testModal') closeTestModal();
+        });
+
         function escapeHtml(text) {
             const div = document.createElement('div');
             div.textContent = text;
             return div.innerHTML;
+        }
+
+        function escapeJs(text) {
+            return text.replace(/'/g, "\\'").replace(/"/g, '\\"');
         }
 
         loadServices();
