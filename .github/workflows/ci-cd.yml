@@ -75,3 +75,10 @@ jobs:
           region: ${{ env.REGION }}
           image: ${{ env.IMAGE_NAME }}:${{ github.sha }}
           flags: --allow-unauthenticated
+          env_vars: |
+            SHOPMONKEY_API_BASE_URL=https://api.shopmonkey.cloud
+            GOOGLE_APPLICATION_CREDENTIALS=/secrets/google-credentials.json
+          secrets: |
+            SHOPMONKEY_API_TOKEN=SHOPMONKEY_API_TOKEN:latest
+            GOOGLE_SHEETS_ID=GOOGLE_SHEETS_ID:latest
+            /secrets/google-credentials.json=GOOGLE_CREDENTIALS_JSON:latest
