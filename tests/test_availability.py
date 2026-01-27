@@ -17,6 +17,7 @@ from availability import (
     check_slot_conflicts,
     calculate_available_slots,
     is_slot_available,
+    get_buffer_minutes,
     get_service_duration_minutes,
     validate_config,
     index_appointments_by_tech,
@@ -377,6 +378,97 @@ class TestGetServiceDurationMinutes:
         """Should return default when duration is invalid."""
         service = {"estimatedDuration": "invalid"}
         assert get_service_duration_minutes(service, default_duration=60) == 60
+
+
+class TestGetBufferMinutes:
+    """Tests for get_buffer_minutes function."""
+
+    def test_returns_buffer_from_label(self):
+        """Should return buffer minutes from buffer:X label."""
+        service = {
+            "name": "Bedliner - Short Bed",
+            "labels": [
+                {"name": "Bedliner", "color": "blue"},
+                {"name": "buffer:180", "color": "gray"},
+            ],
+        }
+        assert get_buffer_minutes(service) == 180
+
+    def test_returns_zero_when_no_buffer_label(self):
+        """Should return 0 when no buffer label and no config."""
+        service = {
+            "name": "Window Tint",
+            "labels": [{"name": "Window Tint", "color": "blue"}],
+        }
+        assert get_buffer_minutes(service) == 0
+
+    def test_returns_zero_when_no_labels(self):
+        """Should return 0 when service has no labels."""
+        service = {"name": "Unlabeled Service"}
+        assert get_buffer_minutes(service) == 0
+
+    def test_handles_buffer_label_case_insensitive(self):
+        """Should match buffer label case-insensitively."""
+        service = {
+            "labels": [{"name": "Buffer:120"}],
+        }
+        assert get_buffer_minutes(service) == 120
+
+    def test_returns_zero_for_invalid_buffer_value(self):
+        """Should return 0 when buffer value is not a valid integer."""
+        service = {
+            "labels": [{"name": "buffer:invalid"}],
+        }
+        assert get_buffer_minutes(service) == 0
+
+    def test_returns_buffer_from_config(self):
+        """Should return buffer from config when no buffer label."""
+        service = {
+            "name": "Bedliner - Short Bed",
+            "labels": [{"name": "Bedliner", "color": "blue"}],
+        }
+        config = {
+            "service_buffers": {"Bedliner": 180},
+        }
+        assert get_buffer_minutes(service, config) == 180
+
+    def test_label_overrides_config(self):
+        """Service buffer:X label should override config-based buffer."""
+        service = {
+            "name": "Bedliner - Short Bed",
+            "labels": [
+                {"name": "Bedliner", "color": "blue"},
+                {"name": "buffer:120", "color": "gray"},
+            ],
+        }
+        config = {
+            "service_buffers": {"Bedliner": 180},
+        }
+        # Label says 120, config says 180 - label wins
+        assert get_buffer_minutes(service, config) == 120
+
+    def test_config_buffer_multiple_labels(self):
+        """Should match first label that has a config buffer."""
+        service = {
+            "labels": [
+                {"name": "Premium", "color": "gold"},
+                {"name": "Bedliner", "color": "blue"},
+            ],
+        }
+        config = {
+            "service_buffers": {"Bedliner": 180},
+        }
+        assert get_buffer_minutes(service, config) == 180
+
+    def test_returns_zero_when_config_has_no_matching_buffer(self):
+        """Should return 0 when config exists but no matching buffer."""
+        service = {
+            "labels": [{"name": "Window Tint", "color": "blue"}],
+        }
+        config = {
+            "service_buffers": {"Bedliner": 180},
+        }
+        assert get_buffer_minutes(service, config) == 0
 
 
 class TestValidateConfig:

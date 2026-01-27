@@ -20,6 +20,7 @@ from pydantic import BaseModel, EmailStr, Field, field_validator
 
 from availability import (
     calculate_available_slots,
+    get_buffer_minutes,
     get_business_hours,
     get_service_duration_minutes,
     is_slot_available,
@@ -540,9 +541,11 @@ async def get_availability(
         appointments = await shopmonkey_client.get_appointments_for_date(date, tech_ids)
         logger.debug("existing_appointments_fetched", count=len(appointments))
 
-        # Get service duration
-        slot_duration = get_service_duration_minutes(service, config.get("default_slot_duration_minutes", 60))
-        logger.debug("service_duration", minutes=slot_duration)
+        # Get service duration (labor time + any buffer for cure time, etc.)
+        labor_duration = get_service_duration_minutes(service, config.get("default_slot_duration_minutes", 60))
+        buffer_minutes = get_buffer_minutes(service, config)
+        slot_duration = labor_duration + buffer_minutes
+        logger.debug("service_duration", labor_minutes=labor_duration, buffer_minutes=buffer_minutes, total_minutes=slot_duration)
 
         # For multi-day services, fetch appointments for upcoming days
         future_appointments: dict[str, list] = {}

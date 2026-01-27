@@ -589,6 +589,61 @@ def is_slot_available(
     return (len(available_tech_ids) > 0, available_tech_ids)
 
 
+def get_buffer_minutes(
+    service: dict[str, Any],
+    config: dict[str, Any] | None = None,
+) -> int:
+    """
+    Get buffer time for a service from labels or config.
+
+    Buffer time is extra scheduling time (e.g., cure time for bedliners)
+    that doesn't affect labor hours/pricing.
+
+    Priority:
+    1. Service-specific "buffer:X" label in Shopmonkey (highest priority)
+    2. Config-based buffer by department label (service_buffers in config.yaml)
+    3. 0 if no buffer configured
+
+    Args:
+        service: Shopmonkey canned service dict
+        config: Configuration dict with optional service_buffers section
+
+    Returns:
+        Buffer time in minutes
+    """
+    labels = service.get("labels", [])
+
+    # Priority 1: Check for explicit buffer:X label on the service
+    for label in labels:
+        name = label.get("name", "")
+        if name.lower().startswith("buffer:"):
+            try:
+                return int(name.split(":")[1])
+            except (ValueError, IndexError):
+                pass
+
+    # Priority 2: Check config for department-based buffer
+    if config and labels:
+        service_buffers = config.get("service_buffers", {})
+        if service_buffers:
+            # Check each label against configured buffers
+            for label in labels:
+                label_name = label.get("name", "")
+                if label_name in service_buffers:
+                    try:
+                        return int(service_buffers[label_name])
+                    except (ValueError, TypeError):
+                        pass
+
+    return 0
+
+
+# Keep old function name as alias for backward compatibility
+def get_buffer_minutes_from_labels(service: dict[str, Any]) -> int:
+    """Deprecated: Use get_buffer_minutes instead."""
+    return get_buffer_minutes(service, config=None)
+
+
 def get_service_duration_minutes(
     service: dict[str, Any], default_duration: int = 60
 ) -> int:
