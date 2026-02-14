@@ -129,6 +129,64 @@ body {
     color: var(--text-secondary);
 }
 
+/* Booking Summary Strip */
+.booking-summary {
+    display: none;
+    background: var(--background);
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+    margin-bottom: 20px;
+    padding: 12px 16px;
+}
+
+.booking-summary.visible {
+    display: block;
+    animation: fadeIn 0.3s ease;
+}
+
+.summary-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.875rem;
+    padding: 6px 0;
+}
+
+.summary-item + .summary-item {
+    border-top: 1px solid var(--border-color);
+}
+
+.summary-item-label {
+    color: var(--text-secondary);
+    flex-shrink: 0;
+    min-width: 60px;
+}
+
+.summary-item-value {
+    color: var(--text-primary);
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.summary-item-edit {
+    color: var(--primary-color);
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 0.8125rem;
+    padding: 2px 6px;
+    flex-shrink: 0;
+    transition: opacity var(--transition);
+}
+
+.summary-item-edit:hover {
+    opacity: 0.8;
+    text-decoration: underline;
+}
+
 /* Main Content */
 .widget-content {
     flex: 1;

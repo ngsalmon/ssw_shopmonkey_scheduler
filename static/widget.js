@@ -930,6 +930,91 @@
         document.getElementById('summaryVehicle').textContent = vehicleInfo;
     }
 
+    // Booking Summary Strip
+    function renderBookingSummary() {
+        const summaryEl = document.getElementById('bookingSummary');
+        if (!summaryEl) return;
+
+        if (state.currentStep <= 1 || state.currentStep >= 6) {
+            summaryEl.classList.remove('visible');
+            while (summaryEl.firstChild) summaryEl.removeChild(summaryEl.firstChild);
+            return;
+        }
+
+        const items = [];
+
+        // Service (steps 2+)
+        if (state.selectedService) {
+            const parts = [state.selectedService.name];
+            if (state.selectedService.totalCents) {
+                parts.push(formatPrice(state.selectedService.totalCents));
+            }
+            if (state.selectedService.laborHours) {
+                parts.push(formatLaborHours(state.selectedService.laborHours));
+            }
+            items.push({ step: 1, label: 'Service', value: parts.join('  \u00B7  ') });
+        }
+
+        // Date (steps 3+)
+        if (state.currentStep > 2 && state.selectedDate) {
+            items.push({ step: 2, label: 'Date', value: formatDateDisplay(state.selectedDate) });
+        }
+
+        // Time (steps 4+)
+        if (state.currentStep > 3 && state.selectedSlot) {
+            const timeValue = formatTime(state.selectedSlot.start) + ' - ' + formatTime(state.selectedSlot.end);
+            items.push({ step: 3, label: 'Time', value: timeValue });
+        }
+
+        // Contact (steps 5+)
+        if (state.currentStep > 4 && state.customer.firstName) {
+            items.push({ step: 4, label: 'Contact', value: state.customer.firstName + ' ' + state.customer.lastName });
+        }
+
+        // Vehicle (step 6)
+        if (state.currentStep > 5 && state.vehicle.year) {
+            items.push({ step: 5, label: 'Vehicle', value: state.vehicle.year + ' ' + state.vehicle.make + ' ' + state.vehicle.model });
+        }
+
+        if (!items.length) {
+            summaryEl.classList.remove('visible');
+            while (summaryEl.firstChild) summaryEl.removeChild(summaryEl.firstChild);
+            return;
+        }
+
+        // Build DOM nodes safely
+        while (summaryEl.firstChild) summaryEl.removeChild(summaryEl.firstChild);
+
+        items.forEach(function(item) {
+            var row = document.createElement('div');
+            row.className = 'summary-item';
+
+            var label = document.createElement('span');
+            label.className = 'summary-item-label';
+            label.textContent = item.label + ':';
+
+            var value = document.createElement('span');
+            value.className = 'summary-item-value';
+            value.textContent = item.value;
+
+            var editBtn = document.createElement('button');
+            editBtn.type = 'button';
+            editBtn.className = 'summary-item-edit';
+            editBtn.textContent = 'edit';
+            editBtn.dataset.step = item.step;
+            editBtn.addEventListener('click', function() {
+                goToStep(parseInt(editBtn.dataset.step, 10));
+            });
+
+            row.appendChild(label);
+            row.appendChild(value);
+            row.appendChild(editBtn);
+            summaryEl.appendChild(row);
+        });
+
+        summaryEl.classList.add('visible');
+    }
+
     // Selection Handlers
     function selectService(serviceId) {
         state.selectedService = state.services.find(s => s.id === serviceId);
@@ -1019,6 +1104,9 @@
         if (currentPanel) {
             currentPanel.classList.add('active');
         }
+
+        // Update booking summary strip
+        renderBookingSummary();
 
         // Update buttons
         elements.backBtn.style.display = step > 1 ? 'inline-block' : 'none';
