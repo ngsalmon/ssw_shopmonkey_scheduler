@@ -192,9 +192,9 @@
                 }
                 .sw-modal-iframe {
                     width: 100%;
-                    height: 80vh;
-                    max-height: 700px;
+                    height: 85vh;
                     border: none;
+                    display: block;
                 }
                 .sw-inline-container {
                     width: 100%;
