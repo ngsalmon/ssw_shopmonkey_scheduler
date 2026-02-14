@@ -1432,15 +1432,32 @@
         if (service) {
             state.selectedService = service;
 
-            // Parse the service to get its category
+            // Parse the service to get its category and filters
             const parsed = parseServiceName(service.name, service.category);
 
             // Auto-select the appropriate category tab
             state.selectedCategory = parsed.categoryKey;
 
+            // Pre-apply filters matching the service
+            if (parsed.categoryKey === 'detail') {
+                if (parsed.vehicleSize) state.filters.detail.vehicleSize = parsed.vehicleSize;
+                if (parsed.serviceType) state.filters.detail.serviceType = parsed.serviceType;
+            } else if (parsed.categoryKey === 'windowTint') {
+                if (parsed.tintType) state.filters.windowTint.tintType = parsed.tintType;
+                if (parsed.tintArea) state.filters.windowTint.tintArea = parsed.tintArea;
+            }
+
             renderServiceSelection();
-            // Skip to date selection (step 2)
-            goToStep(2);
+            updateNextButton();
+
+            // Scroll the selected card into view if needed
+            const selectedCard = elements.servicesContainer.querySelector(
+                '.service-card[data-service-id="' + service.id + '"]'
+            );
+            if (selectedCard) {
+                selectedCard.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+            }
+
             return true;
         }
 
