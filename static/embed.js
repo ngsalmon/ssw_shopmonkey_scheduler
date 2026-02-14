@@ -29,6 +29,10 @@
  *            data-button-text="Book Oil Change">
  *    </script>
  *
+ * 4. Open modal programmatically with a specific service:
+ *    SchedulingWidget.openModal({ serviceId: 'SERVICE_ID_HERE' });
+ *    SchedulingWidget.openModal({ serviceName: 'Oil Change' });
+ *
  * Available data attributes:
  *   data-api-url         - API base URL (auto-detected from script src)
  *   data-button-text     - Button label (default: "Book Appointment")
@@ -239,7 +243,6 @@
 
         renderModal: function() {
             this.createModal();
-            // Optionally auto-open or provide trigger method
         },
 
         createModal: function() {
@@ -285,12 +288,39 @@
             `;
         },
 
-        openModal: function() {
-            const overlay = document.getElementById('sw-modal-overlay');
-            if (overlay) {
-                overlay.classList.add('active');
-                document.body.style.overflow = 'hidden';
+        openModal: function(options) {
+            // Auto-initialize in modal mode if not yet initialized
+            if (!this.isInitialized) {
+                this.init({ mode: 'modal' });
             }
+            // Create modal on first use if it doesn't exist yet
+            if (!document.getElementById('sw-modal-overlay')) {
+                this.createModal();
+            }
+
+            const overlay = document.getElementById('sw-modal-overlay');
+            if (!overlay) return;
+
+            // If options provided, update iframe src with new service
+            if (options && (options.serviceId || options.serviceName)) {
+                const iframe = overlay.querySelector('.sw-modal-iframe');
+                if (iframe) {
+                    const prevServiceId = this.config.serviceId;
+                    const prevServiceName = this.config.serviceName;
+
+                    if (options.serviceId) this.config.serviceId = options.serviceId;
+                    if (options.serviceName) this.config.serviceName = options.serviceName;
+
+                    iframe.src = this.getScheduleUrl();
+
+                    // Restore previous config
+                    this.config.serviceId = prevServiceId;
+                    this.config.serviceName = prevServiceName;
+                }
+            }
+
+            overlay.classList.add('active');
+            document.body.style.overflow = 'hidden';
         },
 
         closeModal: function() {
