@@ -301,17 +301,23 @@
             const overlay = document.getElementById('sw-modal-overlay');
             if (!overlay) return;
 
-            // If options provided, update iframe src with new service
+            // If options provided, rebuild iframe with new service URL
             if (options && (options.serviceId || options.serviceName)) {
-                const iframe = overlay.querySelector('.sw-modal-iframe');
-                if (iframe) {
+                const container = overlay.querySelector('.sw-modal-container');
+                const oldIframe = overlay.querySelector('.sw-modal-iframe');
+                if (container && oldIframe) {
                     const prevServiceId = this.config.serviceId;
                     const prevServiceName = this.config.serviceName;
 
-                    if (options.serviceId) this.config.serviceId = options.serviceId;
-                    if (options.serviceName) this.config.serviceName = options.serviceName;
+                    this.config.serviceId = options.serviceId || null;
+                    this.config.serviceName = options.serviceName || null;
 
-                    iframe.src = this.getScheduleUrl();
+                    // Replace iframe entirely to guarantee fresh load
+                    const newIframe = document.createElement('iframe');
+                    newIframe.className = 'sw-modal-iframe';
+                    newIframe.src = this.getScheduleUrl();
+                    newIframe.title = 'Schedule Appointment';
+                    container.replaceChild(newIframe, oldIframe);
 
                     // Restore previous config
                     this.config.serviceId = prevServiceId;
