@@ -44,8 +44,9 @@ jobs:
       id-token: write
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
@@ -63,30 +64,151 @@ jobs:
 
       - name: Build and push Docker image
         run: |
-          docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
-          docker tag ${{ env.IMAGE_NAME }}:${{ github.sha }} ${{ env.IMAGE_NAME }}:latest
-          docker push ${{ env.IMAGE_NAME }}:${{ github.sha }}
-          docker push ${{ env.IMAGE_NAME }}:latest
+          docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            -t ${{ env.IMAGE_NAME }}:latest .
+          docker push ${{ env.IMAGE_NAME }} --all-tags
+
+      - name: Capture current revision
+        id: current
+        run: |
+          REVISION=$(gcloud run services describe $SERVICE_NAME \
+            --region=$REGION \
+            --format='value(status.traffic[0].revisionName)' 2>/dev/null || echo "")
+          echo "revision=$REVISION" >> $GITHUB_OUTPUT
+
+          PREV_IMAGE=$(gcloud run services describe $SERVICE_NAME \
+            --region=$REGION \
+            --format='value(spec.template.spec.containers[0].image)' 2>/dev/null || echo "")
+          PREV_SHA=$(echo "$PREV_IMAGE" | grep -oP '[a-f0-9]{40}$' || echo "")
+          echo "prev_sha=$PREV_SHA" >> $GITHUB_OUTPUT
 
       - name: Deploy to Cloud Run
-        uses: google-github-actions/deploy-cloudrun@v2
-        with:
-          service: ${{ env.SERVICE_NAME }}
-          region: ${{ env.REGION }}
-          image: ${{ env.IMAGE_NAME }}:${{ github.sha }}
-          flags: --allow-unauthenticated
-          env_vars: |
-            SHOPMONKEY_API_BASE_URL=https://api.shopmonkey.cloud
-            GOOGLE_APPLICATION_CREDENTIALS=/secrets/google-credentials.json
-            ALLOWED_ORIGINS=https://scheduler.salmonspeedworx.com
-            SMTP_HOST=smtp.gmail.com
-            SMTP_PORT=587
-            SMTP_USER=nathan@salmonspeedworx.com
-            SMTP_USE_TLS=true
-            EMAIL_FROM=sales@salmonspeedworx.com
-            NOTIFICATION_EMAIL=sales@salmonspeedworx.com
-          secrets: |
-            SHOPMONKEY_API_TOKEN=SHOPMONKEY_API_TOKEN:latest
-            GOOGLE_SHEETS_ID=GOOGLE_SHEETS_ID:latest
-            /secrets/google-credentials.json=GOOGLE_CREDENTIALS_JSON:latest
-            SMTP_PASSWORD=SMTP_PASSWORD:latest
+        run: |
+          gcloud run deploy $SERVICE_NAME \
+            --image=${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            --region=$REGION \
+            --quiet
+
+      - name: Verify deployment health
+        env:
+          CURRENT_REVISION: ${{ steps.current.outputs.revision }}
+        run: |
+          sleep 10
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            https://scheduler.salmonspeedworx.com/health)
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "::error::Health check failed (HTTP $HTTP_STATUS) — rolling back"
+            if [ -n "$CURRENT_REVISION" ]; then
+              gcloud run services update-traffic $SERVICE_NAME \
+                --region=$REGION \
+                --to-revisions="$CURRENT_REVISION"=100
+            fi
+            exit 1
+          fi
+          echo "Health check passed (HTTP $HTTP_STATUS)"
+
+      - name: Notify Slack
+        if: success()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          PREV_SHA: ${{ steps.current.outputs.prev_sha }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REPO: ${{ github.repository }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "No SLACK_WEBHOOK_URL configured, skipping notification"
+            exit 0
+          fi
+
+          if [ -n "$PREV_SHA" ] && git cat-file -t "$PREV_SHA" &>/dev/null; then
+            COMMITS=$(git log --oneline "$PREV_SHA".."$GITHUB_SHA" --format='• %s (%an)')
+            COMMIT_COUNT=$(git rev-list --count "$PREV_SHA".."$GITHUB_SHA")
+          else
+            COMMITS=$(git log --oneline -10 --format='• %s (%an)')
+            COMMIT_COUNT="?"
+          fi
+
+          if [ -z "$COMMITS" ]; then
+            COMMITS="• No code changes (config/dependency update)"
+            COMMIT_COUNT="0"
+          fi
+
+          SHORT_SHA=$(echo "$GITHUB_SHA" | cut -c1-7)
+          TIMESTAMP=$(date -u '+%b %d, %Y %H:%M UTC')
+
+          jq -n \
+            --arg short_sha "$SHORT_SHA" \
+            --arg sha_url "https://github.com/${GITHUB_REPO}/commit/${GITHUB_SHA}" \
+            --arg timestamp "$TIMESTAMP" \
+            --arg count "$COMMIT_COUNT" \
+            --arg actor "$GITHUB_ACTOR" \
+            --arg commits "$COMMITS" \
+            --arg app_url "https://scheduler.salmonspeedworx.com" \
+            --arg run_url "https://github.com/${GITHUB_REPO}/actions/runs/${GITHUB_RUN_ID}" \
+            '{
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": { "type": "plain_text", "text": "SSW Scheduler \u2014 Deployed to Production" }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    { "type": "mrkdwn", "text": ("*Commit:*\n<" + $sha_url + "|" + $short_sha + ">") },
+                    { "type": "mrkdwn", "text": ("*Deployed:*\n" + $timestamp) },
+                    { "type": "mrkdwn", "text": ("*Commits:*\n" + $count) },
+                    { "type": "mrkdwn", "text": ("*Triggered by:*\n" + $actor) }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": { "type": "mrkdwn", "text": ("*Changes:*\n" + $commits) }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    { "type": "button", "text": { "type": "plain_text", "text": "Open App" }, "url": $app_url },
+                    { "type": "button", "text": { "type": "plain_text", "text": "View Run" }, "url": $run_url }
+                  ]
+                }
+              ]
+            }' | curl -s -X POST "$SLACK_WEBHOOK_URL" \
+              -H 'Content-Type: application/json' \
+              -d @-
+
+      - name: Notify Slack (failure)
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REPO: ${{ github.repository }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then exit 0; fi
+          SHORT_SHA=$(echo "$GITHUB_SHA" | cut -c1-7)
+
+          jq -n \
+            --arg short_sha "$SHORT_SHA" \
+            --arg sha_url "https://github.com/${GITHUB_REPO}/commit/${GITHUB_SHA}" \
+            --arg actor "$GITHUB_ACTOR" \
+            --arg run_url "https://github.com/${GITHUB_REPO}/actions/runs/${GITHUB_RUN_ID}" \
+            '{
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": { "type": "plain_text", "text": "SSW Scheduler \u2014 Deploy FAILED (rolled back)" }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ("*Commit:* <" + $sha_url + "|" + $short_sha + ">\n*Triggered by:* " + $actor + "\n\n<" + $run_url + "|View failed run>")
+                  }
+                }
+              ]
+            }' | curl -s -X POST "$SLACK_WEBHOOK_URL" \
+              -H 'Content-Type: application/json' \
+              -d @-
