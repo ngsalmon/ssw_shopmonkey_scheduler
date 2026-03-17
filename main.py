@@ -34,6 +34,7 @@ from shopmonkey_client import ShopmonkeyClient, ShopmonkeyAPIError
 # Load environment variables
 load_dotenv()
 
+
 # Configure structlog for JSON output in production
 def configure_logging():
     """Configure structured logging with JSON output."""
@@ -106,7 +107,9 @@ def select_tech_by_priority(
     highest_priority = available_techs[0]["priority"]
 
     # Get all techs at that priority level
-    same_priority_techs = [t for t in available_techs if t["priority"] == highest_priority]
+    same_priority_techs = [
+        t for t in available_techs if t["priority"] == highest_priority
+    ]
 
     if len(same_priority_techs) == 1:
         # Only one tech at this priority, no round-robin needed
@@ -360,9 +363,22 @@ class ReadinessResponse(BaseModel):
     sheets_cache: dict | None = None
 
 
-# Label to Tech/Dept column mapping
-# Add mappings here if Shopmonkey labels differ from Tech/Dept column names
 LABEL_TO_DEPARTMENT: dict[str, str] = {}
+
+
+def is_service_disabled(service: dict[str, Any]) -> bool:
+    department = get_department_from_service(service)
+    if not department:
+        return False
+
+    disabled = config.get("disabled_departments", {})
+    if department not in disabled:
+        return False
+
+    dept_config = disabled[department] or {}
+    exceptions = dept_config.get("except", [])
+    service_name = service.get("name", "").lower()
+    return not any(exc.lower() in service_name for exc in exceptions)
 
 
 def get_department_from_service(service: dict[str, Any]) -> str | None:
@@ -410,7 +426,9 @@ async def get_qualified_techs_for_service(
         service = await shopmonkey_client.get_canned_service(service_id)
     except ShopmonkeyAPIError as e:
         logger.error("shopmonkey_api_error", service_id=service_id, error=str(e))
-        raise HTTPException(status_code=502, detail="Unable to reach scheduling service")
+        raise HTTPException(
+            status_code=502, detail="Unable to reach scheduling service"
+        )
 
     if not service:
         logger.warning("service_not_found", service_id=service_id)
@@ -419,13 +437,22 @@ async def get_qualified_techs_for_service(
             detail=f"Service not found",
         )
 
+    if is_service_disabled(service):
+        logger.info(
+            "service_disabled",
+            service_id=service_id,
+            service_name=service.get("name", ""),
+        )
+        raise HTTPException(status_code=404, detail="Service not found")
+
     service_name = service.get("name", "")
     logger.debug("service_found", service_id=service_id, service_name=service_name)
 
-    # Get department from Shopmonkey service label
     department = get_department_from_service(service)
     if not department:
-        logger.warning("service_no_department", service_id=service_id, service_name=service_name)
+        logger.warning(
+            "service_no_department", service_id=service_id, service_name=service_name
+        )
         raise HTTPException(
             status_code=404,
             detail=f"Service configuration incomplete",
@@ -438,7 +465,9 @@ async def get_qualified_techs_for_service(
         qualified_techs = await sheets_client.get_techs_for_department(department)
     except Exception as e:
         logger.error("sheets_api_error", department=department, error=str(e))
-        raise HTTPException(status_code=502, detail="Unable to reach scheduling service")
+        raise HTTPException(
+            status_code=502, detail="Unable to reach scheduling service"
+        )
 
     if not qualified_techs:
         logger.warning("no_techs_for_department", department=department)
@@ -487,6 +516,11 @@ async def list_services(_: ApiKeyDep):
             total_hours = sum(labor.get("hours", 0) for labor in labors)
             return round(total_hours, 1) if total_hours > 0 else None
 
+        active_services = [svc for svc in services if not is_service_disabled(svc)]
+        logger.info(
+            "services_filtered", total=len(services), active=len(active_services)
+        )
+
         return ServicesListResponse(
             services=[
                 ServiceResponse(
@@ -497,12 +531,14 @@ async def list_services(_: ApiKeyDep):
                     category=get_category(svc),
                     laborHours=get_labor_hours(svc),
                 )
-                for svc in services
+                for svc in active_services
             ]
         )
     except ShopmonkeyAPIError as e:
         logger.error("shopmonkey_api_error", error=str(e))
-        raise HTTPException(status_code=502, detail="Unable to reach scheduling service")
+        raise HTTPException(
+            status_code=502, detail="Unable to reach scheduling service"
+        )
     except Exception as e:
         logger.exception("unexpected_error_fetching_services")
         raise HTTPException(status_code=500, detail="An unexpected error occurred")
@@ -511,7 +547,9 @@ async def list_services(_: ApiKeyDep):
 @app.get("/availability", response_model=AvailabilityResponse)
 async def get_availability(
     _: ApiKeyDep,
-    service_id: str = Query(..., description="The ID of the service to check availability for"),
+    service_id: str = Query(
+        ..., description="The ID of the service to check availability for"
+    ),
     date: str = Query(..., description="Date in YYYY-MM-DD format"),
 ):
     """
@@ -530,11 +568,15 @@ async def get_availability(
         target_date = datetime.strptime(date, "%Y-%m-%d")
     except ValueError:
         logger.warning("invalid_date_format", date=date)
-        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+        raise HTTPException(
+            status_code=400, detail="Invalid date format. Use YYYY-MM-DD"
+        )
 
     try:
         # Get service and qualified techs using shared helper
-        service, department, qualified_techs = await get_qualified_techs_for_service(service_id)
+        service, department, qualified_techs = await get_qualified_techs_for_service(
+            service_id
+        )
         tech_ids = [t["tech_id"] for t in qualified_techs]
 
         # Get existing appointments for the date
@@ -542,10 +584,17 @@ async def get_availability(
         logger.debug("existing_appointments_fetched", count=len(appointments))
 
         # Get service duration (labor time + any buffer for cure time, etc.)
-        labor_duration = get_service_duration_minutes(service, config.get("default_slot_duration_minutes", 60))
+        labor_duration = get_service_duration_minutes(
+            service, config.get("default_slot_duration_minutes", 60)
+        )
         buffer_minutes = get_buffer_minutes(service, config)
         slot_duration = labor_duration + buffer_minutes
-        logger.debug("service_duration", labor_minutes=labor_duration, buffer_minutes=buffer_minutes, total_minutes=slot_duration)
+        logger.debug(
+            "service_duration",
+            labor_minutes=labor_duration,
+            buffer_minutes=buffer_minutes,
+            total_minutes=slot_duration,
+        )
 
         # For multi-day services, fetch appointments for upcoming days
         future_appointments: dict[str, list] = {}
@@ -575,7 +624,11 @@ async def get_availability(
 
         # Get business hours for the close time
         business_hours = get_business_hours(config, target_date)
-        close_time = business_hours.close_time.strftime("%H:%M") if business_hours.is_open else "18:00"
+        close_time = (
+            business_hours.close_time.strftime("%H:%M")
+            if business_hours.is_open
+            else "18:00"
+        )
 
         logger.info(
             "availability_checked",
@@ -604,7 +657,9 @@ async def get_availability(
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("unexpected_error_checking_availability", service_id=service_id)
+        logger.exception(
+            "unexpected_error_checking_availability", service_id=service_id
+        )
         raise HTTPException(status_code=500, detail="An unexpected error occurred")
 
 
@@ -637,19 +692,27 @@ async def book_appointment(_: ApiKeyDep, request: BookingRequest):
     async with booking_lock:
         try:
             # Parse slot times
-            slot_start_dt = datetime.fromisoformat(request.slot_start.replace("Z", "+00:00"))
-            slot_end_dt = datetime.fromisoformat(request.slot_end.replace("Z", "+00:00"))
+            slot_start_dt = datetime.fromisoformat(
+                request.slot_start.replace("Z", "+00:00")
+            )
+            slot_end_dt = datetime.fromisoformat(
+                request.slot_end.replace("Z", "+00:00")
+            )
             date_str = slot_start_dt.strftime("%Y-%m-%d")
 
             # Get service and qualified techs using shared helper
-            service, department, qualified_techs = await get_qualified_techs_for_service(
-                request.service_id
-            )
+            (
+                service,
+                department,
+                qualified_techs,
+            ) = await get_qualified_techs_for_service(request.service_id)
             service_name = service.get("name", "Service")
             tech_ids = [t["tech_id"] for t in qualified_techs]
 
             # Re-check availability (inside lock to prevent race conditions)
-            appointments = await shopmonkey_client.get_appointments_for_date(date_str, tech_ids)
+            appointments = await shopmonkey_client.get_appointments_for_date(
+                date_str, tech_ids
+            )
             is_available, available_tech_ids = is_slot_available(
                 date=slot_start_dt,
                 slot_start=slot_start_dt.time(),
@@ -719,7 +782,9 @@ async def book_appointment(_: ApiKeyDep, request: BookingRequest):
                     break
 
             # Create enhanced work order notes
-            tech_line = f"\nAssign to: {assigned_tech_name}" if assigned_tech_name else ""
+            tech_line = (
+                f"\nAssign to: {assigned_tech_name}" if assigned_tech_name else ""
+            )
             work_order_notes = f"""*** ONLINE BOOKING ***
 Confirmation: {confirmation_number}
 {tech_line}
@@ -846,7 +911,11 @@ async def readiness_check():
         except Exception:
             sheets_status = "unhealthy"
 
-    overall_status = "healthy" if (shopmonkey_status == "healthy" and sheets_status == "healthy") else "degraded"
+    overall_status = (
+        "healthy"
+        if (shopmonkey_status == "healthy" and sheets_status == "healthy")
+        else "degraded"
+    )
 
     response = ReadinessResponse(
         status=overall_status,

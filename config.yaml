@@ -25,3 +25,9 @@ default_slot_duration_minutes: 60
 # Can be overridden per-service with a "buffer:X" label in Shopmonkey
 service_buffers:
   Bedliner: 180  # 3 hours cure time
+
+# Temporarily disabled departments (case-insensitive substring match for exceptions)
+disabled_departments:
+  Detail:
+    except:
+      - "Headlight Restoration"
