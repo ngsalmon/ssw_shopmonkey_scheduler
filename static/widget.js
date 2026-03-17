@@ -1485,10 +1485,37 @@
         }
     }
 
+    /**
+     * Post current body height to parent window for iframe auto-resize.
+     * Called after init, step transitions, and content changes.
+     */
+    function notifyParentHeight() {
+        if (window.parent === window) return; // Not in iframe
+        try {
+            const height = document.body.scrollHeight;
+            window.parent.postMessage({
+                type: 'scheduler-resize',
+                height: height
+            }, '*');
+        } catch (e) {
+            // Cross-origin restrictions — silently ignore
+        }
+    }
+
+    const resizeObserver = new ResizeObserver(function() {
+        notifyParentHeight();
+    });
+
     // Start when DOM is ready
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', init);
+        document.addEventListener('DOMContentLoaded', function() {
+            init();
+            resizeObserver.observe(document.body);
+            notifyParentHeight();
+        });
     } else {
         init();
+        resizeObserver.observe(document.body);
+        notifyParentHeight();
     }
 })();
