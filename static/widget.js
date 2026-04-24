@@ -1120,6 +1120,11 @@
         }
 
         updateNextButton();
+
+        // Step transitions change visible content height — notify parent.
+        // `scheduleNotify` is defined later in this IIFE but hoisted as a
+        // function declaration, so the reference is valid at call time.
+        if (typeof scheduleNotify === 'function') scheduleNotify();
     }
 
     function nextStep() {
@@ -1486,36 +1491,93 @@
     }
 
     /**
-     * Post current body height to parent window for iframe auto-resize.
-     * Called after init, step transitions, and content changes.
+     * Iframe auto-resize — post content height to parent window on every
+     * meaningful DOM change so the Shopify theme can size the iframe to fit
+     * content without internal scrolling or blank gaps.
+     *
+     * Contract with the parent:
+     *   { type: 'scheduler-resize', height: <px> }
+     *   targetOrigin '*' because the scheduler origin (scheduler.salmonspeedworx.com)
+     *   is intentionally decoupled from the storefront origins it may embed into
+     *   (salmonspeedworx.com, *.myshopify.com). The message contains no sensitive
+     *   data; the parent is expected to origin-check on its end.
+     *
+     * Defense: hard cap at 3000px protects the parent from a resize runaway
+     * if a deeper CSS regression reintroduces a percentage-of-viewport height.
      */
+    const SCHEDULER_MAX_HEIGHT = 3000;
+    let lastPostedHeight = 0;
+    let notifyQueued = false;
+
     function notifyParentHeight() {
         if (window.parent === window) return; // Not in iframe
         try {
-            const height = document.body.scrollHeight;
+            // scrollHeight on documentElement reflects the full content box
+            // including margins on body children; on body it can under-report
+            // when body has `display:flex` children that overflow.
+            const raw = Math.max(
+                document.documentElement.scrollHeight,
+                document.body.scrollHeight
+            );
+            const height = Math.min(raw, SCHEDULER_MAX_HEIGHT);
+            // Skip if identical to last post — prevents redundant chatter when
+            // ResizeObserver fires on cosmetic changes (focus rings, hovers).
+            if (height === lastPostedHeight) return;
+            lastPostedHeight = height;
             window.parent.postMessage({
                 type: 'scheduler-resize',
                 height: height
             }, '*');
         } catch (e) {
-            // Cross-origin restrictions — silently ignore
+            // Cross-origin restrictions — silently ignore.
         }
     }
 
-    const resizeObserver = new ResizeObserver(function() {
-        notifyParentHeight();
-    });
+    // rAF-debounced: coalesces bursts from ResizeObserver, font-load, image-load
+    // into at most one post per animation frame.
+    function scheduleNotify() {
+        if (notifyQueued) return;
+        notifyQueued = true;
+        requestAnimationFrame(function() {
+            notifyQueued = false;
+            notifyParentHeight();
+        });
+    }
+
+    const resizeObserver = new ResizeObserver(scheduleNotify);
+
+    function attachResizeListeners() {
+        resizeObserver.observe(document.body);
+        resizeObserver.observe(document.documentElement);
+        // Images and webfonts settle after initial paint — emit again then.
+        if (document.fonts && document.fonts.ready) {
+            document.fonts.ready.then(scheduleNotify).catch(function() {});
+        }
+        window.addEventListener('load', scheduleNotify);
+        window.addEventListener('resize', scheduleNotify);
+    }
+
+    // Mark body as embedded when running inside an iframe so stylesheet can
+    // opt out of `min-height: 100vh` (which would inflate scrollHeight to the
+    // iframe's own height and create a resize feedback loop).
+    function markEmbedded() {
+        if (window.parent !== window) {
+            document.body.classList.add('embedded');
+        }
+    }
 
     // Start when DOM is ready
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', function() {
+            markEmbedded();
             init();
-            resizeObserver.observe(document.body);
-            notifyParentHeight();
+            attachResizeListeners();
+            scheduleNotify();
         });
     } else {
+        markEmbedded();
         init();
-        resizeObserver.observe(document.body);
-        notifyParentHeight();
+        attachResizeListeners();
+        scheduleNotify();
     }
 })();

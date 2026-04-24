@@ -30,6 +30,12 @@ body {
     background-color: var(--background);
     color: var(--text-primary);
     line-height: 1.5;
+}
+
+/* Standalone pages (full /schedule route) still fill the viewport so the
+   dark theme background extends edge-to-edge. When embedded via iframe,
+   the parent page controls height, so we opt out with .embedded. */
+body:not(.embedded) {
     min-height: 100vh;
 }
 
@@ -38,9 +44,15 @@ body {
     max-width: 800px;
     margin: 0 auto;
     padding: 20px;
-    min-height: 100vh;
     display: flex;
     flex-direction: column;
+}
+
+/* Only stretch to viewport on standalone pages. In an iframe this would
+   inflate document.body.scrollHeight to the full iframe height and feed a
+   resize loop back via postMessage. */
+body:not(.embedded) .widget-container {
+    min-height: 100vh;
 }
 
 /* Header */
@@ -1021,18 +1033,34 @@ body {
     }
 }
 
-/* Responsive */
-@media (max-width: 600px) {
+/* Responsive
+   Breakpoint 767px — covers phones up to large portrait (iPhone Pro Max,
+   Pixel Pro). Desktop layout is preserved >=768px. */
+@media (max-width: 767px) {
     .widget-container {
         padding: 16px;
     }
 
-    .widget-content {
-        padding: 20px;
+    .widget-header {
+        margin-bottom: 20px;
     }
 
-    .form-row {
-        grid-template-columns: 1fr;
+    .widget-header h1 {
+        font-size: 1.375rem;
+    }
+
+    .widget-header .subtitle {
+        font-size: 0.9375rem;
+    }
+
+    /* Tighter content padding so step panels use the full viewport width. */
+    .widget-content {
+        padding: 18px;
+        margin-bottom: 16px;
+    }
+
+    .progress-container {
+        margin-bottom: 20px;
     }
 
     .progress-steps {
@@ -1043,16 +1071,48 @@ body {
         display: none;
     }
 
+    .form-row {
+        grid-template-columns: 1fr;
+        gap: 12px;
+        margin-bottom: 12px;
+    }
+
     .services-grid {
         grid-template-columns: 1fr;
     }
 
-    .time-slots-container {
-        grid-template-columns: repeat(3, 1fr);
+    .category-services {
+        grid-template-columns: 1fr;
+        padding-left: 0;
     }
 
-    .widget-header h1 {
-        font-size: 1.5rem;
+    /* Keep service list scrollable but compact on phones. */
+    .services-container {
+        max-height: 360px;
+    }
+
+    /* 3-per-row time slots fits iPhone width comfortably. */
+    .time-slots-container {
+        grid-template-columns: repeat(3, 1fr);
+        gap: 8px;
+    }
+
+    .time-slot {
+        padding: 12px 8px;
+        font-size: 0.875rem;
+    }
+
+    .time-slot .slot-time {
+        font-size: 1rem;
+    }
+
+    /* Compact calendar for mobile. */
+    .calendar-container {
+        max-width: 100%;
+    }
+
+    .calendar-day {
+        font-size: 0.8125rem;
     }
 
     /* Mobile: stack filters */
@@ -1077,15 +1137,35 @@ body {
         flex-shrink: 0;
     }
 
-    /* Mobile: horizontal scroll for tabs */
+    /* Mobile: horizontal scroll for tabs (bleed to viewport edges). */
     .category-tabs {
-        margin-left: -20px;
-        margin-right: -20px;
-        padding-left: 20px;
-        padding-right: 20px;
+        margin-left: -16px;
+        margin-right: -16px;
+        padding-left: 16px;
+        padding-right: 16px;
+    }
+
+    /* Confirmation & success padding. */
+    .summary-section {
+        padding: 14px;
+    }
+
+    .success-content {
+        padding: 30px 16px;
+    }
+
+    /* Footer buttons: full-width stacked on very small phones. */
+    .widget-footer {
+        gap: 12px;
+    }
+
+    .btn {
+        padding: 12px 20px;
+        font-size: 0.9375rem;
     }
 }
 
+/* Very small phones (iPhone SE, older Android). */
 @media (max-width: 400px) {
     .time-slots-container {
         grid-template-columns: repeat(2, 1fr);
