@@ -460,9 +460,14 @@ async def get_qualified_techs_for_service(
 
     logger.debug("department_resolved", department=department)
 
-    # Get qualified technicians for this department
+    # Get qualified technicians for this department.
+    # Cross-reference Shopmonkey's active-user list so deactivating a user there
+    # auto-removes them from booking; sheet "Inactive" still acts as a manual override.
     try:
-        qualified_techs = await sheets_client.get_techs_for_department(department)
+        active_tech_ids = await shopmonkey_client.get_active_user_ids()
+        qualified_techs = await sheets_client.get_techs_for_department(
+            department, active_tech_ids=active_tech_ids
+        )
     except Exception as e:
         logger.error("sheets_api_error", department=department, error=str(e))
         raise HTTPException(

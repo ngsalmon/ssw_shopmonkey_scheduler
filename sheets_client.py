@@ -160,8 +160,16 @@ class SheetsClient:
         """Get the normalized department for a specific service name."""
         return await asyncio.to_thread(self._sync_get_department_for_service, service_name)
 
-    def _sync_get_tech_departments(self) -> dict[str, dict]:
-        """Synchronous implementation of get_tech_departments."""
+    def _sync_get_tech_departments(
+        self, active_tech_ids: set[str] | None = None
+    ) -> dict[str, dict]:
+        """Synchronous implementation of get_tech_departments.
+
+        Filtering rules:
+        - Sheet Status == "Inactive" always excludes (manual override).
+        - If `active_tech_ids` is provided, techs whose ID is not in that set
+          are excluded (Shopmonkey is the source of truth for active state).
+        """
         logger.debug("fetching_tech_departments")
         range_name = f"'{self.TECH_DEPARTMENTS_TAB}'!A:Z"
         rows = self._sync_read_sheet(range_name)
@@ -194,17 +202,20 @@ class SheetsClient:
                 tech_id = row[1].strip()
                 role = row[2].strip() if len(row) > 2 else ""
 
-                # Get status (last column) - default to Active if not found
-                status = "Active"
+                status = ""
                 if status_col_index and len(row) > status_col_index:
                     status = row[status_col_index].strip()
 
-                # Skip inactive technicians
-                if status.lower() != "active":
+                # Manual override: explicit "Inactive" in sheet always excludes.
+                if status.lower() == "inactive":
                     continue
 
                 # Skip if no tech_id
                 if not tech_id:
+                    continue
+
+                # Defer to Shopmonkey for active state when caller provided the set.
+                if active_tech_ids is not None and tech_id not in active_tech_ids:
                     continue
 
                 # Parse department priorities (0=not qualified, 1+=priority, lower=higher)
@@ -235,7 +246,9 @@ class SheetsClient:
 
         return result
 
-    async def get_tech_departments(self) -> dict[str, dict]:
+    async def get_tech_departments(
+        self, active_tech_ids: set[str] | None = None
+    ) -> dict[str, dict]:
         """
         Read Tech/Dept tab and return mapping.
 
@@ -245,15 +258,22 @@ class SheetsClient:
 
         Priority values: 0=not qualified, 1=highest priority, 2=second priority, etc.
 
+        Args:
+            active_tech_ids: When provided, exclude techs whose ID is not in this set
+                (Shopmonkey is the source of truth for active state).
+                Sheet Status == "Inactive" still excludes regardless.
+
         Returns:
             Dict mapping tech_id to {tech_name, role, departments: {dept_name: int}, status}
         """
-        return await asyncio.to_thread(self._sync_get_tech_departments)
+        return await asyncio.to_thread(self._sync_get_tech_departments, active_tech_ids)
 
-    def _sync_get_techs_for_department(self, department: str) -> list[dict]:
+    def _sync_get_techs_for_department(
+        self, department: str, active_tech_ids: set[str] | None = None
+    ) -> list[dict]:
         """Synchronous implementation of get_techs_for_department."""
         logger.debug("getting_techs_for_department", department=department)
-        tech_mappings = self._sync_get_tech_departments()
+        tech_mappings = self._sync_get_tech_departments(active_tech_ids)
 
         qualified_techs = []
         for tech_id, tech_info in tech_mappings.items():
@@ -277,18 +297,23 @@ class SheetsClient:
         )
         return qualified_techs
 
-    async def get_techs_for_department(self, department: str) -> list[dict]:
+    async def get_techs_for_department(
+        self, department: str, active_tech_ids: set[str] | None = None
+    ) -> list[dict]:
         """
         Get all technicians qualified for a specific department, sorted by priority.
 
         Args:
             department: Department name to filter by
+            active_tech_ids: When provided, exclude techs whose ID is not in this set.
 
         Returns:
             List of {tech_id, tech_name, priority} for qualified technicians,
             sorted by priority (1=highest priority first)
         """
-        return await asyncio.to_thread(self._sync_get_techs_for_department, department)
+        return await asyncio.to_thread(
+            self._sync_get_techs_for_department, department, active_tech_ids
+        )
 
     def _sync_get_all_departments(self) -> list[str]:
         """Synchronous implementation of get_all_departments."""

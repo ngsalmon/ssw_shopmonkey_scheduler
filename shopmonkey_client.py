@@ -62,6 +62,9 @@ class ShopmonkeyClient:
             raise ValueError("SHOPMONKEY_API_TOKEN is required")
 
         self._client: httpx.AsyncClient | None = None
+        self._active_user_ids_cache: set[str] | None = None
+        self._active_user_ids_cache_expiry: float = 0.0
+        self._active_user_ids_cache_ttl: float = 300.0
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -361,6 +364,21 @@ class ShopmonkeyClient:
 
         result = await self._request("GET", "/v3/user", params=params if params else None)
         return result.get("data", [])
+
+    async def get_active_user_ids(self) -> set[str]:
+        """Return IDs of active Shopmonkey users (cached for 5 minutes)."""
+        now = time.monotonic()
+        if (
+            self._active_user_ids_cache is not None
+            and now < self._active_user_ids_cache_expiry
+        ):
+            return self._active_user_ids_cache
+
+        users = await self.get_users()
+        active_ids = {u["id"] for u in users if u.get("active") and u.get("id")}
+        self._active_user_ids_cache = active_ids
+        self._active_user_ids_cache_expiry = now + self._active_user_ids_cache_ttl
+        return active_ids
 
     async def health_check(self) -> bool:
         """

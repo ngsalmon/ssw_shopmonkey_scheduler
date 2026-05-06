@@ -89,6 +89,77 @@ class TestSheetsClientGetTechDepartments:
         assert len(result) == 1
 
 
+class TestSheetsClientActiveTechIdsFilter:
+    """Tests for the active_tech_ids filter (Shopmonkey active-state override)."""
+
+    @patch("sheets_client.service_account.Credentials.from_service_account_file")
+    @patch("sheets_client.build")
+    def test_excludes_techs_not_in_active_set(self, mock_build, mock_creds):
+        """Techs whose ID is not in active_tech_ids should be excluded."""
+        from sheets_client import SheetsClient
+
+        mock_service = MagicMock()
+        mock_build.return_value = mock_service
+        mock_service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = {
+            "values": [
+                ["Name", "ID", "Role", "Detail", "Status"],
+                ["Tech A", "tech-1", "Technician", "TRUE", "Active"],
+                ["Tech B", "tech-2", "Technician", "TRUE", "Active"],
+            ]
+        }
+
+        client = SheetsClient(spreadsheet_id="test-id", credentials_path="test.json")
+        result = client._sync_get_tech_departments(active_tech_ids={"tech-1"})
+
+        assert "tech-1" in result
+        assert "tech-2" not in result
+
+    @patch("sheets_client.service_account.Credentials.from_service_account_file")
+    @patch("sheets_client.build")
+    def test_inactive_override_wins_even_when_active_in_shopmonkey(
+        self, mock_build, mock_creds
+    ):
+        """Sheet 'Inactive' status excludes regardless of Shopmonkey active state."""
+        from sheets_client import SheetsClient
+
+        mock_service = MagicMock()
+        mock_build.return_value = mock_service
+        mock_service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = {
+            "values": [
+                ["Name", "ID", "Role", "Detail", "Status"],
+                ["Tech A", "tech-1", "Technician", "TRUE", "Inactive"],
+            ]
+        }
+
+        client = SheetsClient(spreadsheet_id="test-id", credentials_path="test.json")
+        # Shopmonkey says active, but sheet override forces inactive.
+        result = client._sync_get_tech_departments(active_tech_ids={"tech-1"})
+
+        assert "tech-1" not in result
+
+    @patch("sheets_client.service_account.Credentials.from_service_account_file")
+    @patch("sheets_client.build")
+    def test_no_filter_when_active_tech_ids_is_none(self, mock_build, mock_creds):
+        """When active_tech_ids is None, no Shopmonkey filtering happens."""
+        from sheets_client import SheetsClient
+
+        mock_service = MagicMock()
+        mock_build.return_value = mock_service
+        mock_service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = {
+            "values": [
+                ["Name", "ID", "Role", "Detail", "Status"],
+                ["Tech A", "tech-1", "Technician", "TRUE", "Active"],
+                ["Tech B", "tech-2", "Technician", "TRUE", "Active"],
+            ]
+        }
+
+        client = SheetsClient(spreadsheet_id="test-id", credentials_path="test.json")
+        result = client._sync_get_tech_departments()
+
+        assert "tech-1" in result
+        assert "tech-2" in result
+
+
 class TestSheetsClientGetTechsForDepartment:
     """Tests for get_techs_for_department method."""
 
