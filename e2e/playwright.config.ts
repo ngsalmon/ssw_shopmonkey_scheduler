@@ -28,7 +28,11 @@ export default defineConfig({
     },
     {
       name: 'mobile-chromium',
-      use: { ...devices['iPhone 14'] },
+      // Pixel 7 is a chromium-based mobile device descriptor (touch, mobile
+      // viewport, mobile UA). We use it instead of iPhone 14 because the
+      // iPhone device's `defaultBrowserType` is webkit, which we don't
+      // install on CI per the harness design decision.
+      use: { ...devices['Pixel 7'] },
       // Mobile only runs the specs explicitly tagged @mobile.
       grep: /@mobile/,
     },
