@@ -196,6 +196,16 @@
         return labels[type] || type;
     }
 
+    function getTintAreaGroup(area) {
+        if (!area) return null;
+        const lower = area.toLowerCase();
+        if (lower.includes('full')) return 'Full Vehicle';
+        if (lower.includes('windshield') && !lower.includes('strip')) return 'Windshield';
+        if (lower.includes('sunstrip') || lower.includes('sun strip')) return 'Sunstrip';
+        if (lower.includes('door') || lower.includes('front')) return 'Front Doors';
+        return area;
+    }
+
     // Sort services consistently within a category
     function sortServices(services, categoryKey) {
         return [...services].sort((a, b) => {
@@ -434,7 +444,7 @@
             if (categoryKey === 'windowTint') {
                 const filters = state.filters.windowTint;
                 if (filters.tintType && p.tintType !== filters.tintType) return false;
-                if (filters.tintArea && p.tintArea !== filters.tintArea) return false;
+                if (filters.tintArea && getTintAreaGroup(p.tintArea) !== filters.tintArea) return false;
             }
 
             return true;
@@ -595,17 +605,11 @@
                 const seenGroups = new Set();
 
                 options.tintAreas.forEach(area => {
-                    const lower = area.toLowerCase();
-                    let groupKey = area;
-
-                    if (lower.includes('full')) groupKey = 'Full Vehicle';
-                    else if (lower.includes('windshield') && !lower.includes('strip')) groupKey = 'Windshield';
-                    else if (lower.includes('sunstrip') || lower.includes('sun strip')) groupKey = 'Sunstrip';
-                    else if (lower.includes('door') || lower.includes('front')) groupKey = 'Front Doors';
+                    const groupKey = getTintAreaGroup(area);
 
                     if (!seenGroups.has(groupKey)) {
                         seenGroups.add(groupKey);
-                        areaGroups.push({ key: area, label: groupKey });
+                        areaGroups.push({ key: groupKey, label: groupKey });
                     }
                 });
 
@@ -1449,7 +1453,7 @@
                 if (parsed.serviceType) state.filters.detail.serviceType = parsed.serviceType;
             } else if (parsed.categoryKey === 'windowTint') {
                 if (parsed.tintType) state.filters.windowTint.tintType = parsed.tintType;
-                if (parsed.tintArea) state.filters.windowTint.tintArea = parsed.tintArea;
+                if (parsed.tintArea) state.filters.windowTint.tintArea = getTintAreaGroup(parsed.tintArea);
             }
 
             renderServiceSelection();
