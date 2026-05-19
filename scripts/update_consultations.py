@@ -126,7 +126,7 @@ def add_label_to_service(client, service_id, label_id):
     current_labels = service.get("labels", [])
 
     # Check if label already attached
-    if any(l.get("id") == label_id for l in current_labels):
+    if any(label.get("id") == label_id for label in current_labels):
         return {"already_attached": True}
 
     # Add the new label
@@ -160,7 +160,7 @@ def update_shopmonkey(client):
             updated = update_canned_service(client, sales_consultation["id"], updates)
             print(f"  Updated to bookable: {updated.get('bookable', True)}")
         else:
-            print(f"  Already bookable: True")
+            print("  Already bookable: True")
 
         sales_consultation_id = sales_consultation["id"]
     else:
@@ -197,9 +197,9 @@ def update_shopmonkey(client):
     label = find_or_create_label(client, "Sales Consultation")
     result = add_label_to_service(client, sales_consultation_id, label["id"])
     if result.get("already_attached"):
-        print(f"  Label already attached to service")
+        print("  Label already attached to service")
     else:
-        print(f"  Label added to service")
+        print("  Label added to service")
 
     # Step 2: Create "Custom Exhaust Consultation" service
     print("\n2. Creating 'Custom Exhaust Consultation' service...")
@@ -233,9 +233,9 @@ def update_shopmonkey(client):
     label = find_or_create_label(client, "Custom Exhaust")
     result = add_label_to_service(client, custom_exhaust_id, label["id"])
     if result.get("already_attached"):
-        print(f"  Label already attached to service")
+        print("  Label already attached to service")
     else:
-        print(f"  Label added to service")
+        print("  Label added to service")
 
     print("\n✓ Shopmonkey updates complete!")
     return sales_consultation_id, custom_exhaust_id

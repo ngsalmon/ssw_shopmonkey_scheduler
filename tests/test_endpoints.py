@@ -1,11 +1,11 @@
 """Unit tests for FastAPI endpoints using TestClient."""
 
 import os
-import pytest
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 # Add parent directory to path for imports

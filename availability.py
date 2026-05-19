@@ -31,7 +31,7 @@ class BusinessHours:
 
 def load_config(config_path: str = "config.yaml") -> dict[str, Any]:
     """Load configuration from YAML file."""
-    with open(config_path, "r") as f:
+    with open(config_path) as f:
         return yaml.safe_load(f)
 
 

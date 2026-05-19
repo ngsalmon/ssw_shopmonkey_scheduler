@@ -1,27 +1,27 @@
 """Unit tests for availability calculation logic."""
 
-import pytest
 import sys
+from datetime import datetime, time
 from pathlib import Path
-from datetime import datetime, time, timedelta
+
+import pytest
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from availability import (
     BusinessHours,
-    TimeSlot,
-    get_business_hours,
-    generate_time_slots,
-    parse_appointment_times,
-    check_slot_conflicts,
     calculate_available_slots,
-    is_slot_available,
-    get_buffer_minutes,
-    get_service_duration_minutes,
-    validate_config,
-    index_appointments_by_tech,
     calculate_days_needed,
+    check_slot_conflicts,
+    generate_time_slots,
+    get_buffer_minutes,
+    get_business_hours,
+    get_service_duration_minutes,
+    index_appointments_by_tech,
+    is_slot_available,
+    parse_appointment_times,
+    validate_config,
 )
 
 

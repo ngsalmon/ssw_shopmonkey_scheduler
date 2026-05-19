@@ -13,8 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from shopmonkey_client import ShopmonkeyClient
 from sheets_client import SheetsClient
+from shopmonkey_client import ShopmonkeyClient
 from tests.e2e_mocks.mock_sheets import MockSheetsClient
 from tests.e2e_mocks.mock_shopmonkey import MockShopmonkeyClient
 

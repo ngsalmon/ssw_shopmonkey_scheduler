@@ -1,0 +1,30 @@
+# Ruff config: lint + format the Python side of the project.
+# Run `ruff check .` and `ruff format .` from the project root.
+
+target-version = "py312"
+line-length = 100
+
+extend-exclude = [
+    ".venv",
+    "e2e/node_modules",
+    "tests/e2e_mocks",  # mock module shapes mirror an external API surface
+]
+
+[lint]
+# Start with a minimal set the codebase already passes. Tighten over time
+# by enabling B (flake8-bugbear), ASYNC, SIM, etc. when their findings have
+# been triaged.
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+]
+
+ignore = [
+    "E501",  # line too long (formatter handles long lines that matter)
+]
+
+[format]
+quote-style = "double"
+indent-style = "space"

@@ -4,15 +4,16 @@ These tests hit real APIs and require valid credentials in .env file.
 Run with: pytest tests/test_integration.py -v -s
 """
 
-import pytest
-import asyncio
 import sys
 from pathlib import Path
+
+import pytest
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
 
@@ -218,6 +219,7 @@ class TestBookingIntegration:
         6. Cleanup: Delete appointment
         """
         from datetime import datetime, timedelta
+
         from main import get_department_from_service
 
         appointment_id = None  # For cleanup

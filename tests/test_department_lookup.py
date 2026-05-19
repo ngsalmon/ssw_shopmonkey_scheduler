@@ -1,13 +1,12 @@
 """Unit tests for department lookup from Shopmonkey labels."""
 
-import pytest
 import sys
 from pathlib import Path
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from main import get_department_from_service, LABEL_TO_DEPARTMENT
+from main import LABEL_TO_DEPARTMENT, get_department_from_service
 
 
 class TestGetDepartmentFromService:

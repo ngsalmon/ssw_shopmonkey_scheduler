@@ -86,7 +86,7 @@ async def main(apply: bool = False) -> int:
     base_url = os.getenv("SHOPMONKEY_API_BASE_URL", "https://api.shopmonkey.cloud")
     location_id = os.getenv("SHOPMONKEY_LOCATION_ID")
 
-    print(f"Shopmonkey Service Renamer")
+    print("Shopmonkey Service Renamer")
     print(f"{'='*50}")
     print(f"Mode: {'APPLY CHANGES' if apply else 'DRY RUN (preview only)'}")
     print(f"API Base URL: {base_url}")

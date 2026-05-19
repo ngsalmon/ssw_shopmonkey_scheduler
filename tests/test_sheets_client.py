@@ -1,9 +1,10 @@
 """Unit tests for Google Sheets client with mocked API."""
 
-import pytest
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))

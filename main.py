@@ -29,7 +29,7 @@ from availability import (
 )
 from email_client import BookingDetails, get_email_client
 from sheets_client import SheetsClient
-from shopmonkey_client import ShopmonkeyClient, ShopmonkeyAPIError
+from shopmonkey_client import ShopmonkeyAPIError, ShopmonkeyClient
 
 # Load environment variables
 load_dotenv()
@@ -451,7 +451,7 @@ async def get_qualified_techs_for_service(
         logger.warning("service_not_found", service_id=service_id)
         raise HTTPException(
             status_code=404,
-            detail=f"Service not found",
+            detail="Service not found",
         )
 
     if is_service_disabled(service):
@@ -472,7 +472,7 @@ async def get_qualified_techs_for_service(
         )
         raise HTTPException(
             status_code=404,
-            detail=f"Service configuration incomplete",
+            detail="Service configuration incomplete",
         )
 
     logger.debug("department_resolved", department=department)
@@ -495,7 +495,7 @@ async def get_qualified_techs_for_service(
         logger.warning("no_techs_for_department", department=department)
         raise HTTPException(
             status_code=404,
-            detail=f"No availability for this service",
+            detail="No availability for this service",
         )
 
     logger.debug(
@@ -561,7 +561,7 @@ async def list_services(_: ApiKeyDep):
         raise HTTPException(
             status_code=502, detail="Unable to reach scheduling service"
         )
-    except Exception as e:
+    except Exception:
         logger.exception("unexpected_error_fetching_services")
         raise HTTPException(status_code=500, detail="An unexpected error occurred")
 
@@ -678,7 +678,7 @@ async def get_availability(
 
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         logger.exception(
             "unexpected_error_checking_availability", service_id=service_id
         )
@@ -870,7 +870,7 @@ Booked online via scheduling API."""
         except ShopmonkeyAPIError as e:
             logger.error("shopmonkey_api_error_during_booking", error=str(e))
             raise HTTPException(status_code=502, detail="Unable to complete booking")
-        except Exception as e:
+        except Exception:
             logger.exception("unexpected_error_booking", service_id=request.service_id)
             raise HTTPException(status_code=500, detail="An unexpected error occurred")
 
