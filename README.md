@@ -20,7 +20,7 @@ A Python FastAPI backend with embeddable JavaScript widget for online appointmen
 
 ### Prerequisites
 
-- Python 3.10+
+- Python 3.11+ (3.12 matches the production Docker image; see `.python-version`)
 - Shopmonkey API token
 - Google Cloud service account with Sheets API access
 - Google Sheet with technician/department mapping
@@ -32,8 +32,9 @@ A Python FastAPI backend with embeddable JavaScript widget for online appointmen
 git clone https://github.com/ngsalmon/ssw_shopmonkey_scheduler.git
 cd ssw_shopmonkey_scheduler
 
-# Install dependencies
-pip install -r requirements.txt
+# One-shot venv setup: creates .venv, installs requirements.txt
+./scripts/setup-dev.sh
+source .venv/bin/activate
 
 # Copy environment file and configure
 cp .env.example .env
