@@ -82,6 +82,46 @@ booking_lock = asyncio.Lock()
 round_robin_tracker: dict[str, dict[int, int]] = {}
 
 
+def build_ootb_booking_name(
+    customer_first: str,
+    customer_last: str,
+    vehicle_year: int,
+    vehicle_make: str,
+    vehicle_model: str,
+    service_name: str,
+) -> str:
+    """Build a calendar tile name that mirrors Shopmonkey's OOTB scheduler.
+
+    OOTB pattern observed in production:
+        "Russ N. / 2016 Toyota RAV4 / Window Tint - Two Door Tint - Carbon - 20%"
+    """
+    first = customer_first.strip()
+    last_initial = customer_last.strip()[:1].upper()
+    suffix = "." if last_initial else ""
+    customer_part = f"{first} {last_initial}{suffix}".strip()
+    vehicle_part = f"{vehicle_year} {vehicle_make} {vehicle_model}".strip()
+    return f"{customer_part} / {vehicle_part} / {service_name}"
+
+
+def canned_service_labors_for_attach(service: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract the labor lines from a canned service for `attach_services_to_order`.
+
+    Only forwards the fields Shopmonkey accepts on the line-item POST: name,
+    hours, rateCents. Empty list when the canned service has no labors so the
+    line item is still created (at $0).
+    """
+    labors: list[dict[str, Any]] = []
+    for labor in service.get("labors", []) or []:
+        labors.append(
+            {
+                "name": labor.get("name") or service.get("name") or "",
+                "hours": labor.get("hours", 0) or 0,
+                "rateCents": labor.get("rateCents", 0) or 0,
+            }
+        )
+    return labors
+
+
 def select_tech_by_priority(
     qualified_techs: list[dict],
     available_tech_ids: list[str],
@@ -776,6 +816,81 @@ async def book_appointment(_: ApiKeyDep, request: BookingRequest):
                 raise HTTPException(status_code=500, detail="Unable to process booking")
             logger.debug("vehicle_ready", vehicle_id=vehicle_id)
 
+            # Build OOTB-style calendar tile name once - shared by the order
+            # (if we create one) and the appointment.
+            ootb_name = build_ootb_booking_name(
+                customer_first=booking_first,
+                customer_last=booking_last,
+                vehicle_year=request.vehicle.year,
+                vehicle_make=request.vehicle.make,
+                vehicle_model=request.vehicle.model,
+                service_name=service_name,
+            )
+
+            # Create the repair order in Shopmonkey's "Scheduled" workflow
+            # column so staff can route the booking through their normal
+            # ticket workflow (mirrors the OOTB scheduler). Guarded by a
+            # config flag so we can disable without redeploying.
+            online_booking_cfg = config.get("online_booking") or {}
+            order_id: str | None = None
+            if online_booking_cfg.get("create_order"):
+                workflow_status_name = online_booking_cfg.get("workflow_status_name", "Scheduled")
+                try:
+                    workflow_status_id = await shopmonkey_client.get_workflow_status_id(
+                        workflow_status_name
+                    )
+                except Exception:
+                    logger.exception(
+                        "workflow_status_lookup_failed",
+                        workflow_status_name=workflow_status_name,
+                    )
+                    workflow_status_id = None
+
+                if not workflow_status_id:
+                    logger.warning(
+                        "workflow_status_not_found",
+                        name=workflow_status_name,
+                        message="Skipping order creation; appointment will not be linked to a ticket",
+                    )
+                else:
+                    try:
+                        created_order = await shopmonkey_client.create_order(
+                            customer_id=customer_id,
+                            vehicle_id=vehicle_id,
+                            workflow_status_id=workflow_status_id,
+                            status=online_booking_cfg.get("order_status", "Estimate"),
+                            color=online_booking_cfg.get("order_color", "blue"),
+                            name=ootb_name,
+                        )
+                        order_id = created_order.get("id")
+                        logger.info(
+                            "order_created",
+                            order_id=order_id,
+                            order_number=created_order.get("number"),
+                        )
+
+                        # Attach the requested service as a line item. Passing
+                        # labors makes Shopmonkey compute calculatedLaborCents
+                        # so the ticket isn't $0 by default.
+                        attach_payload = [
+                            {
+                                "cannedServiceId": request.service_id,
+                                "name": service_name,
+                                "labors": canned_service_labors_for_attach(service),
+                            }
+                        ]
+                        await shopmonkey_client.attach_services_to_order(
+                            order_id=order_id, services=attach_payload
+                        )
+                        logger.info("service_attached_to_order", order_id=order_id)
+                    except ShopmonkeyAPIError as e:
+                        logger.warning(
+                            "order_creation_failed",
+                            error=str(e),
+                            message="Falling back to appointment-only booking",
+                        )
+                        order_id = None
+
             # Create appointment - assign tech by priority + round-robin
             assigned_tech_id = select_tech_by_priority(
                 qualified_techs=qualified_techs,
@@ -823,9 +938,10 @@ Booked online via scheduling API."""
                 vehicle_id=vehicle_id,
                 start_date=start_date_iso,
                 end_date=end_date_iso,
-                title=f"Online Booking: {service_name}",
+                title=ootb_name,
                 notes=work_order_notes,
                 technician_id=assigned_tech_id,
+                order_id=order_id,
             )
 
             appointment_id = appointment.get("id", "")

@@ -122,11 +122,14 @@ class MockState:
         self.appointments: list[MockAppointment] = []
         self.customers: list[MockCustomer] = []
         self.vehicles: list[MockVehicle] = []
+        self.orders: dict[str, dict[str, Any]] = {}
         # Endpoint name -> error spec like {"status_code": 500, "message": "..."}
         # or {"network": True} / {"timeout": True}. Cleared on reset.
         self.errors: dict[str, dict[str, Any]] = {}
         # Recorded calls for assertions
         self.recorded_create_appointment_payloads: list[dict[str, Any]] = []
+        self.recorded_create_order_payloads: list[dict[str, Any]] = []
+        self.recorded_attach_services_payloads: list[dict[str, Any]] = []
 
     def reset(self) -> None:
         self.services.clear()
@@ -134,8 +137,11 @@ class MockState:
         self.appointments.clear()
         self.customers.clear()
         self.vehicles.clear()
+        self.orders.clear()
         self.errors.clear()
         self.recorded_create_appointment_payloads.clear()
+        self.recorded_create_order_payloads.clear()
+        self.recorded_attach_services_payloads.clear()
 
     def load_default(self) -> None:
         """Load the default realistic fixture: all categories, all sizes."""
@@ -240,10 +246,13 @@ class MockState:
                 for t in self.techs.values()
             ],
             "appointments": [a.to_dict() for a in self.appointments],
+            "orders": list(self.orders.values()),
             "errors": copy.deepcopy(self.errors),
             "recorded_create_appointment_payloads": list(
                 self.recorded_create_appointment_payloads
             ),
+            "recorded_create_order_payloads": list(self.recorded_create_order_payloads),
+            "recorded_attach_services_payloads": list(self.recorded_attach_services_payloads),
         }
 
     # --- default fixture ---------------------------------------------------

@@ -95,7 +95,7 @@ class ShopmonkeyClient:
         method: str,
         endpoint: str,
         params: dict[str, Any] | None = None,
-        json_data: dict[str, Any] | None = None,
+        json_data: dict[str, Any] | list[Any] | None = None,
     ) -> dict[str, Any]:
         """
         Make an HTTP request to the Shopmonkey API with retry logic.
@@ -256,6 +256,11 @@ class ShopmonkeyClient:
         customer_data: dict[str, Any] = {
             "firstName": first_name,
             "lastName": last_name,
+            # Shopmonkey requires customerType on POST /v3/customer (validation
+            # added at some point after our initial integration; observed
+            # against the live API). "Customer" is the value existing records
+            # use.
+            "customerType": "Customer",
         }
         if email:
             customer_data["email"] = email
@@ -333,8 +338,9 @@ class ShopmonkeyClient:
         notes: str | None = None,
         technician_id: str | None = None,
         color: str = "blue",
+        order_id: str | None = None,
     ) -> dict[str, Any]:
-        """Create a new appointment."""
+        """Create a new appointment, optionally linked to a repair order."""
         appointment_data: dict[str, Any] = {
             "customerId": customer_id,
             "vehicleId": vehicle_id,
@@ -348,11 +354,79 @@ class ShopmonkeyClient:
             appointment_data["note"] = notes
         if technician_id:
             appointment_data["technicianId"] = technician_id
+        if order_id:
+            appointment_data["orderId"] = order_id
         if self.location_id:
             appointment_data["locationId"] = self.location_id
 
         result = await self._request("POST", "/v3/appointment", json_data=appointment_data)
         return result.get("data", result)
+
+    async def get_workflow_statuses(self) -> list[dict[str, Any]]:
+        """List all workflow status columns (Scheduled, In Progress, etc)."""
+        params: dict[str, Any] = {}
+        if self.location_id:
+            params["locationId"] = self.location_id
+        result = await self._request(
+            "GET", "/v3/workflow_status", params=params if params else None
+        )
+        return result.get("data", [])
+
+    async def get_workflow_status_id(self, name: str) -> str | None:
+        """Return the workflow_status id matching the given name, or None."""
+        statuses = await self.get_workflow_statuses()
+        for s in statuses:
+            if s.get("name") == name:
+                return s.get("id")
+        return None
+
+    async def create_order(
+        self,
+        customer_id: str,
+        vehicle_id: str,
+        workflow_status_id: str,
+        status: str = "Estimate",
+        color: str | None = None,
+        name: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a repair order in Shopmonkey.
+
+        Pairs with `attach_services_to_order` and `create_appointment(order_id=...)`
+        to mirror what the OOTB online scheduler creates: an order in the
+        "Scheduled" workflow column plus an appointment linked via orderId.
+        """
+        order_data: dict[str, Any] = {
+            "customerId": customer_id,
+            "vehicleId": vehicle_id,
+            "workflowStatusId": workflow_status_id,
+            "status": status,
+        }
+        if color:
+            order_data["color"] = color
+        if name:
+            order_data["name"] = name
+        if self.location_id:
+            order_data["locationId"] = self.location_id
+        result = await self._request("POST", "/v3/order", json_data=order_data)
+        return result.get("data", result)
+
+    async def attach_services_to_order(
+        self,
+        order_id: str,
+        services: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Attach one or more service line items to an order.
+
+        Each service dict should include at minimum `cannedServiceId` and
+        `name`, and ideally a `labors` array copied from the canned service so
+        the order's calculated labor cents are populated. POSTing without
+        labors leaves the line item at $0 - functional but missing pricing.
+        """
+        result = await self._request("POST", f"/v3/order/{order_id}/service", json_data=services)
+        data = result.get("data", result)
+        if isinstance(data, dict):
+            return data.get("services", [])
+        return data
 
     async def get_users(self) -> list[dict[str, Any]]:
         """Fetch all users (technicians)."""

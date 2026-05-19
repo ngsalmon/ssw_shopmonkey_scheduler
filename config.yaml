@@ -37,3 +37,13 @@ disabled_departments:
   Detail:
     except:
       - "Headlight Restoration"
+
+# Online booking parity with Shopmonkey's OOTB scheduler. When create_order
+# is true, the /book endpoint also creates a repair-order in the named
+# workflow column and attaches the service line item (with labors copied
+# from the canned service). The appointment is linked via orderId.
+online_booking:
+  create_order: true
+  workflow_status_name: "Scheduled"
+  order_status: "Estimate"
+  order_color: "blue"

@@ -145,6 +145,7 @@ class MockShopmonkeyClient:
         notes: str | None = None,
         technician_id: str | None = None,
         color: str = "blue",
+        order_id: str | None = None,
     ) -> dict[str, Any]:
         _raise_if_error("create_appointment", self._state)
         payload = {
@@ -156,6 +157,7 @@ class MockShopmonkeyClient:
             "notes": notes,
             "technician_id": technician_id,
             "color": color,
+            "order_id": order_id,
         }
         self._state.recorded_create_appointment_payloads.append(payload)
         appt = self._state.add_appointment(
@@ -166,7 +168,82 @@ class MockShopmonkeyClient:
             vehicle_id=vehicle_id,
             name=title or "Online Booking",
         )
-        return appt.to_dict()
+        result = appt.to_dict()
+        result["orderId"] = order_id
+        return result
+
+    async def get_workflow_statuses(self) -> list[dict[str, Any]]:
+        _raise_if_error("get_workflow_statuses", self._state)
+        # Default Shopmonkey-style workflow columns. Tests can override via
+        # /test/state if they need a custom set.
+        return [
+            {"id": "ws_scheduled", "name": "Scheduled"},
+            {"id": "ws_in_progress", "name": "In Progress"},
+            {"id": "ws_invoices", "name": "Invoices"},
+        ]
+
+    async def get_workflow_status_id(self, name: str) -> str | None:
+        for s in await self.get_workflow_statuses():
+            if s.get("name") == name:
+                return s.get("id")
+        return None
+
+    async def create_order(
+        self,
+        customer_id: str,
+        vehicle_id: str,
+        workflow_status_id: str,
+        status: str = "Estimate",
+        color: str | None = None,
+        name: str | None = None,
+    ) -> dict[str, Any]:
+        _raise_if_error("create_order", self._state)
+        order_id = f"order_{uuid.uuid4().hex[:8]}"
+        order = {
+            "id": order_id,
+            "customerId": customer_id,
+            "vehicleId": vehicle_id,
+            "workflowStatusId": workflow_status_id,
+            "status": status,
+            "color": color,
+            "name": name,
+            "number": str(len(self._state.recorded_create_order_payloads) + 1000),
+        }
+        self._state.recorded_create_order_payloads.append(
+            {
+                "customer_id": customer_id,
+                "vehicle_id": vehicle_id,
+                "workflow_status_id": workflow_status_id,
+                "status": status,
+                "color": color,
+                "name": name,
+            }
+        )
+        self._state.orders[order_id] = order
+        return order
+
+    async def attach_services_to_order(
+        self,
+        order_id: str,
+        services: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        _raise_if_error("attach_services_to_order", self._state)
+        self._state.recorded_attach_services_payloads.append(
+            {"order_id": order_id, "services": services}
+        )
+        attached = []
+        for svc in services:
+            attached.append(
+                {
+                    "id": f"svc_{uuid.uuid4().hex[:8]}",
+                    "orderId": order_id,
+                    "name": svc.get("name", ""),
+                    "cannedServiceId": svc.get("cannedServiceId"),
+                    "labors": svc.get("labors", []),
+                }
+            )
+        self._state.orders.setdefault(order_id, {}).setdefault("services", []).extend(attached)
+        return attached
 
     async def get_users(self) -> list[dict[str, Any]]:
         _raise_if_error("get_users", self._state)

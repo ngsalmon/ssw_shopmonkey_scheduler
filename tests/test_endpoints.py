@@ -355,6 +355,108 @@ class TestBookEndpoint:
         assert "Customer record on file: Jena Scaletty" in notes
         assert "TJ McLaughlin" in notes
 
+    def test_booking_creates_order_and_attaches_service_when_flag_on(
+        self, mock_shopmonkey_client, mock_sheets_client
+    ):
+        """OOTB parity: with online_booking.create_order=true the /book flow
+        also POSTs an order, attaches the canned service as a line item, and
+        sets orderId on the appointment.
+        """
+        mock_shopmonkey_client.get_workflow_status_id = AsyncMock(return_value="ws_scheduled")
+        mock_shopmonkey_client.create_order = AsyncMock(
+            return_value={"id": "order_42", "number": "8000"}
+        )
+        mock_shopmonkey_client.attach_services_to_order = AsyncMock(return_value=[])
+        # Use the existing canned service mock; add labors so we can assert
+        # forwarding.
+        mock_shopmonkey_client.get_canned_service = AsyncMock(
+            return_value={
+                "id": "svc-1",
+                "name": "Window Tint",
+                "totalCents": 15000,
+                "labels": [{"name": "Window Tint"}],
+                "labors": [{"name": "Tint Labor", "hours": 1.5, "rateCents": 13000}],
+            }
+        )
+        config_with_flag = {
+            "business_hours": {
+                "monday": {"open": "09:00", "close": "17:00"},
+                "tuesday": {"open": "09:00", "close": "17:00"},
+                "wednesday": {"open": "09:00", "close": "17:00"},
+                "thursday": {"open": "09:00", "close": "17:00"},
+                "friday": {"open": "09:00", "close": "17:00"},
+            },
+            "default_slot_duration_minutes": 60,
+            "online_booking": {
+                "create_order": True,
+                "workflow_status_name": "Scheduled",
+                "order_status": "Estimate",
+                "order_color": "blue",
+            },
+        }
+        with patch.dict(os.environ, {"API_KEY": "", "ALLOWED_ORIGINS": ""}, clear=False):
+            with (
+                patch("main.ShopmonkeyClient", return_value=mock_shopmonkey_client),
+                patch("main.SheetsClient", return_value=mock_sheets_client),
+                patch("main.load_config", return_value=config_with_flag),
+                patch("main.validate_config"),
+            ):
+                from main import app
+
+                with TestClient(app) as client:
+                    response = client.post(
+                        "/book",
+                        json={
+                            "service_id": "svc-1",
+                            "slot_start": "2026-01-19T09:00:00",
+                            "slot_end": "2026-01-19T10:30:00",
+                            "customer": {"firstName": "Russ", "lastName": "Nguyen"},
+                            "vehicle": {"year": 2016, "make": "Toyota", "model": "RAV4"},
+                        },
+                    )
+
+        assert response.status_code == 200, response.text
+        mock_shopmonkey_client.get_workflow_status_id.assert_awaited_once_with("Scheduled")
+        mock_shopmonkey_client.create_order.assert_awaited_once()
+        order_kwargs = mock_shopmonkey_client.create_order.call_args.kwargs
+        assert order_kwargs["workflow_status_id"] == "ws_scheduled"
+        assert order_kwargs["status"] == "Estimate"
+        assert order_kwargs["color"] == "blue"
+        assert order_kwargs["name"] == "Russ N. / 2016 Toyota RAV4 / Window Tint"
+
+        mock_shopmonkey_client.attach_services_to_order.assert_awaited_once()
+        attach_kwargs = mock_shopmonkey_client.attach_services_to_order.call_args.kwargs
+        assert attach_kwargs["order_id"] == "order_42"
+        services = attach_kwargs["services"]
+        assert len(services) == 1
+        assert services[0]["cannedServiceId"] == "svc-1"
+        assert services[0]["name"] == "Window Tint"
+        assert services[0]["labors"] == [{"name": "Tint Labor", "hours": 1.5, "rateCents": 13000}]
+
+        appt_kwargs = mock_shopmonkey_client.create_appointment.call_args.kwargs
+        assert appt_kwargs["order_id"] == "order_42"
+        assert appt_kwargs["title"] == "Russ N. / 2016 Toyota RAV4 / Window Tint"
+
+    def test_booking_skips_order_creation_when_flag_off(self, test_client, mock_shopmonkey_client):
+        """With online_booking absent from config the order endpoints are not called."""
+        # The default test_client fixture's config has no online_booking block,
+        # so booking should skip the order endpoints entirely.
+        mock_shopmonkey_client.create_order = AsyncMock()
+        mock_shopmonkey_client.attach_services_to_order = AsyncMock()
+        response = test_client.post(
+            "/book",
+            json={
+                "service_id": "svc-1",
+                "slot_start": "2026-01-19T09:00:00",
+                "slot_end": "2026-01-19T10:00:00",
+                "customer": {"firstName": "Jane", "lastName": "Doe"},
+                "vehicle": {"year": 2020, "make": "Honda", "model": "Civic"},
+            },
+        )
+        assert response.status_code == 200
+        mock_shopmonkey_client.create_order.assert_not_awaited()
+        mock_shopmonkey_client.attach_services_to_order.assert_not_awaited()
+
     def test_booking_notes_omit_mismatch_when_names_match(
         self, test_client, mock_shopmonkey_client
     ):

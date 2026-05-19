@@ -68,7 +68,13 @@ test('full booking flow ends in confirmation with SM-YYYYMMDD-XXXXXX format', as
   const state = await getState(request);
   expect(state.recorded_create_appointment_payloads.length).toBe(1);
   const payload = state.recorded_create_appointment_payloads[0]!;
-  expect(payload.title).toMatch(/Online Booking/i);
+  // Title now follows the OOTB scheduler pattern:
+  //   "FirstName L. / Year Make Model / Service Name"
+  expect(payload.title).toMatch(/^Anne T\. \/ 2023 Toyota Camry \/ Window Tint/);
+  // The appointment should be linked to a created order.
+  expect(payload.order_id).toBeTruthy();
+  expect(state.recorded_create_order_payloads.length).toBe(1);
+  expect(state.recorded_attach_services_payloads.length).toBe(1);
   expect(typeof payload.technician_id).toBe('string');
 });
 

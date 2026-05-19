@@ -73,6 +73,9 @@ export async function getState(request: APIRequestContext): Promise<{
   appointments: Array<Record<string, unknown>>;
   errors: Record<string, ErrorInjection>;
   recorded_create_appointment_payloads: Array<Record<string, unknown>>;
+  recorded_create_order_payloads: Array<Record<string, unknown>>;
+  recorded_attach_services_payloads: Array<Record<string, unknown>>;
+  orders: Array<Record<string, unknown>>;
   config: Record<string, unknown>;
 }> {
   const response = await request.get('/test/state');
