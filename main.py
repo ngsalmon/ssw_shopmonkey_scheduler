@@ -23,6 +23,7 @@ from availability import (
     get_buffer_minutes,
     get_business_hours,
     get_service_duration_minutes,
+    get_timezone,
     is_slot_available,
     load_config,
     validate_config,
@@ -713,6 +714,7 @@ async def book_appointment(_: ApiKeyDep, request: BookingRequest):
                 slot_end=slot_end_dt.time(),
                 tech_ids=tech_ids,
                 appointments=appointments,
+                config=config,
             )
 
             if not is_available:
@@ -783,10 +785,13 @@ Confirmation: {confirmation_number}
 Service requested: {service_name}
 Booked online via scheduling API."""
 
-            # Format dates as ISO8601 with Central timezone for Shopmonkey API
-            # TODO: Make timezone configurable via config.yaml
-            start_date_iso = slot_start_dt.strftime("%Y-%m-%dT%H:%M:%S") + ".000-06:00"
-            end_date_iso = slot_end_dt.strftime("%Y-%m-%dT%H:%M:%S") + ".000-06:00"
+            # Format dates as ISO8601 in the configured business timezone for
+            # Shopmonkey. zoneinfo picks the right offset for the date (e.g.
+            # -05:00 in CDT, -06:00 in CST) so DST transitions are handled
+            # without manual offset toggles.
+            tz = get_timezone(config)
+            start_date_iso = slot_start_dt.replace(tzinfo=tz).isoformat(timespec="milliseconds")
+            end_date_iso = slot_end_dt.replace(tzinfo=tz).isoformat(timespec="milliseconds")
 
             appointment = await shopmonkey_client.create_appointment(
                 customer_id=customer_id,

@@ -1,3 +1,9 @@
+# IANA timezone name used to interpret slot times that the widget submits
+# (no offset) and to format datetimes sent to Shopmonkey. DST-aware via
+# zoneinfo, so May (CDT, -05:00) and January (CST, -06:00) both work without
+# manual offset toggles.
+timezone: America/Chicago
+
 business_hours:
   monday:
     open: "09:00"

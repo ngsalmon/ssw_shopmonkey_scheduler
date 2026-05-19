@@ -129,8 +129,8 @@ class TestParseAppointmentTimes:
     def test_parses_valid_iso_times(self):
         """Should parse valid ISO format times."""
         appt = {
-            "startDate": "2026-01-19T09:00:00Z",
-            "endDate": "2026-01-19T10:00:00Z",
+            "startDate": "2026-01-19T09:00:00-06:00",
+            "endDate": "2026-01-19T10:00:00-06:00",
         }
         result = parse_appointment_times(appt)
         assert result is not None
@@ -140,19 +140,19 @@ class TestParseAppointmentTimes:
 
     def test_returns_none_when_start_missing(self):
         """Should return None when startDate is missing."""
-        appt = {"endDate": "2026-01-19T10:00:00Z"}
+        appt = {"endDate": "2026-01-19T10:00:00-06:00"}
         assert parse_appointment_times(appt) is None
 
     def test_returns_none_when_end_missing(self):
         """Should return None when endDate is missing."""
-        appt = {"startDate": "2026-01-19T09:00:00Z"}
+        appt = {"startDate": "2026-01-19T09:00:00-06:00"}
         assert parse_appointment_times(appt) is None
 
     def test_returns_none_for_invalid_format(self):
         """Should return None for invalid date format."""
         appt = {
             "startDate": "invalid",
-            "endDate": "2026-01-19T10:00:00Z",
+            "endDate": "2026-01-19T10:00:00-06:00",
         }
         assert parse_appointment_times(appt) is None
 
@@ -176,8 +176,8 @@ class TestCheckSlotConflicts:
         appointments = [
             {
                 "technicianId": "tech1",
-                "startDate": "2026-01-19T09:30:00Z",
-                "endDate": "2026-01-19T10:30:00Z",
+                "startDate": "2026-01-19T09:30:00-06:00",
+                "endDate": "2026-01-19T10:30:00-06:00",
             }
         ]
         result = check_slot_conflicts(
@@ -194,8 +194,8 @@ class TestCheckSlotConflicts:
         appointments = [
             {
                 "technicianId": "tech2",
-                "startDate": "2026-01-19T09:00:00Z",
-                "endDate": "2026-01-19T10:00:00Z",
+                "startDate": "2026-01-19T09:00:00-06:00",
+                "endDate": "2026-01-19T10:00:00-06:00",
             }
         ]
         result = check_slot_conflicts(
@@ -212,8 +212,8 @@ class TestCheckSlotConflicts:
         appointments = [
             {
                 "technicianId": "tech1",
-                "startDate": "2026-01-19T07:00:00Z",
-                "endDate": "2026-01-19T08:00:00Z",
+                "startDate": "2026-01-19T07:00:00-06:00",
+                "endDate": "2026-01-19T08:00:00-06:00",
             }
         ]
         result = check_slot_conflicts(
@@ -230,8 +230,8 @@ class TestCheckSlotConflicts:
         appointments = [
             {
                 "technicianId": "tech1",
-                "startDate": "2026-01-19T11:00:00Z",
-                "endDate": "2026-01-19T12:00:00Z",
+                "startDate": "2026-01-19T11:00:00-06:00",
+                "endDate": "2026-01-19T12:00:00-06:00",
             }
         ]
         result = check_slot_conflicts(
@@ -287,8 +287,8 @@ class TestCalculateAvailableSlots:
         appointments = [
             {
                 "technicianId": "tech1",
-                "startDate": "2026-01-19T09:00:00Z",
-                "endDate": "2026-01-19T10:00:00Z",
+                "startDate": "2026-01-19T09:00:00-06:00",
+                "endDate": "2026-01-19T10:00:00-06:00",
             }
         ]
         slots = calculate_available_slots(
@@ -322,8 +322,8 @@ class TestIsSlotAvailable:
         appointments = [
             {
                 "technicianId": "tech1",
-                "startDate": "2026-01-19T09:00:00Z",
-                "endDate": "2026-01-19T10:00:00Z",
+                "startDate": "2026-01-19T09:00:00-06:00",
+                "endDate": "2026-01-19T10:00:00-06:00",
             }
         ]
         is_avail, tech_ids = is_slot_available(
@@ -341,8 +341,8 @@ class TestIsSlotAvailable:
         appointments = [
             {
                 "technicianId": "tech1",
-                "startDate": "2026-01-19T09:00:00Z",
-                "endDate": "2026-01-19T10:00:00Z",
+                "startDate": "2026-01-19T09:00:00-06:00",
+                "endDate": "2026-01-19T10:00:00-06:00",
             }
         ]
         is_avail, tech_ids = is_slot_available(
@@ -565,9 +565,9 @@ class TestIndexAppointmentsByTech:
     def test_indexes_by_technician_id(self):
         """Should index appointments by technicianId."""
         appointments = [
-            {"technicianId": "tech1", "startDate": "2026-01-19T09:00:00Z"},
-            {"technicianId": "tech1", "startDate": "2026-01-19T10:00:00Z"},
-            {"technicianId": "tech2", "startDate": "2026-01-19T09:00:00Z"},
+            {"technicianId": "tech1", "startDate": "2026-01-19T09:00:00-06:00"},
+            {"technicianId": "tech1", "startDate": "2026-01-19T10:00:00-06:00"},
+            {"technicianId": "tech2", "startDate": "2026-01-19T09:00:00-06:00"},
         ]
         indexed = index_appointments_by_tech(appointments)
         assert len(indexed["tech1"]) == 2
@@ -576,7 +576,7 @@ class TestIndexAppointmentsByTech:
     def test_indexes_by_user_id_fallback(self):
         """Should use userId as fallback when technicianId is missing."""
         appointments = [
-            {"userId": "tech1", "startDate": "2026-01-19T09:00:00Z"},
+            {"userId": "tech1", "startDate": "2026-01-19T09:00:00-06:00"},
         ]
         indexed = index_appointments_by_tech(appointments)
         assert "tech1" in indexed
@@ -590,8 +590,8 @@ class TestIndexAppointmentsByTech:
     def test_appointments_without_tech_id_skipped(self):
         """Should skip appointments without tech ID."""
         appointments = [
-            {"startDate": "2026-01-19T09:00:00Z"},  # No tech ID
-            {"technicianId": "tech1", "startDate": "2026-01-19T10:00:00Z"},
+            {"startDate": "2026-01-19T09:00:00-06:00"},  # No tech ID
+            {"technicianId": "tech1", "startDate": "2026-01-19T10:00:00-06:00"},
         ]
         indexed = index_appointments_by_tech(appointments)
         assert len(indexed) == 1
@@ -685,8 +685,8 @@ class TestCheckSlotConflictsWithIndex:
         appointments = [
             {
                 "technicianId": "tech1",
-                "startDate": "2026-01-19T09:00:00Z",
-                "endDate": "2026-01-19T10:00:00Z",
+                "startDate": "2026-01-19T09:00:00-06:00",
+                "endDate": "2026-01-19T10:00:00-06:00",
             },
         ]
         indexed = index_appointments_by_tech(appointments)
@@ -706,8 +706,8 @@ class TestCheckSlotConflictsWithIndex:
         appointments = [
             {
                 "technicianId": "tech1",
-                "startDate": "2026-01-19T09:00:00Z",
-                "endDate": "2026-01-19T10:00:00Z",
+                "startDate": "2026-01-19T09:00:00-06:00",
+                "endDate": "2026-01-19T10:00:00-06:00",
             },
         ]
         indexed = index_appointments_by_tech(appointments)
@@ -797,3 +797,116 @@ class TestMultiDayAvailability:
                     "tech1" not in morning_slot.available_tech_ids
                     or "tech2" in morning_slot.available_tech_ids
                 )
+
+
+class TestTimezoneAwareConflictDetection:
+    """Regression coverage for the booking-vs-availability TZ mismatch.
+
+    Pre-fix, `check_slot_conflicts` stripped tzinfo without converting, so a
+    UTC appointment time was compared as-if-naive against a slot expressed in
+    business-local time. That allowed double-bookings when Shopmonkey
+    appointments existed in CDT/CST: a 9am Central appointment came back as
+    14:00 or 15:00 UTC, was treated as 14:00 local, and didn't appear to
+    overlap a 9am slot.
+    """
+
+    def test_cdt_appointment_blocks_local_slot_in_may(self):
+        # 9am CDT on May 20, 2026 -> 14:00 UTC. Shopmonkey returns it with a
+        # Z suffix; the conflict check must convert before comparing.
+        appointments = [
+            {
+                "technicianId": "tech1",
+                "startDate": "2026-05-20T14:00:00Z",  # 9am CDT
+                "endDate": "2026-05-20T15:30:00Z",  # 10:30am CDT
+            }
+        ]
+        # A slot at 9am-10:30am local should be flagged as a conflict.
+        has_conflict = check_slot_conflicts(
+            slot_start=time(9, 0),
+            slot_end=time(10, 30),
+            date=datetime(2026, 5, 20),
+            appointments=appointments,
+            tech_id="tech1",
+        )
+        assert has_conflict is True
+
+    def test_cst_appointment_blocks_local_slot_in_january(self):
+        # 9am CST on Jan 19, 2026 -> 15:00 UTC (CST is -06:00).
+        appointments = [
+            {
+                "technicianId": "tech1",
+                "startDate": "2026-01-19T15:00:00Z",
+                "endDate": "2026-01-19T16:00:00Z",
+            }
+        ]
+        has_conflict = check_slot_conflicts(
+            slot_start=time(9, 0),
+            slot_end=time(10, 0),
+            date=datetime(2026, 1, 19),
+            appointments=appointments,
+            tech_id="tech1",
+        )
+        assert has_conflict is True
+
+    def test_appointment_outside_business_hours_does_not_block(self):
+        # 4am CDT on May 20 (UTC 09:00) shouldn't conflict with a 9am local slot.
+        appointments = [
+            {
+                "technicianId": "tech1",
+                "startDate": "2026-05-20T09:00:00Z",  # 4am CDT
+                "endDate": "2026-05-20T10:00:00Z",  # 5am CDT
+            }
+        ]
+        has_conflict = check_slot_conflicts(
+            slot_start=time(9, 0),
+            slot_end=time(10, 0),
+            date=datetime(2026, 5, 20),
+            appointments=appointments,
+            tech_id="tech1",
+        )
+        assert has_conflict is False
+
+    def test_is_slot_available_respects_business_tz(self):
+        # Both qualified techs are booked 9-10am CDT (14-15 UTC). The slot
+        # check should report neither available.
+        appointments = [
+            {
+                "technicianId": "tech1",
+                "startDate": "2026-05-20T14:00:00Z",
+                "endDate": "2026-05-20T15:00:00Z",
+            },
+            {
+                "technicianId": "tech2",
+                "startDate": "2026-05-20T14:00:00Z",
+                "endDate": "2026-05-20T15:00:00Z",
+            },
+        ]
+        is_avail, available = is_slot_available(
+            date=datetime(2026, 5, 20),
+            slot_start=time(9, 0),
+            slot_end=time(10, 0),
+            tech_ids=["tech1", "tech2"],
+            appointments=appointments,
+            config={"timezone": "America/Chicago"},
+        )
+        assert is_avail is False
+        assert available == []
+
+    def test_non_default_tz_is_respected(self):
+        # Eastern time: 9am ET = 13:00 UTC. Verify config drives the offset.
+        appointments = [
+            {
+                "technicianId": "tech1",
+                "startDate": "2026-05-20T13:00:00Z",
+                "endDate": "2026-05-20T14:00:00Z",
+            }
+        ]
+        is_avail, _ = is_slot_available(
+            date=datetime(2026, 5, 20),
+            slot_start=time(9, 0),
+            slot_end=time(10, 0),
+            tech_ids=["tech1"],
+            appointments=appointments,
+            config={"timezone": "America/New_York"},
+        )
+        assert is_avail is False

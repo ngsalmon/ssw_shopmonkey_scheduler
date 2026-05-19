@@ -379,13 +379,13 @@ class TestBookEndpoint:
             return_value=[
                 {
                     "technicianId": "tech-1",
-                    "startDate": "2026-01-19T09:00:00Z",
-                    "endDate": "2026-01-19T10:00:00Z",
+                    "startDate": "2026-01-19T09:00:00-06:00",
+                    "endDate": "2026-01-19T10:00:00-06:00",
                 },
                 {
                     "technicianId": "tech-2",
-                    "startDate": "2026-01-19T09:00:00Z",
-                    "endDate": "2026-01-19T10:00:00Z",
+                    "startDate": "2026-01-19T09:00:00-06:00",
+                    "endDate": "2026-01-19T10:00:00-06:00",
                 },
             ]
         )

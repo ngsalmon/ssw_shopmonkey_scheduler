@@ -3,8 +3,23 @@
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import yaml
+
+# Default IANA timezone for the business. Used when config.yaml doesn't set
+# `timezone`. zoneinfo handles DST automatically.
+DEFAULT_TIMEZONE = "America/Chicago"
+
+
+def get_timezone(config: dict[str, Any] | None) -> ZoneInfo:
+    """Return the ZoneInfo for the business timezone configured in config.yaml.
+
+    Falls back to America/Chicago when no config or no `timezone` key is set.
+    """
+    if not config:
+        return ZoneInfo(DEFAULT_TIMEZONE)
+    return ZoneInfo(config.get("timezone") or DEFAULT_TIMEZONE)
 
 
 @dataclass
@@ -190,21 +205,27 @@ def check_slot_conflicts(
     appointments: list[dict[str, Any]],
     tech_id: str,
     indexed_appointments: dict[str, list[dict[str, Any]]] | None = None,
+    tz: ZoneInfo | None = None,
 ) -> bool:
     """
     Check if a tech has a conflicting appointment during a time slot.
 
     Args:
-        slot_start: Start time of the slot
-        slot_end: End time of the slot
-        date: Date to check
+        slot_start: Start time of the slot (interpreted in the business TZ).
+        slot_end: End time of the slot (interpreted in the business TZ).
+        date: Date to check (interpreted in the business TZ).
         appointments: List of appointments (used if indexed_appointments not provided)
         tech_id: Technician ID to check
         indexed_appointments: Optional pre-indexed appointments by tech_id for O(1) lookup
+        tz: Business timezone for comparison. Defaults to America/Chicago when
+            omitted, which matches the default in config.yaml.
 
     Returns:
         True if there's a conflict, False if the slot is free.
     """
+    if tz is None:
+        tz = ZoneInfo(DEFAULT_TIMEZONE)
+
     slot_start_dt = datetime.combine(date.date(), slot_start)
     slot_end_dt = datetime.combine(date.date(), slot_end)
 
@@ -225,11 +246,15 @@ def check_slot_conflicts(
 
         appt_start, appt_end = times
 
-        # Make naive for comparison if needed
+        # Shopmonkey returns appointments in UTC. Convert to the business TZ
+        # before stripping tzinfo so the naive comparison stays in the same
+        # wall-clock frame as the slot times. Skipping the astimezone step
+        # leaves a UTC value masquerading as local and causes the system to
+        # report techs free when they're actually booked (the 5h DST gap).
         if appt_start.tzinfo is not None:
-            appt_start = appt_start.replace(tzinfo=None)
+            appt_start = appt_start.astimezone(tz).replace(tzinfo=None)
         if appt_end.tzinfo is not None:
-            appt_end = appt_end.replace(tzinfo=None)
+            appt_end = appt_end.astimezone(tz).replace(tzinfo=None)
 
         # Check for overlap
         if appt_start < slot_end_dt and appt_end > slot_start_dt:
@@ -338,6 +363,8 @@ def check_tech_multiday_availability(
     if not days_needed:
         return False
 
+    tz = get_timezone(config)
+
     # Check first day availability (from start_time to close)
     first_date, _ = days_needed[0]
     has_conflict = check_slot_conflicts(
@@ -347,6 +374,7 @@ def check_tech_multiday_availability(
         first_day_appointments,
         tech_id,
         indexed_first_day,
+        tz=tz,
     )
     if has_conflict:
         return False
@@ -375,6 +403,7 @@ def check_tech_multiday_availability(
             day_appointments,
             tech_id,
             indexed_future,
+            tz=tz,
         )
         if has_conflict:
             return False
@@ -446,6 +475,8 @@ def calculate_available_slots(
     # Index appointments once for O(1) lookup per tech
     indexed_appointments = index_appointments_by_tech(appointments)
 
+    tz = get_timezone(config)
+
     # Generate slot start times (hourly intervals)
     slot_interval = config.get("slot_interval_minutes", 60)
     slot_starts = generate_slot_start_times(business_hours, slot_interval)
@@ -493,7 +524,13 @@ def calculate_available_slots(
             available_tech_ids = []
             for tech_id in tech_ids:
                 has_conflict = check_slot_conflicts(
-                    slot_start, slot_end, date, appointments, tech_id, indexed_appointments
+                    slot_start,
+                    slot_end,
+                    date,
+                    appointments,
+                    tech_id,
+                    indexed_appointments,
+                    tz=tz,
                 )
                 if not has_conflict:
                     available_tech_ids.append(tech_id)
@@ -565,17 +602,24 @@ def is_slot_available(
     slot_end: time,
     tech_ids: list[str],
     appointments: list[dict[str, Any]],
+    config: dict[str, Any] | None = None,
 ) -> tuple[bool, list[str]]:
     """
     Check if a specific slot is still available.
 
+    Pass `config` so the conflict check uses the configured business
+    timezone (defaults to America/Chicago).
+
     Returns:
         Tuple of (is_available, list of available tech IDs)
     """
+    tz = get_timezone(config)
     available_tech_ids = []
 
     for tech_id in tech_ids:
-        has_conflict = check_slot_conflicts(slot_start, slot_end, date, appointments, tech_id)
+        has_conflict = check_slot_conflicts(
+            slot_start, slot_end, date, appointments, tech_id, tz=tz
+        )
         if not has_conflict:
             available_tech_ids.append(tech_id)
 
