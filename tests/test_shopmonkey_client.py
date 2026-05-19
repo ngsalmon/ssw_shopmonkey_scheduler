@@ -1,7 +1,9 @@
 """Unit tests for Shopmonkey client with retry logic and error handling."""
 
+import json
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -283,55 +285,130 @@ class TestShopmonkeyClientLocationId:
 
 
 class TestFindOrCreateCustomer:
-    """Tests for find_or_create_customer."""
+    """Tests for find_or_create_customer.
+
+    Anne's bug (2026-05-19): every online booking attached to whichever
+    customer sorted first by id because `where: {"email": ...}` was silently
+    ignored by Shopmonkey (emails live as a sub-resource). The fix queries
+    by firstName + lastName (a top-level filter Shopmonkey honors) and then
+    walks the emails/phoneNumbers arrays in-memory.
+    """
+
+    @staticmethod
+    def _mock(return_data: Any) -> MagicMock:
+        m = MagicMock(status_code=200, json=MagicMock(return_value={"data": return_data}))
+        m.raise_for_status = MagicMock()
+        return m
 
     @pytest.mark.asyncio
-    async def test_creates_customer_with_customerType(self):
-        """Regression: Shopmonkey rejects POST /v3/customer without customerType.
-
-        We discovered this during the OOTB ticket-creation probe when the live
-        API returned 400 'body must have required property customerType'. The
-        original code didn't pass the field; bookings only worked because
-        existing customers were always found by email and the create path
-        rarely fired.
-        """
+    async def test_searches_by_name_not_by_email(self):
+        """Lookup must use firstName/lastName, not email (which is broken)."""
         client = ShopmonkeyClient(api_token="test-token")
-
-        # First call (lookup by email) returns empty -> falls through to create.
-        # Second call (POST) returns the new customer.
-        lookup_response = MagicMock(status_code=200, json=MagicMock(return_value={"data": []}))
-        lookup_response.raise_for_status = MagicMock()
-        create_response = MagicMock(
-            status_code=200,
-            json=MagicMock(return_value={"data": {"id": "cust-new"}}),
-        )
-        create_response.raise_for_status = MagicMock()
-
         mock_client = AsyncMock()
-        # Two lookups (email then phone) both return empty, then the POST.
-        mock_client.request = AsyncMock(
-            side_effect=[lookup_response, lookup_response, create_response]
-        )
+        mock_client.request = AsyncMock(side_effect=[self._mock([]), self._mock({"id": "cust-1"})])
+        with patch.object(client, "_get_client", return_value=mock_client):
+            await client.find_or_create_customer(
+                first_name="Jane",
+                last_name="Doe",
+                email="jane@example.com",
+                phone="555-1234",
+            )
+        lookup_params = mock_client.request.call_args_list[0].kwargs["params"]
+        where = json.loads(lookup_params["where"])
+        assert where == {"firstName": "Jane", "lastName": "Doe"}
+        await client.close()
 
+    @pytest.mark.asyncio
+    async def test_reuses_when_email_matches_subresource(self):
+        """Returns the existing record when one of its sub-resource emails matches."""
+        client = ShopmonkeyClient(api_token="test-token")
+        existing = {
+            "id": "cust-existing",
+            "firstName": "Jane",
+            "lastName": "Doe",
+            "emails": [{"email": "jane@example.com", "primary": True}],
+            "phoneNumbers": [{"number": "+15551234567", "primary": True}],
+        }
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(return_value=self._mock([existing]))
         with patch.object(client, "_get_client", return_value=mock_client):
             result = await client.find_or_create_customer(
-                first_name="New",
-                last_name="Customer",
-                email="new@example.com",
-                phone="555-9999",
+                first_name="Jane", last_name="Doe", email="JANE@example.com"
             )
+        assert result == existing
+        # Exactly one request - no POST should follow.
+        assert mock_client.request.call_count == 1
+        await client.close()
 
+    @pytest.mark.asyncio
+    async def test_creates_new_when_name_matches_but_email_differs(self):
+        """Two real people share a name - don't attach to the wrong one."""
+        client = ShopmonkeyClient(api_token="test-token")
+        existing_other = {
+            "id": "cust-other-jane",
+            "firstName": "Jane",
+            "lastName": "Doe",
+            "emails": [{"email": "different@example.com", "primary": True}],
+            "phoneNumbers": [{"number": "+19998887777", "primary": True}],
+        }
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(
+            side_effect=[
+                self._mock([existing_other]),
+                self._mock({"id": "cust-new"}),
+            ]
+        )
+        with patch.object(client, "_get_client", return_value=mock_client):
+            result = await client.find_or_create_customer(
+                first_name="Jane",
+                last_name="Doe",
+                email="newjane@example.com",
+                phone="555-1234567",
+            )
         assert result == {"id": "cust-new"}
-
-        # Last call was the POST - inspect the body.
         post_call = mock_client.request.call_args_list[-1]
-        assert post_call.kwargs["method"] == "POST"
-        assert post_call.kwargs["url"] == "/v3/customer"
         body = post_call.kwargs["json"]
+        # Must use sub-resource arrays - top-level email/phone are dropped by
+        # the API.
         assert body["customerType"] == "Customer"
-        assert body["firstName"] == "New"
-        assert body["lastName"] == "Customer"
-        assert body["email"] == "new@example.com"
-        assert body["phone"] == "555-9999"
+        assert body["emails"] == [{"email": "newjane@example.com", "primary": True}]
+        assert body["phoneNumbers"] == [{"number": "+15551234567", "primary": True}]
+        assert "email" not in body  # top-level field is silently dropped
+        assert "phone" not in body
+        await client.close()
 
+    @pytest.mark.asyncio
+    async def test_phone_normalized_to_e164_us(self):
+        """10-digit US numbers normalize to +1XXXXXXXXXX."""
+        client = ShopmonkeyClient(api_token="test-token")
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(
+            side_effect=[self._mock([]), self._mock({"id": "cust-new"})]
+        )
+        with patch.object(client, "_get_client", return_value=mock_client):
+            await client.find_or_create_customer(
+                first_name="N", last_name="N", phone="(555) 123-4567"
+            )
+        body = mock_client.request.call_args_list[-1].kwargs["json"]
+        assert body["phoneNumbers"] == [{"number": "+15551234567", "primary": True}]
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_phone_match_ignores_formatting(self):
+        """A stored '+15551234567' must match a submitted '555-123-4567'."""
+        client = ShopmonkeyClient(api_token="test-token")
+        existing = {
+            "id": "cust-existing",
+            "firstName": "Jane",
+            "lastName": "Doe",
+            "emails": [],
+            "phoneNumbers": [{"number": "+15551234567", "primary": True}],
+        }
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(return_value=self._mock([existing]))
+        with patch.object(client, "_get_client", return_value=mock_client):
+            result = await client.find_or_create_customer(
+                first_name="Jane", last_name="Doe", phone="555-123-4567"
+            )
+        assert result == existing
         await client.close()

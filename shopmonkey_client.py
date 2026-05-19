@@ -220,6 +220,54 @@ class ShopmonkeyClient:
 
         return appointments
 
+    @staticmethod
+    def _normalize_phone(phone: str | None) -> str | None:
+        """Return phone in E.164 format Shopmonkey accepts (e.g. "+15551234567").
+
+        Strips formatting, defaults to a US country code when 10 digits are
+        provided without one. Returns None for empty input. Returns the input
+        unchanged when we can't confidently normalize (so we still send what
+        the user provided).
+        """
+        if not phone:
+            return None
+        digits = "".join(ch for ch in phone if ch.isdigit())
+        if not digits:
+            return phone
+        if phone.lstrip().startswith("+"):
+            return "+" + digits
+        if len(digits) == 10:
+            return "+1" + digits
+        if len(digits) == 11 and digits.startswith("1"):
+            return "+" + digits
+        return phone
+
+    @staticmethod
+    def _customer_matches(
+        customer: dict[str, Any],
+        email: str | None,
+        phone: str | None,
+    ) -> bool:
+        """Return True when the customer's emails/phoneNumbers include a match.
+
+        Shopmonkey stores emails and phone numbers as sub-resources on the
+        customer record. The top-level `email`/`phone` fields are always null
+        on list and detail responses, and `where: {"email": ...}` is silently
+        ignored by the search endpoint, so we have to do the match in-memory.
+        """
+        if email:
+            target = email.strip().lower()
+            for entry in customer.get("emails") or []:
+                if (entry.get("email") or "").strip().lower() == target:
+                    return True
+        if phone:
+            target_digits = "".join(ch for ch in phone if ch.isdigit())
+            for entry in customer.get("phoneNumbers") or []:
+                entry_digits = "".join(ch for ch in (entry.get("number") or "") if ch.isdigit())
+                if entry_digits and entry_digits.endswith(target_digits[-10:]):
+                    return True
+        return False
+
     async def find_or_create_customer(
         self,
         first_name: str,
@@ -227,45 +275,57 @@ class ShopmonkeyClient:
         email: str | None = None,
         phone: str | None = None,
     ) -> dict[str, Any]:
-        """Find existing customer by email/phone or create new one."""
-        # Try to find by email first
-        if email:
-            where_clause = json.dumps({"email": email})
-            params = {"where": where_clause}
-            if self.location_id:
-                params["locationId"] = self.location_id
+        """Find an existing customer or create a new one.
 
-            result = await self._request("GET", "/v3/customer", params=params)
-            customers = result.get("data", [])
-            if customers:
-                return customers[0]
+        Shopmonkey's `/v3/customer` `where` filter only honors top-level
+        scalar fields. Emails and phone numbers live as sub-resources, so we
+        can't filter on them directly (every value comes back as the same
+        unfiltered page, which previously caused new bookings to attach to
+        whichever customer sorted first by id - the misattachment Anne
+        flagged on 2026-05-19).
 
-        # Try to find by phone
-        if phone:
-            where_clause = json.dumps({"phone": phone})
-            params = {"where": where_clause}
-            if self.location_id:
-                params["locationId"] = self.location_id
+        Instead: look up by firstName + lastName, then walk the returned
+        records' `emails`/`phoneNumbers` sub-resources to verify the
+        identity. Create a new record when no candidate matches.
+        """
+        where_clause = json.dumps({"firstName": first_name, "lastName": last_name})
+        params: dict[str, Any] = {"where": where_clause}
+        if self.location_id:
+            params["locationId"] = self.location_id
 
-            result = await self._request("GET", "/v3/customer", params=params)
-            customers = result.get("data", [])
-            if customers:
-                return customers[0]
+        result = await self._request("GET", "/v3/customer", params=params)
+        candidates = result.get("data", [])
 
-        # Create new customer
+        # Filter to records whose name actually matches (the where filter
+        # might still return broader rows if Shopmonkey's behavior shifts).
+        same_name = [
+            c
+            for c in candidates
+            if (c.get("firstName") or "").strip().lower() == first_name.strip().lower()
+            and (c.get("lastName") or "").strip().lower() == last_name.strip().lower()
+        ]
+
+        if email or phone:
+            for candidate in same_name:
+                if self._customer_matches(candidate, email, phone):
+                    return candidate
+        elif same_name:
+            # No email/phone to verify - accept the first same-name match.
+            return same_name[0]
+
+        # No match; create a new customer with emails/phoneNumbers as
+        # sub-resource arrays (top-level email/phone fields are silently
+        # dropped by the API).
         customer_data: dict[str, Any] = {
             "firstName": first_name,
             "lastName": last_name,
-            # Shopmonkey requires customerType on POST /v3/customer (validation
-            # added at some point after our initial integration; observed
-            # against the live API). "Customer" is the value existing records
-            # use.
             "customerType": "Customer",
         }
         if email:
-            customer_data["email"] = email
-        if phone:
-            customer_data["phone"] = phone
+            customer_data["emails"] = [{"email": email, "primary": True}]
+        normalized_phone = self._normalize_phone(phone)
+        if normalized_phone:
+            customer_data["phoneNumbers"] = [{"number": normalized_phone, "primary": True}]
         if self.location_id:
             customer_data["locationId"] = self.location_id
 
