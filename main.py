@@ -197,14 +197,23 @@ async def lifespan(app: FastAPI):
         logger.error("config_validation_failed", error=str(e))
         raise RuntimeError(f"Invalid configuration: {e}")
 
-    # Initialize clients
-    try:
-        shopmonkey_client = ShopmonkeyClient()
-        sheets_client = SheetsClient()
-        logger.info("clients_initialized")
-    except ValueError as e:
-        logger.error("client_initialization_failed", error=str(e))
-        raise RuntimeError(f"Failed to initialize clients: {e}")
+    # Initialize clients. In E2E_MODE we skip the real clients entirely (they
+    # require external creds) and install in-process mocks instead.
+    if os.getenv("E2E_MODE"):
+        import sys
+
+        from tests.e2e_mocks.install import install_mocks
+
+        install_mocks(sys.modules[__name__])
+        logger.info("e2e_mode_enabled", message="Real Shopmonkey/Sheets clients NOT initialized")
+    else:
+        try:
+            shopmonkey_client = ShopmonkeyClient()
+            sheets_client = SheetsClient()
+            logger.info("clients_initialized")
+        except ValueError as e:
+            logger.error("client_initialization_failed", error=str(e))
+            raise RuntimeError(f"Failed to initialize clients: {e}")
 
     yield
 
@@ -221,6 +230,14 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# Test-only endpoints for E2E scenario control. Mounted at process start so
+# requests during lifespan/startup return 404 unless E2E_MODE is set.
+if os.getenv("E2E_MODE"):
+    from tests.e2e_mocks.endpoints import router as _e2e_router
+
+    app.include_router(_e2e_router)
+    logger.info("e2e_test_endpoints_mounted")
 
 
 # CORS middleware configuration
