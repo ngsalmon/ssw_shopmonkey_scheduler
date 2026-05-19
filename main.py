@@ -742,6 +742,25 @@ async def book_appointment(_: ApiKeyDep, request: BookingRequest):
                 raise HTTPException(status_code=500, detail="Unable to process booking")
             logger.debug("customer_ready", customer_id=customer_id)
 
+            # Detect when find_or_create reused an existing customer record
+            # whose name differs from the booking. Staff need to see both
+            # names so they don't think the wrong person booked the slot.
+            existing_first = (customer.get("firstName") or "").strip()
+            existing_last = (customer.get("lastName") or "").strip()
+            booking_first = request.customer.firstName.strip()
+            booking_last = request.customer.lastName.strip()
+            customer_name_mismatch: str | None = None
+            if (existing_first and existing_first != booking_first) or (
+                existing_last and existing_last != booking_last
+            ):
+                customer_name_mismatch = f"{existing_first} {existing_last}".strip() or "<unknown>"
+                logger.info(
+                    "customer_name_mismatch",
+                    booking_name=f"{booking_first} {booking_last}",
+                    existing_name=customer_name_mismatch,
+                    customer_id=customer_id,
+                )
+
             # Find or create vehicle
             logger.debug("creating_vehicle")
             vehicle = await shopmonkey_client.find_or_create_vehicle(
@@ -779,9 +798,15 @@ async def book_appointment(_: ApiKeyDep, request: BookingRequest):
 
             # Create enhanced work order notes
             tech_line = f"\nAssign to: {assigned_tech_name}" if assigned_tech_name else ""
+            mismatch_line = (
+                f"\n!! Customer record on file: {customer_name_mismatch}"
+                f" (booking submitted as {booking_first} {booking_last})"
+                if customer_name_mismatch
+                else ""
+            )
             work_order_notes = f"""*** ONLINE BOOKING ***
 Confirmation: {confirmation_number}
-{tech_line}
+{tech_line}{mismatch_line}
 Service requested: {service_name}
 Booked online via scheduling API."""
 

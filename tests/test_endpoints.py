@@ -321,6 +321,64 @@ class TestBookEndpoint:
             vin="1HGBH41JXMN109186",
         )
 
+    def test_booking_notes_flag_customer_name_mismatch(self, test_client, mock_shopmonkey_client):
+        """Surface existing-record name when find_or_create reuses a customer.
+
+        Regression: Anne saw a booking appear under the wrong name because
+        find_or_create_customer matched on email and reused the older record.
+        The note should expose both names so staff can confirm.
+        """
+        mock_shopmonkey_client.find_or_create_customer = AsyncMock(
+            return_value={
+                "id": "cust-existing",
+                "firstName": "Jena",
+                "lastName": "Scaletty",
+                "email": "shared@example.com",
+            }
+        )
+        booking_request = {
+            "service_id": "svc-1",
+            "slot_start": "2026-01-19T09:00:00",
+            "slot_end": "2026-01-19T10:00:00",
+            "customer": {
+                "firstName": "TJ",
+                "lastName": "McLaughlin",
+                "email": "shared@example.com",
+            },
+            "vehicle": {"year": 2022, "make": "Toyota", "model": "Camry"},
+        }
+        response = test_client.post("/book", json=booking_request)
+        assert response.status_code == 200
+
+        mock_shopmonkey_client.create_appointment.assert_called_once()
+        notes = mock_shopmonkey_client.create_appointment.call_args.kwargs.get("notes", "")
+        assert "Customer record on file: Jena Scaletty" in notes
+        assert "TJ McLaughlin" in notes
+
+    def test_booking_notes_omit_mismatch_when_names_match(
+        self, test_client, mock_shopmonkey_client
+    ):
+        """No mismatch line when the returned customer matches the booking name."""
+        mock_shopmonkey_client.find_or_create_customer = AsyncMock(
+            return_value={
+                "id": "cust-existing",
+                "firstName": "TJ",
+                "lastName": "McLaughlin",
+            }
+        )
+        booking_request = {
+            "service_id": "svc-1",
+            "slot_start": "2026-01-19T09:00:00",
+            "slot_end": "2026-01-19T10:00:00",
+            "customer": {"firstName": "TJ", "lastName": "McLaughlin"},
+            "vehicle": {"year": 2022, "make": "Toyota", "model": "Camry"},
+        }
+        response = test_client.post("/book", json=booking_request)
+        assert response.status_code == 200
+
+        notes = mock_shopmonkey_client.create_appointment.call_args.kwargs.get("notes", "")
+        assert "Customer record on file" not in notes
+
     def test_booking_service_not_found(self, test_client, mock_shopmonkey_client):
         """Should return 404 when service not found."""
         mock_shopmonkey_client.get_canned_service = AsyncMock(return_value=None)
