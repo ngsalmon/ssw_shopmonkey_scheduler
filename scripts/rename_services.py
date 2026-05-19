@@ -22,32 +22,26 @@ load_dotenv()
 RENAMES = {
     # 1. Bedliner - Add "Spray-In" suffix
     "Bedliner - Short Bed": "Bedliner - Short Bed Spray-In",
-
     # 2. Consultations - Unify category and add separator
     "Custom Exhaust Consultation": "Consultation - Custom Exhaust",
     "Sales Consultation": "Consultation - Sales",
-
     # 3. Detail - Add "Level 1" to basic Exterior services
     "Detail - Exterior - Coupe/Two Door Truck": "Detail - Exterior Level 1 - Coupe/Two Door Truck",
     "Detail - Exterior - SUV": "Detail - Exterior Level 1 - SUV",
     "Detail - Exterior - Sedan/Four Door Truck": "Detail - Exterior Level 1 - Sedan/Four Door Truck",
     "Detail - Exterior - XL SUV/Van": "Detail - Exterior Level 1 - XL SUV/Van",
-
     # 4. Detail - Remove "Only" from Interior Level 2
     "Detail - Interior Only Level 2 - Coupe/Two Door Truck": "Detail - Interior Level 2 - Coupe/Two Door Truck",
     "Detail - Interior Only Level 2 - SUV": "Detail - Interior Level 2 - SUV",
     "Detail - Interior Only Level 2 - Sedan/Four Door Truck": "Detail - Interior Level 2 - Sedan/Four Door Truck",
     "Detail - Interior Only Level 2 - XL SUV/Van": "Detail - Interior Level 2 - XL SUV/Van",
-
     # 5. Detail - Standardize Express vehicle naming
     "Detail - Express Exterior - Standard Vehicle": "Detail - Express Exterior - 2-Row Vehicle",
     "Detail - Express Interior & Exterior - Standard Vehicle": "Detail - Express Interior & Exterior - 2-Row Vehicle",
     "Detail - Express Interior & Exterior - Vehicle w/Third Row Seating": "Detail - Express Interior & Exterior - 3-Row Vehicle",
-
     # 6. Window Tint - Clarify "Two Door Tint"
     "Window Tint - Two Door Tint - Carbon": "Window Tint - Front Doors - Carbon",
     "Window Tint - Two Door Tint - Ceramic": "Window Tint - Front Doors - Ceramic",
-
     # 7. Window Tint - Clarify window-count-based pricing
     "Window Tint - Full Sedan/Truck - Carbon": "Window Tint - Full Sedan/Truck/SUV (5 Window) - Carbon",
     "Window Tint - Full Sedan/Truck - Ceramic": "Window Tint - Full Sedan/Truck/SUV (5 Window) - Ceramic",
@@ -56,7 +50,9 @@ RENAMES = {
 }
 
 
-async def fetch_all_canned_services(client: httpx.AsyncClient, location_id: str | None) -> list[dict]:
+async def fetch_all_canned_services(
+    client: httpx.AsyncClient, location_id: str | None
+) -> list[dict]:
     """Fetch all canned services from Shopmonkey."""
     params = {}
     if location_id:
@@ -69,10 +65,7 @@ async def fetch_all_canned_services(client: httpx.AsyncClient, location_id: str 
 
 async def update_service_name(client: httpx.AsyncClient, service_id: str, new_name: str) -> bool:
     """Update a canned service's name."""
-    response = await client.put(
-        f"/v3/canned_service/{service_id}",
-        json={"name": new_name}
-    )
+    response = await client.put(f"/v3/canned_service/{service_id}", json={"name": new_name})
     return response.status_code == 200
 
 
@@ -87,7 +80,7 @@ async def main(apply: bool = False) -> int:
     location_id = os.getenv("SHOPMONKEY_LOCATION_ID")
 
     print("Shopmonkey Service Renamer")
-    print(f"{'='*50}")
+    print(f"{'=' * 50}")
     print(f"Mode: {'APPLY CHANGES' if apply else 'DRY RUN (preview only)'}")
     print(f"API Base URL: {base_url}")
     print(f"Location ID: {location_id or '(not set)'}")
@@ -111,11 +104,13 @@ async def main(apply: bool = False) -> int:
         for service in services:
             current_name = service.get("name", "")
             if current_name in RENAMES:
-                to_rename.append({
-                    "id": service["id"],
-                    "current_name": current_name,
-                    "new_name": RENAMES[current_name],
-                })
+                to_rename.append(
+                    {
+                        "id": service["id"],
+                        "current_name": current_name,
+                        "new_name": RENAMES[current_name],
+                    }
+                )
 
         if not to_rename:
             print("No services found matching the rename list.")
@@ -168,7 +163,9 @@ async def main(apply: bool = False) -> int:
                     print(f"✗ Failed: {item['current_name']} (unexpected response)")
                     failure_count += 1
             except httpx.HTTPStatusError as e:
-                print(f"✗ Failed: {item['current_name']} ({e.response.status_code}: {e.response.text[:100]})")
+                print(
+                    f"✗ Failed: {item['current_name']} ({e.response.status_code}: {e.response.text[:100]})"
+                )
                 failure_count += 1
             except Exception as e:
                 print(f"✗ Failed: {item['current_name']} ({type(e).__name__}: {e})")

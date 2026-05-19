@@ -141,9 +141,7 @@ def generate_time_slots(
     return slots
 
 
-def parse_appointment_times(
-    appointment: dict[str, Any]
-) -> tuple[datetime, datetime] | None:
+def parse_appointment_times(appointment: dict[str, Any]) -> tuple[datetime, datetime] | None:
     """Parse start and end times from a Shopmonkey appointment."""
     start_str = appointment.get("startDate")
     end_str = appointment.get("endDate")
@@ -164,7 +162,7 @@ def parse_appointment_times(
 
 
 def index_appointments_by_tech(
-    appointments: list[dict[str, Any]]
+    appointments: list[dict[str, Any]],
 ) -> dict[str, list[dict[str, Any]]]:
     """
     Index appointments by technician ID for O(1) lookup.
@@ -215,7 +213,8 @@ def check_slot_conflicts(
         tech_appointments = indexed_appointments.get(tech_id, [])
     else:
         tech_appointments = [
-            appt for appt in appointments
+            appt
+            for appt in appointments
             if (appt.get("technicianId") or appt.get("userId")) == tech_id
         ]
 
@@ -360,8 +359,7 @@ def check_tech_multiday_availability(
 
         # Tech needs to be free from open until minutes_needed
         needed_end = (
-            datetime.combine(date.date(), day_hours.open_time)
-            + timedelta(minutes=minutes_needed)
+            datetime.combine(date.date(), day_hours.open_time) + timedelta(minutes=minutes_needed)
         ).time()
 
         date_str = date.strftime("%Y-%m-%d")
@@ -456,9 +454,7 @@ def calculate_available_slots(
 
     for slot_start in slot_starts:
         # Calculate days needed for this service starting at slot_start
-        days_needed = calculate_days_needed(
-            slot_duration_minutes, date, slot_start, config
-        )
+        days_needed = calculate_days_needed(slot_duration_minutes, date, slot_start, config)
 
         if days_needed is None:
             # Can't complete service within reasonable timeframe
@@ -491,8 +487,7 @@ def calculate_available_slots(
         else:
             # Service fits within business hours
             slot_end = (
-                datetime.combine(date.date(), slot_start)
-                + timedelta(minutes=slot_duration_minutes)
+                datetime.combine(date.date(), slot_start) + timedelta(minutes=slot_duration_minutes)
             ).time()
 
             available_tech_ids = []
@@ -580,9 +575,7 @@ def is_slot_available(
     available_tech_ids = []
 
     for tech_id in tech_ids:
-        has_conflict = check_slot_conflicts(
-            slot_start, slot_end, date, appointments, tech_id
-        )
+        has_conflict = check_slot_conflicts(slot_start, slot_end, date, appointments, tech_id)
         if not has_conflict:
             available_tech_ids.append(tech_id)
 
@@ -644,9 +637,7 @@ def get_buffer_minutes_from_labels(service: dict[str, Any]) -> int:
     return get_buffer_minutes(service, config=None)
 
 
-def get_service_duration_minutes(
-    service: dict[str, Any], default_duration: int = 60
-) -> int:
+def get_service_duration_minutes(service: dict[str, Any], default_duration: int = 60) -> int:
     """
     Extract service duration from Shopmonkey canned service.
 

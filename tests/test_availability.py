@@ -683,7 +683,11 @@ class TestCheckSlotConflictsWithIndex:
     def test_uses_indexed_appointments(self):
         """Should use pre-indexed appointments when provided."""
         appointments = [
-            {"technicianId": "tech1", "startDate": "2026-01-19T09:00:00Z", "endDate": "2026-01-19T10:00:00Z"},
+            {
+                "technicianId": "tech1",
+                "startDate": "2026-01-19T09:00:00Z",
+                "endDate": "2026-01-19T10:00:00Z",
+            },
         ]
         indexed = index_appointments_by_tech(appointments)
 
@@ -700,7 +704,11 @@ class TestCheckSlotConflictsWithIndex:
     def test_no_conflict_with_indexed_for_different_tech(self):
         """Should find no conflict for different tech with indexed appointments."""
         appointments = [
-            {"technicianId": "tech1", "startDate": "2026-01-19T09:00:00Z", "endDate": "2026-01-19T10:00:00Z"},
+            {
+                "technicianId": "tech1",
+                "startDate": "2026-01-19T09:00:00Z",
+                "endDate": "2026-01-19T10:00:00Z",
+            },
         ]
         indexed = index_appointments_by_tech(appointments)
 
@@ -785,4 +793,7 @@ class TestMultiDayAvailability:
             if morning_slot:
                 # tech1 should not be available for 9am slot because
                 # a 10-hour service starting at 9am needs day 2 morning
-                assert "tech1" not in morning_slot.available_tech_ids or "tech2" in morning_slot.available_tech_ids
+                assert (
+                    "tech1" not in morning_slot.available_tech_ids
+                    or "tech2" in morning_slot.available_tech_ids
+                )

@@ -48,7 +48,9 @@ class TestShopmonkeyAPIError:
 
     def test_api_error_with_status_code(self):
         """Should store status code and response body."""
-        error = ShopmonkeyAPIError("Error message", status_code=400, response_body='{"error": "bad request"}')
+        error = ShopmonkeyAPIError(
+            "Error message", status_code=400, response_body='{"error": "bad request"}'
+        )
         assert str(error) == "Error message"
         assert error.status_code == 400
         assert error.response_body == '{"error": "bad request"}'
@@ -153,9 +155,7 @@ class TestShopmonkeyClientRetry:
         client = ShopmonkeyClient(api_token="test-token")
 
         mock_client = AsyncMock()
-        mock_client.request = AsyncMock(
-            side_effect=httpx.TimeoutException("Always times out")
-        )
+        mock_client.request = AsyncMock(side_effect=httpx.TimeoutException("Always times out"))
 
         with patch.object(client, "_get_client", return_value=mock_client):
             with pytest.raises(ShopmonkeyTimeoutError):
@@ -246,9 +246,7 @@ class TestShopmonkeyClientMethods:
         client = ShopmonkeyClient(api_token="test-token")
 
         mock_client = AsyncMock()
-        mock_client.request = AsyncMock(
-            side_effect=httpx.TimeoutException("Connection timed out")
-        )
+        mock_client.request = AsyncMock(side_effect=httpx.TimeoutException("Connection timed out"))
 
         with patch.object(client, "_get_client", return_value=mock_client):
             result = await client.health_check()

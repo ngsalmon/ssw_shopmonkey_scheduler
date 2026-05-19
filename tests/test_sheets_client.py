@@ -26,7 +26,16 @@ class TestSheetsClientGetTechDepartments:
             "values": [
                 ["Name", "ID", "Role", "Vinyl", "Alignment", "Tint", "Detail", "Status"],
                 ["John Doe", "tech-123", "Technician", "TRUE", "FALSE", "TRUE", "FALSE", "Active"],
-                ["Jane Smith", "tech-456", "Technician", "FALSE", "TRUE", "FALSE", "TRUE", "Active"],
+                [
+                    "Jane Smith",
+                    "tech-456",
+                    "Technician",
+                    "FALSE",
+                    "TRUE",
+                    "FALSE",
+                    "TRUE",
+                    "Active",
+                ],
             ]
         }
 
@@ -117,9 +126,7 @@ class TestSheetsClientActiveTechIdsFilter:
 
     @patch("sheets_client.service_account.Credentials.from_service_account_file")
     @patch("sheets_client.build")
-    def test_inactive_override_wins_even_when_active_in_shopmonkey(
-        self, mock_build, mock_creds
-    ):
+    def test_inactive_override_wins_even_when_active_in_shopmonkey(self, mock_build, mock_creds):
         """Sheet 'Inactive' status excludes regardless of Shopmonkey active state."""
         from sheets_client import SheetsClient
 
@@ -256,7 +263,17 @@ class TestSheetsClientGetAllDepartments:
         mock_build.return_value = mock_service
         mock_service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = {
             "values": [
-                ["Name", "ID", "Role", "Vinyl", "Alignment", "Window Tint", "Detail", "Bedliner", "Status"]
+                [
+                    "Name",
+                    "ID",
+                    "Role",
+                    "Vinyl",
+                    "Alignment",
+                    "Window Tint",
+                    "Detail",
+                    "Bedliner",
+                    "Status",
+                ]
             ]
         }
 

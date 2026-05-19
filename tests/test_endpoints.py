@@ -16,17 +16,33 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 def mock_shopmonkey_client():
     """Create a mock ShopmonkeyClient."""
     client = AsyncMock()
-    client.get_bookable_canned_services = AsyncMock(return_value=[
-        {"id": "svc-1", "name": "Window Tint", "totalCents": 15000, "labels": [{"name": "Window Tint"}], "labors": [{"hours": 2.5}]},
-        {"id": "svc-2", "name": "Paint Protection Film", "totalCents": 50000, "labels": [{"name": "Vinyl"}], "labors": [{"hours": 8}, {"hours": 1}]},
-    ])
-    client.get_canned_service = AsyncMock(return_value={
-        "id": "svc-1",
-        "name": "Window Tint",
-        "totalCents": 15000,
-        "labels": [{"name": "Window Tint"}],
-        "estimatedDuration": 60,
-    })
+    client.get_bookable_canned_services = AsyncMock(
+        return_value=[
+            {
+                "id": "svc-1",
+                "name": "Window Tint",
+                "totalCents": 15000,
+                "labels": [{"name": "Window Tint"}],
+                "labors": [{"hours": 2.5}],
+            },
+            {
+                "id": "svc-2",
+                "name": "Paint Protection Film",
+                "totalCents": 50000,
+                "labels": [{"name": "Vinyl"}],
+                "labors": [{"hours": 8}, {"hours": 1}],
+            },
+        ]
+    )
+    client.get_canned_service = AsyncMock(
+        return_value={
+            "id": "svc-1",
+            "name": "Window Tint",
+            "totalCents": 15000,
+            "labels": [{"name": "Window Tint"}],
+            "estimatedDuration": 60,
+        }
+    )
     client.get_appointments_for_date = AsyncMock(return_value=[])
     client.find_or_create_customer = AsyncMock(return_value={"id": "cust-123"})
     client.find_or_create_vehicle = AsyncMock(return_value={"id": "veh-456"})
@@ -41,21 +57,27 @@ def mock_sheets_client():
     """Create a mock SheetsClient with async methods."""
     client = MagicMock()
     # Mock async methods
-    client.get_techs_for_department = AsyncMock(return_value=[
-        {"tech_id": "tech-1", "tech_name": "John Doe", "priority": 1},
-        {"tech_id": "tech-2", "tech_name": "Jane Smith", "priority": 2},
-    ])
+    client.get_techs_for_department = AsyncMock(
+        return_value=[
+            {"tech_id": "tech-1", "tech_name": "John Doe", "priority": 1},
+            {"tech_id": "tech-2", "tech_name": "Jane Smith", "priority": 2},
+        ]
+    )
     client.get_all_departments = AsyncMock(return_value=["Window Tint", "Vinyl", "Detail"])
-    client.get_tech_departments = AsyncMock(return_value={
-        "tech-1": {"tech_name": "John Doe", "departments": {"Window Tint": 1}},
-        "tech-2": {"tech_name": "Jane Smith", "departments": {"Vinyl": 1}},
-    })
+    client.get_tech_departments = AsyncMock(
+        return_value={
+            "tech-1": {"tech_name": "John Doe", "departments": {"Window Tint": 1}},
+            "tech-2": {"tech_name": "Jane Smith", "departments": {"Vinyl": 1}},
+        }
+    )
     client.health_check = AsyncMock(return_value=True)
-    client.get_cache_status = MagicMock(return_value={
-        "cache_size": 0,
-        "cache_ttl_seconds": 300,
-        "cache_maxsize": 100,
-    })
+    client.get_cache_status = MagicMock(
+        return_value={
+            "cache_size": 0,
+            "cache_ttl_seconds": 300,
+            "cache_maxsize": 100,
+        }
+    )
     return client
 
 
@@ -79,11 +101,14 @@ def test_client(mock_shopmonkey_client, mock_sheets_client, mock_config):
     """Create a TestClient with mocked dependencies."""
     # Clear any existing API_KEY environment variable for tests
     with patch.dict(os.environ, {"API_KEY": "", "ALLOWED_ORIGINS": ""}, clear=False):
-        with patch("main.ShopmonkeyClient", return_value=mock_shopmonkey_client), \
-             patch("main.SheetsClient", return_value=mock_sheets_client), \
-             patch("main.load_config", return_value=mock_config), \
-             patch("main.validate_config"):
+        with (
+            patch("main.ShopmonkeyClient", return_value=mock_shopmonkey_client),
+            patch("main.SheetsClient", return_value=mock_sheets_client),
+            patch("main.load_config", return_value=mock_config),
+            patch("main.validate_config"),
+        ):
             from main import app
+
             with TestClient(app) as client:
                 yield client
 
@@ -91,13 +116,18 @@ def test_client(mock_shopmonkey_client, mock_sheets_client, mock_config):
 @pytest.fixture
 def test_client_with_api_key(mock_shopmonkey_client, mock_sheets_client, mock_config):
     """Create a TestClient with API key authentication enabled."""
-    with patch.dict(os.environ, {"API_KEY": "test-api-key-123", "ALLOWED_ORIGINS": ""}, clear=False):
-        with patch("main.ShopmonkeyClient", return_value=mock_shopmonkey_client), \
-             patch("main.SheetsClient", return_value=mock_sheets_client), \
-             patch("main.load_config", return_value=mock_config), \
-             patch("main.validate_config"), \
-             patch("main.API_KEY", "test-api-key-123"):
+    with patch.dict(
+        os.environ, {"API_KEY": "test-api-key-123", "ALLOWED_ORIGINS": ""}, clear=False
+    ):
+        with (
+            patch("main.ShopmonkeyClient", return_value=mock_shopmonkey_client),
+            patch("main.SheetsClient", return_value=mock_sheets_client),
+            patch("main.load_config", return_value=mock_config),
+            patch("main.validate_config"),
+            patch("main.API_KEY", "test-api-key-123"),
+        ):
             from main import app
+
             with TestClient(app) as client:
                 yield client
 
@@ -193,11 +223,13 @@ class TestAvailabilityEndpoint:
 
     def test_service_without_label_returns_404(self, test_client, mock_shopmonkey_client):
         """Should return 404 when service has no label."""
-        mock_shopmonkey_client.get_canned_service = AsyncMock(return_value={
-            "id": "svc-no-label",
-            "name": "Unlabeled Service",
-            "labels": [],
-        })
+        mock_shopmonkey_client.get_canned_service = AsyncMock(
+            return_value={
+                "id": "svc-no-label",
+                "name": "Unlabeled Service",
+                "labels": [],
+            }
+        )
         response = test_client.get("/availability?service_id=svc-no-label&date=2026-01-19")
         assert response.status_code == 404
 
@@ -343,18 +375,20 @@ class TestBookEndpoint:
     def test_slot_conflict_returns_409(self, test_client, mock_shopmonkey_client):
         """Should return 409 when slot is no longer available."""
         # First call is during availability check in book endpoint
-        mock_shopmonkey_client.get_appointments_for_date = AsyncMock(return_value=[
-            {
-                "technicianId": "tech-1",
-                "startDate": "2026-01-19T09:00:00Z",
-                "endDate": "2026-01-19T10:00:00Z",
-            },
-            {
-                "technicianId": "tech-2",
-                "startDate": "2026-01-19T09:00:00Z",
-                "endDate": "2026-01-19T10:00:00Z",
-            },
-        ])
+        mock_shopmonkey_client.get_appointments_for_date = AsyncMock(
+            return_value=[
+                {
+                    "technicianId": "tech-1",
+                    "startDate": "2026-01-19T09:00:00Z",
+                    "endDate": "2026-01-19T10:00:00Z",
+                },
+                {
+                    "technicianId": "tech-2",
+                    "startDate": "2026-01-19T09:00:00Z",
+                    "endDate": "2026-01-19T10:00:00Z",
+                },
+            ]
+        )
         booking_request = {
             "service_id": "svc-1",
             "slot_start": "2026-01-19T09:00:00",
@@ -398,18 +432,14 @@ class TestAPIKeyAuthentication:
 
     def test_services_with_invalid_api_key(self, test_client_with_api_key):
         """Should return 401 with invalid API key."""
-        response = test_client_with_api_key.get(
-            "/services",
-            headers={"X-API-Key": "wrong-key"}
-        )
+        response = test_client_with_api_key.get("/services", headers={"X-API-Key": "wrong-key"})
         assert response.status_code == 401
         assert "Invalid API key" in response.json()["detail"]
 
     def test_services_with_valid_api_key(self, test_client_with_api_key):
         """Should allow access with valid API key."""
         response = test_client_with_api_key.get(
-            "/services",
-            headers={"X-API-Key": "test-api-key-123"}
+            "/services", headers={"X-API-Key": "test-api-key-123"}
         )
         assert response.status_code == 200
 

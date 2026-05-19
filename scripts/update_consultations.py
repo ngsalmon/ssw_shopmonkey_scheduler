@@ -50,6 +50,7 @@ def get_sheets_service():
         )
     else:
         from google.auth import default
+
         credentials, _ = default(scopes=["https://www.googleapis.com/auth/spreadsheets"])
 
     return build("sheets", "v4", credentials=credentials)
@@ -91,11 +92,14 @@ def find_or_create_label(client, label_name, color="blue"):
             return label
 
     # Create new label (color and saved are required for reusable labels)
-    response = client.post("/v3/label", json={
-        "name": label_name,
-        "color": color,
-        "saved": True,
-    })
+    response = client.post(
+        "/v3/label",
+        json={
+            "name": label_name,
+            "color": color,
+            "saved": True,
+        },
+    )
     response.raise_for_status()
     new_label = response.json().get("data", response.json())
     print(f"  Created new label: {label_name} (ID: {new_label.get('id')})")
@@ -249,10 +253,12 @@ def update_google_sheets(service, spreadsheet_id):
 
     # Step 1: Read current header row to find column positions
     print("1. Reading current Tech/Dept header row...")
-    result = service.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id,
-        range=f"'{tab_name}'!1:1"
-    ).execute()
+    result = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range=f"'{tab_name}'!1:1")
+        .execute()
+    )
 
     header_row = result.get("values", [[]])[0]
     print(f"  Current columns: {header_row}")
@@ -283,10 +289,12 @@ def update_google_sheets(service, spreadsheet_id):
 
     # Step 2: Read all data to get tech names and IDs
     print("\n2. Reading tech data...")
-    result = service.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id,
-        range=f"'{tab_name}'!A:Z"
-    ).execute()
+    result = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range=f"'{tab_name}'!A:Z")
+        .execute()
+    )
 
     all_data = result.get("values", [])
     if len(all_data) < 2:
@@ -323,40 +331,43 @@ def update_google_sheets(service, spreadsheet_id):
         # We'll insert columns before Status if it exists
         # Insert two columns at status_index position
         if sales_col_index is None:
-            requests.append({
-                "insertDimension": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "dimension": "COLUMNS",
-                        "startIndex": status_index,
-                        "endIndex": status_index + 1,
-                    },
-                    "inheritFromBefore": True,
+            requests.append(
+                {
+                    "insertDimension": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "dimension": "COLUMNS",
+                            "startIndex": status_index,
+                            "endIndex": status_index + 1,
+                        },
+                        "inheritFromBefore": True,
+                    }
                 }
-            })
+            )
             print(f"  Inserting 'Sales Consultation' column at index {status_index}")
             sales_col_index = status_index
             status_index += 1  # Status moved right
 
         if exhaust_col_index is None:
-            requests.append({
-                "insertDimension": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "dimension": "COLUMNS",
-                        "startIndex": status_index,
-                        "endIndex": status_index + 1,
-                    },
-                    "inheritFromBefore": True,
+            requests.append(
+                {
+                    "insertDimension": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "dimension": "COLUMNS",
+                            "startIndex": status_index,
+                            "endIndex": status_index + 1,
+                        },
+                        "inheritFromBefore": True,
+                    }
                 }
-            })
+            )
             print(f"  Inserting 'Custom Exhaust' column at index {status_index}")
             exhaust_col_index = status_index
 
         if requests:
             service.spreadsheets().batchUpdate(
-                spreadsheetId=spreadsheet_id,
-                body={"requests": requests}
+                spreadsheetId=spreadsheet_id, body={"requests": requests}
             ).execute()
             print("  Columns inserted!")
     else:
@@ -371,7 +382,7 @@ def update_google_sheets(service, spreadsheet_id):
     def col_letter(index):
         result = ""
         while index >= 0:
-            result = chr(index % 26 + ord('A')) + result
+            result = chr(index % 26 + ord("A")) + result
             index = index // 26 - 1
         return result
 
@@ -385,14 +396,8 @@ def update_google_sheets(service, spreadsheet_id):
     updates = []
 
     # Headers
-    updates.append({
-        "range": f"'{tab_name}'!{sales_col}1",
-        "values": [["Sales Consultation"]]
-    })
-    updates.append({
-        "range": f"'{tab_name}'!{exhaust_col}1",
-        "values": [["Custom Exhaust"]]
-    })
+    updates.append({"range": f"'{tab_name}'!{sales_col}1", "values": [["Sales Consultation"]]})
+    updates.append({"range": f"'{tab_name}'!{exhaust_col}1", "values": [["Custom Exhaust"]]})
 
     # Tech assignments
     # Nikki and Chad -> Sales Consultation = TRUE
@@ -416,22 +421,14 @@ def update_google_sheets(service, spreadsheet_id):
         else:
             exhaust_value = "FALSE"
 
-        updates.append({
-            "range": f"'{tab_name}'!{sales_col}{row_idx}",
-            "values": [[sales_value]]
-        })
-        updates.append({
-            "range": f"'{tab_name}'!{exhaust_col}{row_idx}",
-            "values": [[exhaust_value]]
-        })
+        updates.append({"range": f"'{tab_name}'!{sales_col}{row_idx}", "values": [[sales_value]]})
+        updates.append(
+            {"range": f"'{tab_name}'!{exhaust_col}{row_idx}", "values": [[exhaust_value]]}
+        )
 
     # Execute batch update
     service.spreadsheets().values().batchUpdate(
-        spreadsheetId=spreadsheet_id,
-        body={
-            "valueInputOption": "USER_ENTERED",
-            "data": updates
-        }
+        spreadsheetId=spreadsheet_id, body={"valueInputOption": "USER_ENTERED", "data": updates}
     ).execute()
 
     print("\n✓ Google Sheets updates complete!")

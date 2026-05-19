@@ -25,6 +25,7 @@ pytestmark = pytest.mark.integration
 def sheets_client():
     """Create a SheetsClient instance."""
     from sheets_client import SheetsClient
+
     return SheetsClient()
 
 
@@ -32,6 +33,7 @@ def sheets_client():
 async def shopmonkey_client():
     """Create a ShopmonkeyClient instance."""
     from shopmonkey_client import ShopmonkeyClient
+
     client = ShopmonkeyClient()
     yield client
     await client.close()
@@ -114,6 +116,7 @@ class TestShopmonkeyIntegration:
     async def test_can_get_appointments(self, shopmonkey_client):
         """Should be able to get appointments for a date."""
         from datetime import datetime
+
         today = datetime.now().strftime("%Y-%m-%d")
         appointments = await shopmonkey_client.get_appointments_for_date(today)
         assert isinstance(appointments, list)
@@ -285,6 +288,7 @@ class TestBookingIntegration:
 
             # Generate confirmation number like main.py does
             import uuid
+
             date_part = start_time.strftime("%Y%m%d")
             unique_part = uuid.uuid4().hex[:6].upper()
             confirmation_number = f"SM-{date_part}-{unique_part}"
@@ -324,7 +328,9 @@ Booked online via scheduling API."""
             # Note: technicianId is a write-only field in Shopmonkey API v3
             # It works (technician gets assigned in UI) but doesn't return in GET responses
             # We've verified this works by manual testing - the tech shows in Shopmonkey calendar
-            print("   Technician assignment: Verified working (write-only field, not in API response)")
+            print(
+                "   Technician assignment: Verified working (write-only field, not in API response)"
+            )
 
             # Verify notes contain ONLINE BOOKING marker
             notes = fetched.get("note", "")

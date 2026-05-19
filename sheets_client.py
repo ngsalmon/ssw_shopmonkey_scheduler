@@ -19,7 +19,9 @@ class SheetsClient:
     """Client for reading scheduling configuration from Google Sheets."""
 
     # Tab names in the Google Sheet (must match actual sheet tab names)
-    SERVICE_DEPARTMENTS_TAB = "Bookable Canned Services"  # Legacy - no longer used (using Shopmonkey labels)
+    SERVICE_DEPARTMENTS_TAB = (
+        "Bookable Canned Services"  # Legacy - no longer used (using Shopmonkey labels)
+    )
     TECH_DEPARTMENTS_TAB = "Tech/Dept"
 
     def __init__(
@@ -29,9 +31,7 @@ class SheetsClient:
         cache_ttl: int = DEFAULT_CACHE_TTL,
     ):
         self.spreadsheet_id = spreadsheet_id or os.getenv("GOOGLE_SHEETS_ID")
-        self.credentials_path = credentials_path or os.getenv(
-            "GOOGLE_APPLICATION_CREDENTIALS"
-        )
+        self.credentials_path = credentials_path or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
         if not self.spreadsheet_id:
             raise ValueError("GOOGLE_SHEETS_ID is required")
@@ -58,9 +58,7 @@ class SheetsClient:
                 # Use Application Default Credentials (ADC) - works on Cloud Run
                 from google.auth import default
 
-                credentials, _ = default(
-                    scopes=["https://www.googleapis.com/auth/spreadsheets"]
-                )
+                credentials, _ = default(scopes=["https://www.googleapis.com/auth/spreadsheets"])
 
             self._service = build("sheets", "v4", credentials=credentials)
         return self._service

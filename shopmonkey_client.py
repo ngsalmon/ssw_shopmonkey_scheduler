@@ -20,7 +20,9 @@ logger = structlog.get_logger(__name__)
 class ShopmonkeyAPIError(Exception):
     """Base exception for Shopmonkey API errors."""
 
-    def __init__(self, message: str, status_code: int | None = None, response_body: str | None = None):
+    def __init__(
+        self, message: str, status_code: int | None = None, response_body: str | None = None
+    ):
         super().__init__(message)
         self.status_code = status_code
         self.response_body = response_body
@@ -52,8 +54,7 @@ class ShopmonkeyClient:
     ):
         self.api_token = api_token or os.getenv("SHOPMONKEY_API_TOKEN")
         self.base_url = (
-            base_url
-            or os.getenv("SHOPMONKEY_API_BASE_URL", "https://api.shopmonkey.cloud")
+            base_url or os.getenv("SHOPMONKEY_API_BASE_URL", "https://api.shopmonkey.cloud")
         ).rstrip("/")
         self.location_id = location_id or os.getenv("SHOPMONKEY_LOCATION_ID")
         self.timeout = timeout
@@ -137,7 +138,9 @@ class ShopmonkeyClient:
                 elapsed_ms=round(elapsed_ms, 2),
                 error=str(e),
             )
-            raise ShopmonkeyTimeoutError(f"Request to {endpoint} timed out after {self.timeout}s") from e
+            raise ShopmonkeyTimeoutError(
+                f"Request to {endpoint} timed out after {self.timeout}s"
+            ) from e
 
         except httpx.NetworkError as e:
             elapsed_ms = (time.monotonic() - start_time) * 1000
@@ -197,9 +200,7 @@ class ShopmonkeyClient:
         start_date = f"{date_str}T00:00:00Z"
         end_date = f"{date_str}T23:59:59Z"
 
-        where_clause: dict[str, Any] = {
-            "startDate": {"$gte": start_date, "$lt": end_date}
-        }
+        where_clause: dict[str, Any] = {"startDate": {"$gte": start_date, "$lt": end_date}}
 
         params = {"where": json.dumps(where_clause)}
 
@@ -214,8 +215,7 @@ class ShopmonkeyClient:
             appointments = [
                 appt
                 for appt in appointments
-                if appt.get("technicianId") in tech_ids
-                or appt.get("userId") in tech_ids
+                if appt.get("technicianId") in tech_ids or appt.get("userId") in tech_ids
             ]
 
         return appointments
@@ -351,9 +351,7 @@ class ShopmonkeyClient:
         if self.location_id:
             appointment_data["locationId"] = self.location_id
 
-        result = await self._request(
-            "POST", "/v3/appointment", json_data=appointment_data
-        )
+        result = await self._request("POST", "/v3/appointment", json_data=appointment_data)
         return result.get("data", result)
 
     async def get_users(self) -> list[dict[str, Any]]:
@@ -368,10 +366,7 @@ class ShopmonkeyClient:
     async def get_active_user_ids(self) -> set[str]:
         """Return IDs of active Shopmonkey users (cached for 5 minutes)."""
         now = time.monotonic()
-        if (
-            self._active_user_ids_cache is not None
-            and now < self._active_user_ids_cache_expiry
-        ):
+        if self._active_user_ids_cache is not None and now < self._active_user_ids_cache_expiry:
             return self._active_user_ids_cache
 
         users = await self.get_users()

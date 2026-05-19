@@ -29,10 +29,7 @@ def _collect_attribute_accesses(source_path: Path, target_names: set[str]) -> se
 
     class Visitor(ast.NodeVisitor):
         def visit_Attribute(self, node: ast.Attribute) -> None:
-            if (
-                isinstance(node.value, ast.Name)
-                and node.value.id in target_names
-            ):
+            if isinstance(node.value, ast.Name) and node.value.id in target_names:
                 found.add(node.attr)
             self.generic_visit(node)
 
@@ -59,9 +56,7 @@ def test_mock_shopmonkey_implements_all_used_methods(shopmonkey_calls_in_main):
             continue
         if not hasattr(MockShopmonkeyClient, attr):
             missing.add(attr)
-    assert not missing, (
-        f"MockShopmonkeyClient missing methods used by main.py: {sorted(missing)}"
-    )
+    assert not missing, f"MockShopmonkeyClient missing methods used by main.py: {sorted(missing)}"
 
 
 def test_mock_sheets_implements_all_used_methods(sheets_calls_in_main):
@@ -72,9 +67,7 @@ def test_mock_sheets_implements_all_used_methods(sheets_calls_in_main):
             continue
         if not hasattr(MockSheetsClient, attr):
             missing.add(attr)
-    assert not missing, (
-        f"MockSheetsClient missing methods used by main.py: {sorted(missing)}"
-    )
+    assert not missing, f"MockSheetsClient missing methods used by main.py: {sorted(missing)}"
 
 
 @pytest.mark.parametrize(
