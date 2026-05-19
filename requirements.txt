@@ -1,16 +1,20 @@
-fastapi==0.109.0
-uvicorn[standard]==0.27.0
-httpx==0.26.0
-google-api-python-client==2.114.0
-google-auth==2.27.0
-python-dotenv==1.0.0
-pyyaml==6.0.1
-email-validator==2.1.0
-cachetools==5.3.0
-tenacity>=8.2.0
-structlog>=24.1.0
-aiosmtplib>=3.0.0
+fastapi>=0.115,<0.137
+uvicorn[standard]>=0.32,<0.48
+httpx>=0.28,<0.29
+pydantic>=2.10,<3
+google-api-python-client>=2.150,<3
+google-auth>=2.40,<3
+python-dotenv>=1.0,<2
+pyyaml>=6.0,<7
+email-validator>=2.2,<3
+cachetools>=5.5,<8
+tenacity>=9.0,<10
+structlog>=25.0,<26
+aiosmtplib>=4.0,<6
 
 # Testing
-pytest>=8.0.0
-pytest-asyncio>=0.24.0
+pytest>=8.0,<10
+pytest-asyncio>=0.24,<2
+
+# Dev tools (lint/format)
+ruff>=0.15,<1

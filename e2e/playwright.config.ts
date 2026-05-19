@@ -35,7 +35,10 @@ export default defineConfig({
   ],
 
   webServer: {
-    command: `/usr/bin/python3 -m uvicorn main:app --port ${PORT} --log-level warning`,
+    // Use the project venv if it exists (matches scripts/setup-dev.sh), then
+    // fall back to whichever python is on PATH. The shell glob expansion
+    // happens because we wrap in `sh -c` via Playwright.
+    command: `sh -c '[ -x "${REPO_ROOT}/.venv/bin/python" ] && PY="${REPO_ROOT}/.venv/bin/python" || PY=python3; exec "$PY" -m uvicorn main:app --port ${PORT} --log-level warning'`,
     cwd: REPO_ROOT,
     url: `${BASE_URL}/health`,
     timeout: 30_000,
