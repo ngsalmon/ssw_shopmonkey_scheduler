@@ -280,3 +280,58 @@ class TestShopmonkeyClientLocationId:
             assert params.get("locationId") == "loc-123"
 
         await client.close()
+
+
+class TestFindOrCreateCustomer:
+    """Tests for find_or_create_customer."""
+
+    @pytest.mark.asyncio
+    async def test_creates_customer_with_customerType(self):
+        """Regression: Shopmonkey rejects POST /v3/customer without customerType.
+
+        We discovered this during the OOTB ticket-creation probe when the live
+        API returned 400 'body must have required property customerType'. The
+        original code didn't pass the field; bookings only worked because
+        existing customers were always found by email and the create path
+        rarely fired.
+        """
+        client = ShopmonkeyClient(api_token="test-token")
+
+        # First call (lookup by email) returns empty -> falls through to create.
+        # Second call (POST) returns the new customer.
+        lookup_response = MagicMock(status_code=200, json=MagicMock(return_value={"data": []}))
+        lookup_response.raise_for_status = MagicMock()
+        create_response = MagicMock(
+            status_code=200,
+            json=MagicMock(return_value={"data": {"id": "cust-new"}}),
+        )
+        create_response.raise_for_status = MagicMock()
+
+        mock_client = AsyncMock()
+        # Two lookups (email then phone) both return empty, then the POST.
+        mock_client.request = AsyncMock(
+            side_effect=[lookup_response, lookup_response, create_response]
+        )
+
+        with patch.object(client, "_get_client", return_value=mock_client):
+            result = await client.find_or_create_customer(
+                first_name="New",
+                last_name="Customer",
+                email="new@example.com",
+                phone="555-9999",
+            )
+
+        assert result == {"id": "cust-new"}
+
+        # Last call was the POST - inspect the body.
+        post_call = mock_client.request.call_args_list[-1]
+        assert post_call.kwargs["method"] == "POST"
+        assert post_call.kwargs["url"] == "/v3/customer"
+        body = post_call.kwargs["json"]
+        assert body["customerType"] == "Customer"
+        assert body["firstName"] == "New"
+        assert body["lastName"] == "Customer"
+        assert body["email"] == "new@example.com"
+        assert body["phone"] == "555-9999"
+
+        await client.close()

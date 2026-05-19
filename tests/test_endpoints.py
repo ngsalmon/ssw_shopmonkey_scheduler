@@ -457,6 +457,40 @@ class TestBookEndpoint:
         mock_shopmonkey_client.create_order.assert_not_awaited()
         mock_shopmonkey_client.attach_services_to_order.assert_not_awaited()
 
+    def test_booking_sends_dst_aware_iso_to_shopmonkey(self, test_client, mock_shopmonkey_client):
+        """The booking ISO format must reflect DST: May -> -05:00, Jan -> -06:00."""
+        # May slot - America/Chicago is CDT (-05:00) in May
+        test_client.post(
+            "/book",
+            json={
+                "service_id": "svc-1",
+                "slot_start": "2026-05-20T11:00:00",
+                "slot_end": "2026-05-20T12:00:00",
+                "customer": {"firstName": "May", "lastName": "Tester"},
+                "vehicle": {"year": 2024, "make": "Toyota", "model": "Camry"},
+            },
+        )
+        may_kwargs = mock_shopmonkey_client.create_appointment.call_args.kwargs
+        assert may_kwargs["start_date"] == "2026-05-20T11:00:00.000-05:00"
+        assert may_kwargs["end_date"] == "2026-05-20T12:00:00.000-05:00"
+
+        mock_shopmonkey_client.create_appointment.reset_mock()
+
+        # January slot - CST (-06:00)
+        test_client.post(
+            "/book",
+            json={
+                "service_id": "svc-1",
+                "slot_start": "2026-01-15T11:00:00",
+                "slot_end": "2026-01-15T12:00:00",
+                "customer": {"firstName": "Jan", "lastName": "Tester"},
+                "vehicle": {"year": 2024, "make": "Toyota", "model": "Camry"},
+            },
+        )
+        jan_kwargs = mock_shopmonkey_client.create_appointment.call_args.kwargs
+        assert jan_kwargs["start_date"] == "2026-01-15T11:00:00.000-06:00"
+        assert jan_kwargs["end_date"] == "2026-01-15T12:00:00.000-06:00"
+
     def test_booking_notes_omit_mismatch_when_names_match(
         self, test_client, mock_shopmonkey_client
     ):
