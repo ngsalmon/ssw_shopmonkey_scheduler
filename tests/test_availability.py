@@ -17,9 +17,11 @@ from availability import (
     generate_time_slots,
     get_buffer_minutes,
     get_business_hours,
+    get_overlap_info_for_slot,
     get_service_duration_minutes,
     is_slot_available,
     parse_appointment_times,
+    slot_capacity,
     validate_config,
 )
 
@@ -846,6 +848,135 @@ class TestMultiDayAvailability:
         morning_slot = next((s for s in slots if s.start == time(9, 0)), None)
         # 2 techs - 2 overlaps = 0 capacity; slot dropped from list.
         assert morning_slot is None
+
+
+class TestPerTechAvailability:
+    """Verify that labor.technicianId info on appointments lets us drop
+    only the specifically-busy techs from the qualified pool, instead of
+    treating every overlap as a shop-wide capacity hit.
+
+    `_busyTechIds` is populated upstream by walking Appointment → Order →
+    Service.labors → technicianId (see ShopmonkeyClient.get_busy_techs_
+    for_appointments). Tests pre-populate it directly.
+    """
+
+    def _appt(
+        self,
+        order_id: str,
+        start: str,
+        end: str,
+        busy: list[str] | None = None,
+    ):
+        a = {"orderId": order_id, "startDate": start, "endDate": end}
+        if busy is not None:
+            a["_busyTechIds"] = busy
+        return a
+
+    def test_get_overlap_info_returns_specific_busy_techs(self):
+        appts = [
+            self._appt(
+                "ord_a",
+                "2026-01-19T09:00:00-06:00",
+                "2026-01-19T10:00:00-06:00",
+                busy=["tech_alex"],
+            )
+        ]
+        busy, unattributed = get_overlap_info_for_slot(
+            time(9, 0), time(10, 0), datetime(2026, 1, 19), appts
+        )
+        assert busy == {"tech_alex"}
+        assert unattributed == 0
+
+    def test_unattributed_overlap_when_no_busy_tech_ids(self):
+        """Overlapping order with no labor-tech info counts as 1 unattributed."""
+        appts = [
+            self._appt(
+                "ord_a",
+                "2026-01-19T09:00:00-06:00",
+                "2026-01-19T10:00:00-06:00",
+                busy=[],
+            )
+        ]
+        busy, unattributed = get_overlap_info_for_slot(
+            time(9, 0), time(10, 0), datetime(2026, 1, 19), appts
+        )
+        assert busy == set()
+        assert unattributed == 1
+
+    def test_slot_capacity_drops_only_busy_tech(self):
+        """A Window Tint tech busy on a Body Shop appointment is dropped
+        from the Window Tint qualified pool. Cross-department tech
+        constraints are captured here even though the appointment is for
+        a different department."""
+        appts = [
+            self._appt(
+                "ord_a",
+                "2026-01-19T09:00:00-06:00",
+                "2026-01-19T10:00:00-06:00",
+                busy=["tech_alex"],
+            )
+        ]
+        capacity, free = slot_capacity(
+            time(9, 0),
+            time(10, 0),
+            datetime(2026, 1, 19),
+            appts,
+            ["tech_alex", "tech_cam", "tech_dave"],
+        )
+        # 3 qualified - tech_alex busy = 2 free, 0 unattributed → capacity 2
+        assert capacity == 2
+        assert "tech_alex" not in free
+        assert set(free) == {"tech_cam", "tech_dave"}
+
+    def test_busy_tech_outside_qualified_pool_does_not_reduce_capacity(self):
+        """An appointment busying a tech NOT qualified for this department
+        leaves the pool fully available."""
+        appts = [
+            self._appt(
+                "ord_a",
+                "2026-01-19T09:00:00-06:00",
+                "2026-01-19T10:00:00-06:00",
+                busy=["tech_marvin_bodyshop"],
+            )
+        ]
+        capacity, free = slot_capacity(
+            time(9, 0),
+            time(10, 0),
+            datetime(2026, 1, 19),
+            appts,
+            ["tech_alex", "tech_cam"],
+        )
+        # marvin isn't in the qualified pool, so dropping him doesn't matter
+        assert capacity == 2
+        assert set(free) == {"tech_alex", "tech_cam"}
+
+    def test_mix_of_busy_and_unattributed_appointments(self):
+        """Specifically-busy techs are dropped AND unattributed overlap
+        reduces remaining capacity by 1 each."""
+        appts = [
+            self._appt(
+                "ord_a",
+                "2026-01-19T09:00:00-06:00",
+                "2026-01-19T10:00:00-06:00",
+                busy=["tech_alex"],
+            ),
+            self._appt(
+                "ord_b",
+                "2026-01-19T09:00:00-06:00",
+                "2026-01-19T10:00:00-06:00",
+                busy=[],  # labor walk found no tech
+            ),
+        ]
+        capacity, free = slot_capacity(
+            time(9, 0),
+            time(10, 0),
+            datetime(2026, 1, 19),
+            appts,
+            ["tech_alex", "tech_cam", "tech_dave"],
+        )
+        # 3 qualified - tech_alex = 2 free, - 1 unattributed = 1 capacity
+        assert capacity == 1
+        assert "tech_alex" not in free
 
 
 class TestTimezoneAwareConflictDetection:

@@ -71,7 +71,8 @@ class MockShopmonkeyClient:
 
         Mirrors the real Shopmonkey API: there is no `technicianId` on
         appointment records, so the tech_ids argument is intentionally
-        ignored. Conflict detection uses overlap-count instead.
+        ignored. Conflict detection uses overlap-count + per-tech labor
+        walk instead (see `get_busy_techs_for_appointments`).
         """
         _raise_if_error("get_appointments_for_date", self._state)
         result: list[dict[str, Any]] = []
@@ -79,6 +80,28 @@ class MockShopmonkeyClient:
             if _parse_iso_to_date(appt.start_date) != date_str:
                 continue
             result.append(appt.to_dict())
+        return result
+
+    async def get_busy_techs_for_appointments(
+        self, appointments: list[dict[str, Any]]
+    ) -> dict[str, set[str]]:
+        """Simulate Appointment → Order → Service.labors → technicianId.
+
+        Real Shopmonkey requires N+1 HTTP calls (one per appointment) to
+        walk the chain. For tests we shortcut by reading the appointment's
+        technician_id directly, since that's the same field staff use to
+        decide who's busy in practice.
+        """
+        _raise_if_error("get_busy_techs_for_appointments", self._state)
+        result: dict[str, set[str]] = {}
+        for appt in self._state.appointments:
+            if not appt.order_id:
+                continue
+            appt_dict_id = appt.id
+            if appt.technician_id:
+                result[appt_dict_id] = {appt.technician_id}
+            else:
+                result[appt_dict_id] = set()
         return result
 
     async def find_or_create_customer(

@@ -468,3 +468,77 @@ class TestGetAppointmentsForDate:
         params = mock_client.request.call_args.kwargs["params"]
         assert params.get("limit") == "100"
         await client.close()
+
+
+class TestGetBusyTechsForAppointments:
+    """Coverage for the appointment→order→service→labor→technicianId walk
+    that powers per-tech availability. Live probe on 2026-05-20 confirmed
+    96% of upcoming bookings carry a labor.technicianId; this tested behavior
+    is what extracts those tech IDs into the conflict-detection pipeline.
+    """
+
+    def _services_response(self, services):
+        m = MagicMock()
+        m.status_code = 200
+        m.json.return_value = {"data": services, "meta": {"hasMore": False, "total": len(services)}}
+        m.raise_for_status = MagicMock()
+        return m
+
+    @pytest.mark.asyncio
+    async def test_collects_tech_ids_from_labors(self):
+        client = ShopmonkeyClient(api_token="test-token")
+        mock_client = AsyncMock()
+        # Two appointments, two distinct orders, each with a labor-tech.
+        mock_client.request = AsyncMock(
+            side_effect=[
+                self._services_response([{"labors": [{"technicianId": "tech_alex"}]}]),
+                self._services_response(
+                    [
+                        {"labors": [{"technicianId": "tech_cam"}]},
+                        {"labors": [{"technicianId": "tech_dave"}]},
+                    ]
+                ),
+            ]
+        )
+        with patch.object(client, "_get_client", return_value=mock_client):
+            result = await client.get_busy_techs_for_appointments(
+                [
+                    {"id": "appt_1", "orderId": "ord_a"},
+                    {"id": "appt_2", "orderId": "ord_b"},
+                ]
+            )
+        assert result == {"appt_1": {"tech_alex"}, "appt_2": {"tech_cam", "tech_dave"}}
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_skips_appointments_without_order_id(self):
+        """Time-off / lunch blocks have no orderId; don't fetch services for them."""
+        client = ShopmonkeyClient(api_token="test-token")
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock()
+        with patch.object(client, "_get_client", return_value=mock_client):
+            result = await client.get_busy_techs_for_appointments(
+                [{"id": "appt_block", "orderId": None}]
+            )
+        assert result == {}
+        mock_client.request.assert_not_called()
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_set_when_labors_have_no_tech(self):
+        """Order/service exists but no labor has technicianId set (~4% of
+        bookings). Caller treats this as 'unattributed' overlap and reduces
+        shop capacity by 1 conservatively."""
+        client = ShopmonkeyClient(api_token="test-token")
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(
+            return_value=self._services_response(
+                [{"labors": [{"name": "Some labor"}]}]  # no technicianId
+            )
+        )
+        with patch.object(client, "_get_client", return_value=mock_client):
+            result = await client.get_busy_techs_for_appointments(
+                [{"id": "appt_1", "orderId": "ord_a"}]
+            )
+        assert result == {"appt_1": set()}
+        await client.close()

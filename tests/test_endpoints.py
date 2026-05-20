@@ -44,6 +44,7 @@ def mock_shopmonkey_client():
         }
     )
     client.get_appointments_for_date = AsyncMock(return_value=[])
+    client.get_busy_techs_for_appointments = AsyncMock(return_value={})
     client.find_or_create_customer = AsyncMock(return_value={"id": "cust-123"})
     client.find_or_create_vehicle = AsyncMock(return_value={"id": "veh-456"})
     client.create_appointment = AsyncMock(return_value={"id": "appt-789"})
@@ -431,7 +432,17 @@ class TestBookEndpoint:
         assert len(services) == 1
         assert services[0]["cannedServiceId"] == "svc-1"
         assert services[0]["name"] == "Window Tint"
-        assert services[0]["labors"] == [{"name": "Tint Labor", "hours": 1.5, "rateCents": 13000}]
+        # Labor is stamped with the assigned tech so the next /availability
+        # check sees this booking as taking that tech (instead of falling
+        # into the "unattributed" bucket).
+        assert services[0]["labors"] == [
+            {
+                "name": "Tint Labor",
+                "hours": 1.5,
+                "rateCents": 13000,
+                "technicianId": "tech-1",
+            }
+        ]
 
         appt_kwargs = mock_shopmonkey_client.create_appointment.call_args.kwargs
         assert appt_kwargs["order_id"] == "order_42"
@@ -531,6 +542,9 @@ class TestBookEndpoint:
         assert labor["rateCents"] == 10000
         assert labor["hours"] == 3.21
         assert labor["taxable"] is False
+        # Labor is stamped with the assigned tech so per-tech availability
+        # picks up our booking on the next /availability check.
+        assert labor["technicianId"] in {"tech-1", "tech-2"}
 
         # Parts forwarded with quantity/retail/partNumber so the ticket has
         # line items instead of a labor-only $0-parts total. Pre-fix this

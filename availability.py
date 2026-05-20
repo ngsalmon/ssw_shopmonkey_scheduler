@@ -176,36 +176,30 @@ def parse_appointment_times(appointment: dict[str, Any]) -> tuple[datetime, date
         return None
 
 
-def count_overlapping_appointments(
+def get_overlap_info_for_slot(
     slot_start: time,
     slot_end: time,
     date: datetime,
     appointments: list[dict[str, Any]],
     tz: ZoneInfo | None = None,
-) -> int:
-    """Count "real customer" appointments overlapping the slot.
+) -> tuple[set[str], int]:
+    """Inspect every appointment overlapping the slot and split it into
+    `(busy_tech_ids, unattributed_overlap_count)`.
 
-    Shopmonkey's `/v3/appointment` records do not carry a `technicianId` or
-    `userId` field, so we cannot do per-tech conflict detection from the
-    appointment payload alone (the previous per-tech check was a silent
-    no-op - every tech always looked free and the system happily
-    double-booked). Instead we count overlapping appointments as a
-    shop-level capacity proxy.
+    `busy_tech_ids` is the union of `_busyTechIds` across overlapping
+    appointments - those are technician IDs resolved upstream by walking
+    Appointment → Order → Service.labors → technicianId. They identify a
+    specific tech as busy so we can drop only that tech from the qualified
+    pool.
 
-    Only counts appointments with `orderId` set, which excludes one-off
-    calendar blocks like "Robert Out", "Lunch - All employees", and
-    "PTO All Day". Those are tech-specific time-off entries that don't
-    occupy a service bay, so counting them would over-restrict capacity.
+    `unattributed_overlap_count` counts overlapping orderId-bearing
+    appointments where the labor walk found no technicianId (~4% of live
+    bookings on 2026-05-20 - typically older work orders that haven't
+    been triaged yet). We don't know which tech, so each one reduces
+    overall shop capacity by 1 conservatively.
 
-    Args:
-        slot_start: Start time of the slot (interpreted in the business TZ)
-        slot_end: End time of the slot (interpreted in the business TZ)
-        date: Date to check (interpreted in the business TZ)
-        appointments: List of Shopmonkey appointment records for that date
-        tz: Business timezone. Defaults to America/Chicago.
-
-    Returns:
-        Number of overlapping customer appointments.
+    Appointments without `orderId` (lunch / PTO / "Robert Out" blocks)
+    are intentionally ignored - they don't occupy a service bay.
     """
     if tz is None:
         tz = ZoneInfo(DEFAULT_TIMEZONE)
@@ -213,9 +207,10 @@ def count_overlapping_appointments(
     slot_start_dt = datetime.combine(date.date(), slot_start)
     slot_end_dt = datetime.combine(date.date(), slot_end)
 
-    count = 0
+    busy_techs: set[str] = set()
+    unattributed = 0
+
     for appt in appointments:
-        # Skip personal blocks / shop events / time-off (no linked order).
         if not appt.get("orderId"):
             continue
 
@@ -234,10 +229,51 @@ def count_overlapping_appointments(
             appt_end = appt_end.astimezone(tz).replace(tzinfo=None)
 
         # Half-open overlap: an appointment ending exactly at slot_start
-        # doesn't conflict (matches the canonical overlap definition).
+        # doesn't conflict.
+        if not (appt_start < slot_end_dt and appt_end > slot_start_dt):
+            continue
+
+        appt_tech_ids = appt.get("_busyTechIds") or []
+        if appt_tech_ids:
+            busy_techs.update(appt_tech_ids)
+        else:
+            unattributed += 1
+
+    return busy_techs, unattributed
+
+
+def count_overlapping_appointments(
+    slot_start: time,
+    slot_end: time,
+    date: datetime,
+    appointments: list[dict[str, Any]],
+    tz: ZoneInfo | None = None,
+) -> int:
+    """Count orderId-bearing appointments overlapping the slot.
+
+    Shop-level capacity proxy. Prefer `get_overlap_info_for_slot` when
+    you also care which specific techs are busy.
+    """
+    if tz is None:
+        tz = ZoneInfo(DEFAULT_TIMEZONE)
+
+    slot_start_dt = datetime.combine(date.date(), slot_start)
+    slot_end_dt = datetime.combine(date.date(), slot_end)
+
+    count = 0
+    for appt in appointments:
+        if not appt.get("orderId"):
+            continue
+        times = parse_appointment_times(appt)
+        if times is None:
+            continue
+        appt_start, appt_end = times
+        if appt_start.tzinfo is not None:
+            appt_start = appt_start.astimezone(tz).replace(tzinfo=None)
+        if appt_end.tzinfo is not None:
+            appt_end = appt_end.astimezone(tz).replace(tzinfo=None)
         if appt_start < slot_end_dt and appt_end > slot_start_dt:
             count += 1
-
     return count
 
 
@@ -312,6 +348,33 @@ def calculate_days_needed(
     return days_needed
 
 
+def slot_capacity(
+    slot_start: time,
+    slot_end: time,
+    date: datetime,
+    appointments: list[dict[str, Any]],
+    tech_ids: list[str],
+    tz: ZoneInfo | None = None,
+) -> tuple[int, list[str]]:
+    """Compute `(remaining_capacity, free_tech_ids)` for a slot.
+
+    Uses per-tech busy info from `_busyTechIds` (resolved upstream by
+    walking labor.technicianId) to drop only the specifically-busy techs
+    from the qualified pool, then subtracts the unattributed overlap
+    count (orderId-bearing appointments where labors carry no tech) as a
+    conservative shop-level reduction.
+
+    `free_tech_ids` are techs we KNOW are not busy. When unattributed > 0,
+    the caller still treats overall capacity as `len(free_tech_ids) -
+    unattributed`, because we can't tell which of the "free" techs might
+    actually be the unattributed-busy one.
+    """
+    busy, unattributed = get_overlap_info_for_slot(slot_start, slot_end, date, appointments, tz=tz)
+    free = [t for t in tech_ids if t not in busy]
+    capacity = max(len(free) - unattributed, 0)
+    return capacity, free
+
+
 def count_multiday_overlap_capacity(
     days_needed: list[tuple[datetime, int]],
     first_day_appointments: list[dict[str, Any]],
@@ -319,35 +382,38 @@ def count_multiday_overlap_capacity(
     first_day_close_time: time,
     future_appointments: dict[str, list[dict[str, Any]]],
     config: dict[str, Any],
-    qualified_tech_count: int,
-) -> int:
-    """Compute remaining capacity (techs - max overlap) for a multi-day slot.
+    tech_ids: list[str],
+) -> tuple[int, list[str]]:
+    """Compute remaining capacity and free techs for a multi-day slot.
 
-    Returns the *minimum* free capacity across all required days: a multi-day
-    booking only works if every day it spans has at least one tech free, so
-    the bottleneck day governs.
+    Returns `(min_capacity, free_tech_ids)` where free_tech_ids is the
+    INTERSECTION of free techs across every required day (a tech has to
+    be free on all spanned days to take a multi-day booking). The
+    bottleneck day governs the capacity number.
     """
     if not days_needed:
-        return 0
+        return 0, []
 
     tz = get_timezone(config)
 
-    # First day: count overlaps from start_time to close
+    # First day: cap from start_time to close
     first_date, _ = days_needed[0]
-    first_overlap = count_overlapping_appointments(
+    first_capacity, first_free = slot_capacity(
         first_day_start_time,
         first_day_close_time,
         first_date,
         first_day_appointments,
+        tech_ids,
         tz=tz,
     )
-    min_capacity = qualified_tech_count - first_overlap
+    min_capacity = first_capacity
+    free_set = set(first_free)
 
     # Subsequent days: from open until minutes_needed
     for date, minutes_needed in days_needed[1:]:
         day_hours = get_business_hours(config, date)
         if not day_hours.is_open:
-            return 0
+            return 0, []
 
         needed_end = (
             datetime.combine(date.date(), day_hours.open_time) + timedelta(minutes=minutes_needed)
@@ -356,18 +422,21 @@ def count_multiday_overlap_capacity(
         date_str = date.strftime("%Y-%m-%d")
         day_appointments = future_appointments.get(date_str, [])
 
-        overlap = count_overlapping_appointments(
+        cap, free = slot_capacity(
             day_hours.open_time,
             needed_end,
             date,
             day_appointments,
+            tech_ids,
             tz=tz,
         )
-        capacity = qualified_tech_count - overlap
-        if capacity < min_capacity:
-            min_capacity = capacity
+        if cap < min_capacity:
+            min_capacity = cap
+        free_set &= set(free)
 
-    return max(min_capacity, 0)
+    # Preserve qualified order in the returned free list
+    free_in_order = [t for t in tech_ids if t in free_set]
+    return max(min_capacity, 0), free_in_order
 
 
 def generate_slot_start_times(
@@ -432,7 +501,6 @@ def calculate_available_slots(
         future_appointments = {}
 
     tz = get_timezone(config)
-    tech_count = len(tech_ids)
 
     # Generate slot start times (hourly intervals)
     slot_interval = config.get("slot_interval_minutes", 60)
@@ -451,37 +519,34 @@ def calculate_available_slots(
         is_multiday = len(days_needed) > 1
 
         if is_multiday:
-            capacity = count_multiday_overlap_capacity(
+            capacity, free_techs = count_multiday_overlap_capacity(
                 days_needed=days_needed,
                 first_day_appointments=appointments,
                 first_day_start_time=slot_start,
                 first_day_close_time=business_hours.close_time,
                 future_appointments=future_appointments,
                 config=config,
-                qualified_tech_count=tech_count,
+                tech_ids=tech_ids,
             )
             slot_end = business_hours.close_time
         else:
             slot_end = (
                 datetime.combine(date.date(), slot_start) + timedelta(minutes=slot_duration_minutes)
             ).time()
-            overlap = count_overlapping_appointments(
-                slot_start, slot_end, date, appointments, tz=tz
+            capacity, free_techs = slot_capacity(
+                slot_start, slot_end, date, appointments, tech_ids, tz=tz
             )
-            capacity = max(tech_count - overlap, 0)
 
         if capacity > 0:
-            # We can't tell from the appointment payload which specific tech
-            # is busy (Shopmonkey doesn't expose technicianId on
-            # appointments), so hand back the full qualified list and let
-            # priority/round-robin pick one. Capacity governs whether the
-            # slot is even shown to the customer.
+            # free_techs are the qualified techs whose labor.technicianId
+            # does NOT appear on any overlapping order. priority +
+            # round-robin picks one of them for assignment.
             available_slots.append(
                 TimeSlot(
                     start=slot_start,
                     end=slot_end,
                     available_techs=capacity,
-                    available_tech_ids=list(tech_ids),
+                    available_tech_ids=free_techs,
                 )
             )
 
@@ -496,24 +561,20 @@ def is_slot_available(
     appointments: list[dict[str, Any]],
     config: dict[str, Any] | None = None,
 ) -> tuple[bool, list[str]]:
-    """Re-check that a specific slot still has shop capacity.
+    """Re-check that a specific slot still has capacity for a qualified tech.
 
     Used by /book inside the booking lock to catch races between the
-    availability check and the actual create. See
-    `count_overlapping_appointments` for why this is shop-level capacity,
-    not per-tech.
-
-    Returns:
-        Tuple of (is_available, list of qualified tech IDs eligible for
-        assignment). The tech list is the full qualified set when there's
-        remaining capacity; empty when the shop is full.
+    availability check and the actual create. Returns the same
+    `(is_available, eligible_tech_ids)` shape as before; the eligible
+    list now reflects techs known free (not busy on a labor for an
+    overlapping order). See `get_overlap_info_for_slot` for the labor-tech
+    chain walk.
     """
     tz = get_timezone(config)
-    overlap = count_overlapping_appointments(slot_start, slot_end, date, appointments, tz=tz)
-    capacity = len(tech_ids) - overlap
+    capacity, free_techs = slot_capacity(slot_start, slot_end, date, appointments, tech_ids, tz=tz)
     if capacity <= 0:
         return (False, [])
-    return (True, list(tech_ids))
+    return (True, free_techs)
 
 
 def get_buffer_minutes(

@@ -223,17 +223,50 @@ def canned_service_subcontracts_for_attach(
     return subs
 
 
-def build_attach_service_payload(service: dict[str, Any], canned_service_id: str) -> dict[str, Any]:
+async def _fetch_appointments_with_busy_techs(date_str: str) -> list[dict[str, Any]]:
+    """Fetch appointments for the date and tag each with `_busyTechIds`.
+
+    Walks Appointment → Order → Service.labors → technicianId so the
+    availability check can drop only specifically-busy techs from the
+    qualified pool instead of treating every overlap as a shop-wide
+    capacity hit. Verified on 2026-05-20 that ~96% of upcoming bookings
+    have at least one labor with technicianId set; the remaining ones
+    fall through as "unattributed" and reduce shop capacity by one.
+    """
+    if not shopmonkey_client:
+        return []
+    appointments = await shopmonkey_client.get_appointments_for_date(date_str)
+    busy_by_appt = await shopmonkey_client.get_busy_techs_for_appointments(appointments)
+    for appt in appointments:
+        tech_ids = busy_by_appt.get(appt.get("id"), set())
+        appt["_busyTechIds"] = sorted(tech_ids)
+    return appointments
+
+
+def build_attach_service_payload(
+    service: dict[str, Any],
+    canned_service_id: str,
+    assigned_tech_id: str | None = None,
+) -> dict[str, Any]:
     """Build the full line-item attach payload for a canned service.
 
     Mirrors what Shopmonkey's OOTB scheduler does so the resulting ticket
     has the right labor rate, parts, fees, and totals - what Anne sees on
     the website matches what staff sees on the ticket.
     """
+    labors = canned_service_labors_for_attach(service)
+    # Stamp the assigned tech onto every labor so the availability check
+    # for the NEXT booking (which walks order.services.labors.technicianId)
+    # sees this booking as taking that tech. Without this, our own
+    # bookings would land in the "unattributed" bucket and only reduce
+    # shop capacity by one - we'd still over-allow assignments.
+    if assigned_tech_id:
+        for labor in labors:
+            labor["technicianId"] = assigned_tech_id
     return {
         "cannedServiceId": canned_service_id,
         "name": service.get("name") or "",
-        "labors": canned_service_labors_for_attach(service),
+        "labors": labors,
         "parts": canned_service_parts_for_attach(service),
         "fees": canned_service_fees_for_attach(service),
         "subcontracts": canned_service_subcontracts_for_attach(service),
@@ -742,8 +775,9 @@ async def get_availability(
         service, department, qualified_techs = await get_qualified_techs_for_service(service_id)
         tech_ids = [t["tech_id"] for t in qualified_techs]
 
-        # Get existing appointments for the date
-        appointments = await shopmonkey_client.get_appointments_for_date(date, tech_ids)
+        # Get existing appointments for the date and enrich each with the
+        # tech IDs assigned via their order's service labors.
+        appointments = await _fetch_appointments_with_busy_techs(date)
         logger.debug("existing_appointments_fetched", count=len(appointments))
 
         # Get service duration (labor time + any buffer for cure time, etc.)
@@ -760,6 +794,8 @@ async def get_availability(
         )
 
         # For multi-day services, fetch appointments for upcoming days
+        # (also enriched with _busyTechIds so per-tech availability holds
+        # across day boundaries).
         future_appointments: dict[str, list] = {}
         if slot_duration > 300:  # Only fetch future days for services > 5 hours
             check_date = target_date
@@ -767,9 +803,7 @@ async def get_availability(
                 check_date = check_date + timedelta(days=1)
                 date_str = check_date.strftime("%Y-%m-%d")
                 try:
-                    future_appts = await shopmonkey_client.get_appointments_for_date(
-                        date_str, tech_ids
-                    )
+                    future_appts = await _fetch_appointments_with_busy_techs(date_str)
                     future_appointments[date_str] = future_appts
                 except ShopmonkeyAPIError:
                     logger.warning("future_appointments_fetch_failed", date=date_str)
@@ -864,8 +898,11 @@ async def book_appointment(_: ApiKeyDep, request: BookingRequest):
             service_name = service.get("name", "Service")
             tech_ids = [t["tech_id"] for t in qualified_techs]
 
-            # Re-check availability (inside lock to prevent race conditions)
-            appointments = await shopmonkey_client.get_appointments_for_date(date_str, tech_ids)
+            # Re-check availability (inside lock to prevent race conditions).
+            # Enriched appointments carry _busyTechIds from labor.technicianId
+            # so we filter out specifically-busy techs and only fail when no
+            # qualified tech is actually free.
+            appointments = await _fetch_appointments_with_busy_techs(date_str)
             is_available, available_tech_ids = is_slot_available(
                 date=slot_start_dt,
                 slot_start=slot_start_dt.time(),
@@ -885,6 +922,16 @@ async def book_appointment(_: ApiKeyDep, request: BookingRequest):
                     status_code=409,
                     detail="The selected time slot is no longer available",
                 )
+
+            # Pick the tech upfront so we can stamp technicianId onto the
+            # labor when we attach the service - the next /availability check
+            # then sees this booking as taking that tech (instead of falling
+            # into the "unattributed" bucket).
+            assigned_tech_id = select_tech_by_priority(
+                qualified_techs=qualified_techs,
+                available_tech_ids=available_tech_ids,
+                department=department,
+            )
 
             # Find or create customer
             logger.debug("creating_customer")
@@ -990,8 +1037,13 @@ async def book_appointment(_: ApiKeyDep, request: BookingRequest):
                         # Attach the requested service as a line item with
                         # labors+parts+fees+subcontracts from the canned
                         # service so the resulting ticket total matches
-                        # what the customer was quoted.
-                        attach_payload = [build_attach_service_payload(service, request.service_id)]
+                        # what the customer was quoted. Stamp the chosen
+                        # tech onto every labor.
+                        attach_payload = [
+                            build_attach_service_payload(
+                                service, request.service_id, assigned_tech_id
+                            )
+                        ]
                         await shopmonkey_client.attach_services_to_order(
                             order_id=order_id, services=attach_payload
                         )
@@ -1010,12 +1062,6 @@ async def book_appointment(_: ApiKeyDep, request: BookingRequest):
                         )
                         order_id = None
 
-            # Create appointment - assign tech by priority + round-robin
-            assigned_tech_id = select_tech_by_priority(
-                qualified_techs=qualified_techs,
-                available_tech_ids=available_tech_ids,
-                department=department,
-            )
             logger.debug("creating_appointment", technician_id=assigned_tech_id)
 
             # Generate confirmation number BEFORE creating appointment
