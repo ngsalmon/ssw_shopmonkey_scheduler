@@ -103,23 +103,141 @@ def build_ootb_booking_name(
     return f"{customer_part} / {vehicle_part} / {service_name}"
 
 
-def canned_service_labors_for_attach(service: dict[str, Any]) -> list[dict[str, Any]]:
-    """Extract the labor lines from a canned service for `attach_services_to_order`.
+def _safe_cents(value: Any) -> int:
+    """Round cents fields. Shopmonkey returns floats here (e.g. 5649.5)."""
+    if value is None:
+        return 0
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return 0
 
-    Only forwards the fields Shopmonkey accepts on the line-item POST: name,
-    hours, rateCents. Empty list when the canned service has no labors so the
-    line item is still created (at $0).
+
+def canned_service_labors_for_attach(service: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract labor lines from a canned service for line-item attach.
+
+    Forwards rateId/laborMatrixId/laborRate so Shopmonkey uses the rate the
+    canned service was priced with. Without rateId the API silently
+    substitutes the shop default labor rate, which is why our pre-fix
+    tickets showed $130/hr instead of the $100/hr the customer was quoted.
     """
     labors: list[dict[str, Any]] = []
     for labor in service.get("labors", []) or []:
-        labors.append(
-            {
-                "name": labor.get("name") or service.get("name") or "",
-                "hours": labor.get("hours", 0) or 0,
-                "rateCents": labor.get("rateCents", 0) or 0,
-            }
-        )
+        item: dict[str, Any] = {
+            "name": labor.get("name") or service.get("name") or "",
+            "hours": labor.get("hours", 0) or 0,
+            "rateCents": _safe_cents(labor.get("rateCents")),
+        }
+        # Optional fields that fix pricing parity with the canned service
+        # when present. Skipped when null so we don't send unset references.
+        for key in ("rateId", "laborMatrixId", "categoryId"):
+            if labor.get(key):
+                item[key] = labor[key]
+        if "taxable" in labor:
+            item["taxable"] = bool(labor["taxable"])
+        if labor.get("discountCents"):
+            item["discountCents"] = _safe_cents(labor["discountCents"])
+        if labor.get("discountPercent"):
+            item["discountPercent"] = labor["discountPercent"]
+        labors.append(item)
     return labors
+
+
+def canned_service_parts_for_attach(service: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract part lines from a canned service for line-item attach.
+
+    Parts were missing entirely pre-fix because we only forwarded labors,
+    which is why tickets showed labor only and no parts (e.g. the Window
+    Tint Ceramic ticket missing its 3.5 yards of "Ceramic IR" film).
+    """
+    parts: list[dict[str, Any]] = []
+    for part in service.get("parts", []) or []:
+        item: dict[str, Any] = {
+            "name": part.get("name") or "",
+            "quantity": part.get("quantity", 0) or 0,
+            "retailCostCents": _safe_cents(part.get("retailCostCents")),
+        }
+        if part.get("wholesaleCostCents") is not None:
+            item["wholesaleCostCents"] = _safe_cents(part["wholesaleCostCents"])
+        if part.get("partNumber"):
+            item["partNumber"] = part["partNumber"]
+        if "taxable" in part:
+            item["taxable"] = bool(part["taxable"])
+        if part.get("discountCents"):
+            item["discountCents"] = _safe_cents(part["discountCents"])
+        if part.get("discountPercent"):
+            item["discountPercent"] = part["discountPercent"]
+        for key in ("vendorId", "inventoryPartId", "categoryId", "pricingMatrixId"):
+            if part.get(key):
+                item[key] = part[key]
+        if part.get("note"):
+            item["note"] = part["note"]
+        parts.append(item)
+    return parts
+
+
+def canned_service_fees_for_attach(service: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract fee lines from a canned service for line-item attach."""
+    fees: list[dict[str, Any]] = []
+    for fee in service.get("fees", []) or []:
+        item: dict[str, Any] = {
+            "name": fee.get("name") or "",
+            "amountCents": _safe_cents(fee.get("amountCents")),
+        }
+        if "taxable" in fee:
+            item["taxable"] = bool(fee["taxable"])
+        if fee.get("categoryId"):
+            item["categoryId"] = fee["categoryId"]
+        if fee.get("inventoryFeeId"):
+            item["inventoryFeeId"] = fee["inventoryFeeId"]
+        fees.append(item)
+    return fees
+
+
+def canned_service_subcontracts_for_attach(
+    service: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Extract subcontract lines from a canned service for line-item attach.
+
+    The REST API now returns `costCents`; older payloads used
+    `wholesaleCostCents`. Read both so we cover the transition window.
+    """
+    subs: list[dict[str, Any]] = []
+    for sub in service.get("subcontracts", []) or []:
+        cost = (
+            sub.get("wholesaleCostCents")
+            if sub.get("wholesaleCostCents") is not None
+            else sub.get("costCents")
+        )
+        item: dict[str, Any] = {
+            "name": sub.get("name") or "",
+            "retailCostCents": _safe_cents(sub.get("retailCostCents")),
+        }
+        if cost is not None:
+            item["wholesaleCostCents"] = _safe_cents(cost)
+        if "taxable" in sub:
+            item["taxable"] = bool(sub["taxable"])
+        if sub.get("vendorId"):
+            item["vendorId"] = sub["vendorId"]
+        subs.append(item)
+    return subs
+
+
+def build_attach_service_payload(service: dict[str, Any], canned_service_id: str) -> dict[str, Any]:
+    """Build the full line-item attach payload for a canned service.
+
+    Mirrors what Shopmonkey's OOTB scheduler does so the resulting ticket
+    has the right labor rate, parts, fees, and totals - what Anne sees on
+    the website matches what staff sees on the ticket.
+    """
+    return {
+        "cannedServiceId": canned_service_id,
+        "name": service.get("name") or "",
+        "labors": canned_service_labors_for_attach(service),
+        "parts": canned_service_parts_for_attach(service),
+        "fees": canned_service_fees_for_attach(service),
+        "subcontracts": canned_service_subcontracts_for_attach(service),
+    }
 
 
 def select_tech_by_priority(
@@ -869,20 +987,21 @@ async def book_appointment(_: ApiKeyDep, request: BookingRequest):
                             order_number=created_order.get("number"),
                         )
 
-                        # Attach the requested service as a line item. Passing
-                        # labors makes Shopmonkey compute calculatedLaborCents
-                        # so the ticket isn't $0 by default.
-                        attach_payload = [
-                            {
-                                "cannedServiceId": request.service_id,
-                                "name": service_name,
-                                "labors": canned_service_labors_for_attach(service),
-                            }
-                        ]
+                        # Attach the requested service as a line item with
+                        # labors+parts+fees+subcontracts from the canned
+                        # service so the resulting ticket total matches
+                        # what the customer was quoted.
+                        attach_payload = [build_attach_service_payload(service, request.service_id)]
                         await shopmonkey_client.attach_services_to_order(
                             order_id=order_id, services=attach_payload
                         )
-                        logger.info("service_attached_to_order", order_id=order_id)
+                        logger.info(
+                            "service_attached_to_order",
+                            order_id=order_id,
+                            labor_count=len(attach_payload[0].get("labors", [])),
+                            parts_count=len(attach_payload[0].get("parts", [])),
+                            fees_count=len(attach_payload[0].get("fees", [])),
+                        )
                     except ShopmonkeyAPIError as e:
                         logger.warning(
                             "order_creation_failed",

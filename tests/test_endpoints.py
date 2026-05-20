@@ -437,6 +437,112 @@ class TestBookEndpoint:
         assert appt_kwargs["order_id"] == "order_42"
         assert appt_kwargs["title"] == "Russ N. / 2016 Toyota RAV4 / Window Tint"
 
+    def test_booking_attach_payload_forwards_parts_and_rate_id(
+        self, mock_shopmonkey_client, mock_sheets_client
+    ):
+        """Regression for Anne's 2026-05-20 report: attach payload was
+        missing parts entirely and stripped labor rateId, so tickets
+        showed the shop default rate ($130/hr) instead of the canned
+        service's rate ($100/hr) and had no parts. Verify both are
+        forwarded so the ticket total matches what the customer saw.
+        """
+        mock_shopmonkey_client.get_workflow_status_id = AsyncMock(return_value="ws_sched")
+        mock_shopmonkey_client.create_order = AsyncMock(
+            return_value={"id": "order_99", "number": "9000"}
+        )
+        mock_shopmonkey_client.attach_services_to_order = AsyncMock(return_value=[])
+        # Mirrors the live Window Tint Ceramic canned service that produced
+        # the wrong ticket on 2026-05-20 (id stripped for the test).
+        mock_shopmonkey_client.get_canned_service = AsyncMock(
+            return_value={
+                "id": "svc-tint-ceramic",
+                "name": "Window Tint - Full Sedan/Truck - Ceramic",
+                "totalCents": 38047,
+                "labels": [{"name": "Window Tint"}],
+                "labors": [
+                    {
+                        "name": "Install window tint on side windows and rear glass",
+                        "hours": 3.21,
+                        "rateCents": 10000,
+                        "rateId": "lr_window_tint_sedan_ceramic",
+                        "taxable": False,
+                    }
+                ],
+                "parts": [
+                    {
+                        "name": "Ceramic IR",
+                        "quantity": 3.5,
+                        "retailCostCents": 1543,
+                        "wholesaleCostCents": 1189,
+                        "partNumber": "CERAMICIR",
+                        "taxable": True,
+                    }
+                ],
+            }
+        )
+        config_with_flag = {
+            "business_hours": {
+                "monday": {"open": "09:00", "close": "17:00"},
+                "tuesday": {"open": "09:00", "close": "17:00"},
+                "wednesday": {"open": "09:00", "close": "17:00"},
+                "thursday": {"open": "09:00", "close": "17:00"},
+                "friday": {"open": "09:00", "close": "17:00"},
+            },
+            "default_slot_duration_minutes": 60,
+            "online_booking": {
+                "create_order": True,
+                "workflow_status_name": "Scheduled",
+                "order_status": "Estimate",
+                "order_color": "blue",
+            },
+        }
+        with patch.dict(os.environ, {"API_KEY": "", "ALLOWED_ORIGINS": ""}, clear=False):
+            with (
+                patch("main.ShopmonkeyClient", return_value=mock_shopmonkey_client),
+                patch("main.SheetsClient", return_value=mock_sheets_client),
+                patch("main.load_config", return_value=config_with_flag),
+                patch("main.validate_config"),
+            ):
+                from main import app
+
+                with TestClient(app) as client:
+                    response = client.post(
+                        "/book",
+                        json={
+                            "service_id": "svc-tint-ceramic",
+                            "slot_start": "2026-05-27T13:00:00",
+                            "slot_end": "2026-05-27T16:12:36",
+                            "customer": {"firstName": "Anne", "lastName": "Wehner"},
+                            "vehicle": {"year": 2022, "make": "Toyota", "model": "Prius"},
+                        },
+                    )
+
+        assert response.status_code == 200, response.text
+        attach_kwargs = mock_shopmonkey_client.attach_services_to_order.call_args.kwargs
+        services = attach_kwargs["services"]
+        assert len(services) == 1
+        line = services[0]
+
+        # Labor forwards rateId so Shopmonkey uses the canned rate, not the
+        # shop default. Pre-fix this was missing.
+        assert len(line["labors"]) == 1
+        labor = line["labors"][0]
+        assert labor["rateId"] == "lr_window_tint_sedan_ceramic"
+        assert labor["rateCents"] == 10000
+        assert labor["hours"] == 3.21
+        assert labor["taxable"] is False
+
+        # Parts forwarded with quantity/retail/partNumber so the ticket has
+        # line items instead of a labor-only $0-parts total. Pre-fix this
+        # array was absent entirely.
+        assert len(line["parts"]) == 1
+        part = line["parts"][0]
+        assert part["name"] == "Ceramic IR"
+        assert part["quantity"] == 3.5
+        assert part["retailCostCents"] == 1543
+        assert part["partNumber"] == "CERAMICIR"
+        assert part["taxable"] is True
+
     def test_booking_skips_order_creation_when_flag_off(self, test_client, mock_shopmonkey_client):
         """With online_booking absent from config the order endpoints are not called."""
         # The default test_client fixture's config has no online_booking block,
