@@ -412,3 +412,59 @@ class TestFindOrCreateCustomer:
             )
         assert result == existing
         await client.close()
+
+
+class TestGetAppointmentsForDate:
+    """Regression coverage for the where-filter syntax that broke conflict
+    detection on 2026-05-20.
+
+    Shopmonkey's GET /v3/appointment silently ignores MongoDB-style
+    operators with the `$` prefix - the request succeeds but returns ~100
+    unfiltered rows, so our availability check thought the shop was empty
+    and double-booked customers. Operators WITHOUT the `$` prefix work.
+    """
+
+    def _ok(self, data):
+        m = MagicMock()
+        m.status_code = 200
+        m.json.return_value = {"data": data, "meta": {"hasMore": False, "total": len(data)}}
+        m.raise_for_status = MagicMock()
+        return m
+
+    @pytest.mark.asyncio
+    async def test_where_filter_uses_no_dollar_prefix(self):
+        """Operators must be `gte`/`lt`, not `$gte`/`$lt`. The server quietly
+        drops $-prefixed operators."""
+        client = ShopmonkeyClient(api_token="test-token")
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(return_value=self._ok([]))
+        with patch.object(client, "_get_client", return_value=mock_client):
+            await client.get_appointments_for_date("2026-05-27")
+        call = mock_client.request.call_args
+        params = call.kwargs["params"]
+        assert "where" in params
+        where = json.loads(params["where"])
+        assert "startDate" in where
+        # The key assertion: no $-prefixed operators leak through.
+        operators = where["startDate"]
+        assert "$gte" not in operators, "remove $ prefix; server ignores it"
+        assert "$lt" not in operators
+        assert "gte" in operators
+        assert "lt" in operators
+        # Bounds cover the requested local day in UTC.
+        assert operators["gte"].startswith("2026-05-27T")
+        assert operators["lt"].startswith("2026-05-27T")
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_caps_limit_at_100(self):
+        """Shopmonkey hard-caps appointment list at 100 rows; we must send
+        that limit so callers can detect overflow via the meta block."""
+        client = ShopmonkeyClient(api_token="test-token")
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(return_value=self._ok([]))
+        with patch.object(client, "_get_client", return_value=mock_client):
+            await client.get_appointments_for_date("2026-05-27")
+        params = mock_client.request.call_args.kwargs["params"]
+        assert params.get("limit") == "100"
+        await client.close()

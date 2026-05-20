@@ -194,29 +194,44 @@ class ShopmonkeyClient:
 
         Args:
             date_str: Date in YYYY-MM-DD format
-            tech_ids: Optional list of technician IDs to filter by
+            tech_ids: Ignored. Appointments in Shopmonkey don't carry a
+                technicianId/userId field, so caller-side filtering by tech
+                wouldn't work anyway. Kept for backward compatibility.
+
+        Important Shopmonkey API quirks (verified 2026-05-20 against the live
+        API in this shop's account):
+            * The `where` filter uses MongoDB-like operators WITHOUT the `$`
+              prefix. `{"startDate": {"$gte": ...}}` is silently ignored and
+              returns ~100 unfiltered rows. `{"startDate": {"gte": ...}}`
+              works and returns only matching rows.
+            * Page size is hard-capped at 100. For a single day's slice this
+              is fine (a busy day has well under 100 appointments).
         """
-        # Build date range for the full day
+        # Build date range for the full day. The widget submits naive local
+        # dates and we use UTC bounds wide enough to catch any local TZ.
         start_date = f"{date_str}T00:00:00Z"
         end_date = f"{date_str}T23:59:59Z"
 
-        where_clause: dict[str, Any] = {"startDate": {"$gte": start_date, "$lt": end_date}}
+        where_clause: dict[str, Any] = {"startDate": {"gte": start_date, "lt": end_date}}
 
-        params = {"where": json.dumps(where_clause)}
+        params: dict[str, Any] = {"where": json.dumps(where_clause), "limit": "100"}
 
         if self.location_id:
             params["locationId"] = self.location_id
 
         result = await self._request("GET", "/v3/appointment", params=params)
         appointments = result.get("data", [])
+        meta = result.get("meta") or {}
 
-        # Filter by tech IDs if provided
-        if tech_ids:
-            appointments = [
-                appt
-                for appt in appointments
-                if appt.get("technicianId") in tech_ids or appt.get("userId") in tech_ids
-            ]
+        if meta.get("hasMore"):
+            # A single day exceeding 100 appointments would be extraordinary,
+            # but log it so we know to add pagination if it ever happens.
+            logger.warning(
+                "appointment_list_has_more",
+                date=date_str,
+                returned=len(appointments),
+                total=meta.get("total"),
+            )
 
         return appointments
 
