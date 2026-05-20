@@ -567,17 +567,21 @@ class TestBookEndpoint:
         assert response.status_code == 422
 
     def test_slot_conflict_returns_409(self, test_client, mock_shopmonkey_client):
-        """Should return 409 when slot is no longer available."""
-        # First call is during availability check in book endpoint
+        """Should return 409 when slot is no longer available.
+
+        Conflict detection counts appointments with `orderId` set against
+        the qualified tech count. With 2 qualified techs, we need 2
+        overlapping orders to fill the slot.
+        """
         mock_shopmonkey_client.get_appointments_for_date = AsyncMock(
             return_value=[
                 {
-                    "technicianId": "tech-1",
+                    "orderId": "ord-aaa",
                     "startDate": "2026-01-19T09:00:00-06:00",
                     "endDate": "2026-01-19T10:00:00-06:00",
                 },
                 {
-                    "technicianId": "tech-2",
+                    "orderId": "ord-bbb",
                     "startDate": "2026-01-19T09:00:00-06:00",
                     "endDate": "2026-01-19T10:00:00-06:00",
                 },

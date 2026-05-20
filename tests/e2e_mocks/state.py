@@ -61,6 +61,12 @@ class MockAppointment:
     customer_id: str | None = None
     vehicle_id: str | None = None
     name: str = ""
+    # Production appointments created by /book always carry an orderId.
+    # The availability check counts orderId-bearing appointments as
+    # capacity-occupying; blocks without orderId (time off / lunch /
+    # PTO) intentionally don't consume a tech slot. Tests can pass
+    # `order_id=None` to model a non-blocking calendar event.
+    order_id: str | None = "ord_block"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -71,6 +77,7 @@ class MockAppointment:
             "endDate": self.end_date,
             "customerId": self.customer_id,
             "vehicleId": self.vehicle_id,
+            "orderId": self.order_id,
             "name": self.name,
         }
 
@@ -157,6 +164,7 @@ class MockState:
         customer_id: str | None = None,
         vehicle_id: str | None = None,
         name: str = "Existing booking",
+        order_id: str | None = "ord_block",
     ) -> MockAppointment:
         appt = MockAppointment(
             id=f"appt_{uuid.uuid4().hex[:8]}",
@@ -166,6 +174,7 @@ class MockState:
             customer_id=customer_id,
             vehicle_id=vehicle_id,
             name=name,
+            order_id=order_id,
         )
         self.appointments.append(appt)
         return appt
@@ -211,6 +220,15 @@ class MockState:
         if "appointments" in payload:
             self.appointments = []
             for a in payload["appointments"]:
+                # order_id defaults to a synthetic value so fixture
+                # bookings act as capacity blockers. Pass null/None
+                # explicitly to model a non-blocking event (lunch / PTO).
+                if "order_id" in a:
+                    order_id = a["order_id"]
+                elif "orderId" in a:
+                    order_id = a["orderId"]
+                else:
+                    order_id = "ord_block"
                 self.add_appointment(
                     technician_id=a.get("technician_id") or a.get("technicianId"),
                     start_date=a["start_date"] if "start_date" in a else a["startDate"],
@@ -218,6 +236,7 @@ class MockState:
                     customer_id=a.get("customer_id") or a.get("customerId"),
                     vehicle_id=a.get("vehicle_id") or a.get("vehicleId"),
                     name=a.get("name", "Existing booking"),
+                    order_id=order_id,
                 )
         if "errors" in payload:
             self.errors = copy.deepcopy(payload["errors"])

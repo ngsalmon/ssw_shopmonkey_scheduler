@@ -13,12 +13,11 @@ from availability import (
     BusinessHours,
     calculate_available_slots,
     calculate_days_needed,
-    check_slot_conflicts,
+    count_overlapping_appointments,
     generate_time_slots,
     get_buffer_minutes,
     get_business_hours,
     get_service_duration_minutes,
-    index_appointments_by_tech,
     is_slot_available,
     parse_appointment_times,
     validate_config,
@@ -157,91 +156,124 @@ class TestParseAppointmentTimes:
         assert parse_appointment_times(appt) is None
 
 
-class TestCheckSlotConflicts:
-    """Tests for check_slot_conflicts function."""
+class TestCountOverlappingAppointments:
+    """Tests for count_overlapping_appointments function.
 
-    def test_no_conflict_when_no_appointments(self):
-        """Should return False when no appointments."""
-        result = check_slot_conflicts(
-            slot_start=time(9, 0),
-            slot_end=time(10, 0),
-            date=datetime(2026, 1, 19),
-            appointments=[],
-            tech_id="tech1",
+    Replaces the prior per-tech check_slot_conflicts since Shopmonkey
+    appointment records do not carry a technicianId - capacity has to be
+    counted at the shop level. Only appointments with `orderId` set count
+    toward overlap (real customer bookings); time-off blocks without an
+    order are intentionally ignored.
+    """
+
+    def test_zero_when_no_appointments(self):
+        assert (
+            count_overlapping_appointments(
+                slot_start=time(9, 0),
+                slot_end=time(10, 0),
+                date=datetime(2026, 1, 19),
+                appointments=[],
+            )
+            == 0
         )
-        assert result is False
 
-    def test_conflict_when_appointment_overlaps(self):
-        """Should return True when appointment overlaps slot."""
+    def test_counts_overlapping_real_booking(self):
         appointments = [
             {
-                "technicianId": "tech1",
+                "orderId": "ord_abc",
                 "startDate": "2026-01-19T09:30:00-06:00",
                 "endDate": "2026-01-19T10:30:00-06:00",
             }
         ]
-        result = check_slot_conflicts(
-            slot_start=time(9, 0),
-            slot_end=time(10, 0),
-            date=datetime(2026, 1, 19),
-            appointments=appointments,
-            tech_id="tech1",
+        assert (
+            count_overlapping_appointments(
+                slot_start=time(9, 0),
+                slot_end=time(10, 0),
+                date=datetime(2026, 1, 19),
+                appointments=appointments,
+            )
+            == 1
         )
-        assert result is True
 
-    def test_no_conflict_for_different_tech(self):
-        """Should return False when appointment is for different tech."""
+    def test_ignores_block_without_order_id(self):
+        """Time-off / lunch / PTO blocks lack orderId and must not count."""
         appointments = [
             {
-                "technicianId": "tech2",
+                # No orderId - this is e.g. "Robert Out" or "Lunch".
                 "startDate": "2026-01-19T09:00:00-06:00",
-                "endDate": "2026-01-19T10:00:00-06:00",
+                "endDate": "2026-01-19T17:30:00-06:00",
+                "name": "Robert Out",
             }
         ]
-        result = check_slot_conflicts(
-            slot_start=time(9, 0),
-            slot_end=time(10, 0),
-            date=datetime(2026, 1, 19),
-            appointments=appointments,
-            tech_id="tech1",
+        assert (
+            count_overlapping_appointments(
+                slot_start=time(9, 0),
+                slot_end=time(10, 0),
+                date=datetime(2026, 1, 19),
+                appointments=appointments,
+            )
+            == 0
         )
-        assert result is False
 
-    def test_no_conflict_when_appointment_before_slot(self):
-        """Should return False when appointment ends before slot starts."""
+    def test_no_overlap_when_appointment_before_slot(self):
         appointments = [
             {
-                "technicianId": "tech1",
+                "orderId": "ord_abc",
                 "startDate": "2026-01-19T07:00:00-06:00",
                 "endDate": "2026-01-19T08:00:00-06:00",
             }
         ]
-        result = check_slot_conflicts(
-            slot_start=time(9, 0),
-            slot_end=time(10, 0),
-            date=datetime(2026, 1, 19),
-            appointments=appointments,
-            tech_id="tech1",
+        assert (
+            count_overlapping_appointments(
+                slot_start=time(9, 0),
+                slot_end=time(10, 0),
+                date=datetime(2026, 1, 19),
+                appointments=appointments,
+            )
+            == 0
         )
-        assert result is False
 
-    def test_no_conflict_when_appointment_after_slot(self):
-        """Should return False when appointment starts after slot ends."""
+    def test_no_overlap_when_appointment_ends_at_slot_start(self):
+        """Half-open overlap: an appt ending exactly at slot start is free."""
         appointments = [
             {
-                "technicianId": "tech1",
-                "startDate": "2026-01-19T11:00:00-06:00",
-                "endDate": "2026-01-19T12:00:00-06:00",
+                "orderId": "ord_abc",
+                "startDate": "2026-01-19T08:00:00-06:00",
+                "endDate": "2026-01-19T09:00:00-06:00",
             }
         ]
-        result = check_slot_conflicts(
-            slot_start=time(9, 0),
-            slot_end=time(10, 0),
-            date=datetime(2026, 1, 19),
-            appointments=appointments,
-            tech_id="tech1",
+        assert (
+            count_overlapping_appointments(
+                slot_start=time(9, 0),
+                slot_end=time(10, 0),
+                date=datetime(2026, 1, 19),
+                appointments=appointments,
+            )
+            == 0
         )
-        assert result is False
+
+    def test_counts_multiple_overlapping_appointments(self):
+        appointments = [
+            {
+                "orderId": "ord_a",
+                "startDate": "2026-01-19T09:00:00-06:00",
+                "endDate": "2026-01-19T10:00:00-06:00",
+            },
+            {
+                "orderId": "ord_b",
+                "startDate": "2026-01-19T09:30:00-06:00",
+                "endDate": "2026-01-19T10:30:00-06:00",
+            },
+        ]
+        assert (
+            count_overlapping_appointments(
+                slot_start=time(9, 0),
+                slot_end=time(10, 0),
+                date=datetime(2026, 1, 19),
+                appointments=appointments,
+            )
+            == 2
+        )
 
 
 class TestCalculateAvailableSlots:
@@ -277,7 +309,7 @@ class TestCalculateAvailableSlots:
         assert "tech1" in slots[0].available_tech_ids
 
     def test_excludes_slots_with_no_available_techs(self):
-        """Should exclude slots where all techs are busy."""
+        """Slots with overlap >= qualified tech count are excluded."""
         config = {
             "business_hours": {
                 "monday": {"open": "09:00", "close": "11:00"},
@@ -286,7 +318,7 @@ class TestCalculateAvailableSlots:
         }
         appointments = [
             {
-                "technicianId": "tech1",
+                "orderId": "ord_abc",
                 "startDate": "2026-01-19T09:00:00-06:00",
                 "endDate": "2026-01-19T10:00:00-06:00",
             }
@@ -297,16 +329,70 @@ class TestCalculateAvailableSlots:
             appointments=appointments,
             config=config,
         )
-        # Only 10-11 slot should be available
+        # 9-10 slot has overlap=1 >= tech_count=1 → excluded. 10-11 free.
         assert len(slots) == 1
         assert slots[0].start == time(10, 0)
 
+    def test_capacity_reflects_remaining_techs(self):
+        """With 2 qualified techs and 1 overlap, slot shows capacity=1."""
+        config = {
+            "business_hours": {
+                "monday": {"open": "09:00", "close": "10:00"},
+            },
+            "default_slot_duration_minutes": 60,
+        }
+        appointments = [
+            {
+                "orderId": "ord_abc",
+                "startDate": "2026-01-19T09:00:00-06:00",
+                "endDate": "2026-01-19T10:00:00-06:00",
+            }
+        ]
+        slots = calculate_available_slots(
+            date=datetime(2026, 1, 19),
+            tech_ids=["tech1", "tech2"],
+            appointments=appointments,
+            config=config,
+        )
+        assert len(slots) == 1
+        assert slots[0].available_techs == 1
+
+    def test_blocks_without_order_id_do_not_consume_capacity(self):
+        """Calendar blocks (lunch / PTO) without orderId must not reduce capacity."""
+        config = {
+            "business_hours": {
+                "monday": {"open": "09:00", "close": "10:00"},
+            },
+            "default_slot_duration_minutes": 60,
+        }
+        appointments = [
+            {
+                # "Robert Out"-style block: no orderId.
+                "startDate": "2026-01-19T09:00:00-06:00",
+                "endDate": "2026-01-19T10:00:00-06:00",
+                "name": "Tech Out",
+            }
+        ]
+        slots = calculate_available_slots(
+            date=datetime(2026, 1, 19),
+            tech_ids=["tech1"],
+            appointments=appointments,
+            config=config,
+        )
+        assert len(slots) == 1
+        assert slots[0].available_techs == 1
+
 
 class TestIsSlotAvailable:
-    """Tests for is_slot_available function."""
+    """Tests for is_slot_available function.
+
+    Returns (is_available, eligible_tech_ids). The eligible list is the
+    FULL qualified set when there's remaining capacity (Shopmonkey doesn't
+    expose which specific tech is busy from the appointment record);
+    empty when the shop is full for that slot.
+    """
 
     def test_available_when_no_conflicts(self):
-        """Should return True when no conflicts."""
         is_avail, tech_ids = is_slot_available(
             date=datetime(2026, 1, 19),
             slot_start=time(9, 0),
@@ -317,11 +403,11 @@ class TestIsSlotAvailable:
         assert is_avail is True
         assert set(tech_ids) == {"tech1", "tech2"}
 
-    def test_available_when_some_techs_free(self):
-        """Should return True when at least one tech is free."""
+    def test_available_when_capacity_remaining(self):
+        """1 overlap + 2 qualified techs → 1 tech of capacity remains."""
         appointments = [
             {
-                "technicianId": "tech1",
+                "orderId": "ord_abc",
                 "startDate": "2026-01-19T09:00:00-06:00",
                 "endDate": "2026-01-19T10:00:00-06:00",
             }
@@ -334,13 +420,15 @@ class TestIsSlotAvailable:
             appointments=appointments,
         )
         assert is_avail is True
-        assert tech_ids == ["tech2"]
+        # Full qualified list returned (we can't tell from the API which
+        # specific tech is busy; round-robin picks one).
+        assert set(tech_ids) == {"tech1", "tech2"}
 
-    def test_unavailable_when_all_techs_busy(self):
-        """Should return False when all techs are busy."""
+    def test_unavailable_when_overlap_meets_capacity(self):
+        """1 overlap + 1 qualified tech → no capacity."""
         appointments = [
             {
-                "technicianId": "tech1",
+                "orderId": "ord_abc",
                 "startDate": "2026-01-19T09:00:00-06:00",
                 "endDate": "2026-01-19T10:00:00-06:00",
             }
@@ -354,6 +442,25 @@ class TestIsSlotAvailable:
         )
         assert is_avail is False
         assert tech_ids == []
+
+    def test_block_without_order_id_does_not_consume_capacity(self):
+        """A calendar block (no orderId) leaves the slot free."""
+        appointments = [
+            {
+                "startDate": "2026-01-19T09:00:00-06:00",
+                "endDate": "2026-01-19T10:00:00-06:00",
+                "name": "Tech Out",
+            }
+        ]
+        is_avail, tech_ids = is_slot_available(
+            date=datetime(2026, 1, 19),
+            slot_start=time(9, 0),
+            slot_end=time(10, 0),
+            tech_ids=["tech1"],
+            appointments=appointments,
+        )
+        assert is_avail is True
+        assert tech_ids == ["tech1"]
 
 
 class TestGetServiceDurationMinutes:
@@ -559,45 +666,6 @@ class TestValidateConfig:
             validate_config(config)
 
 
-class TestIndexAppointmentsByTech:
-    """Tests for index_appointments_by_tech function."""
-
-    def test_indexes_by_technician_id(self):
-        """Should index appointments by technicianId."""
-        appointments = [
-            {"technicianId": "tech1", "startDate": "2026-01-19T09:00:00-06:00"},
-            {"technicianId": "tech1", "startDate": "2026-01-19T10:00:00-06:00"},
-            {"technicianId": "tech2", "startDate": "2026-01-19T09:00:00-06:00"},
-        ]
-        indexed = index_appointments_by_tech(appointments)
-        assert len(indexed["tech1"]) == 2
-        assert len(indexed["tech2"]) == 1
-
-    def test_indexes_by_user_id_fallback(self):
-        """Should use userId as fallback when technicianId is missing."""
-        appointments = [
-            {"userId": "tech1", "startDate": "2026-01-19T09:00:00-06:00"},
-        ]
-        indexed = index_appointments_by_tech(appointments)
-        assert "tech1" in indexed
-        assert len(indexed["tech1"]) == 1
-
-    def test_empty_list_returns_empty_dict(self):
-        """Should return empty dict for empty appointment list."""
-        indexed = index_appointments_by_tech([])
-        assert indexed == {}
-
-    def test_appointments_without_tech_id_skipped(self):
-        """Should skip appointments without tech ID."""
-        appointments = [
-            {"startDate": "2026-01-19T09:00:00-06:00"},  # No tech ID
-            {"technicianId": "tech1", "startDate": "2026-01-19T10:00:00-06:00"},
-        ]
-        indexed = index_appointments_by_tech(appointments)
-        assert len(indexed) == 1
-        assert "tech1" in indexed
-
-
 class TestCalculateDaysNeeded:
     """Tests for calculate_days_needed function."""
 
@@ -677,52 +745,6 @@ class TestCalculateDaysNeeded:
         assert result[1][1] == 60  # 60 min on next Monday
 
 
-class TestCheckSlotConflictsWithIndex:
-    """Tests for check_slot_conflicts with indexed appointments."""
-
-    def test_uses_indexed_appointments(self):
-        """Should use pre-indexed appointments when provided."""
-        appointments = [
-            {
-                "technicianId": "tech1",
-                "startDate": "2026-01-19T09:00:00-06:00",
-                "endDate": "2026-01-19T10:00:00-06:00",
-            },
-        ]
-        indexed = index_appointments_by_tech(appointments)
-
-        result = check_slot_conflicts(
-            slot_start=time(9, 0),
-            slot_end=time(10, 0),
-            date=datetime(2026, 1, 19),
-            appointments=[],  # Empty list - should use indexed
-            tech_id="tech1",
-            indexed_appointments=indexed,
-        )
-        assert result is True  # Conflict found via index
-
-    def test_no_conflict_with_indexed_for_different_tech(self):
-        """Should find no conflict for different tech with indexed appointments."""
-        appointments = [
-            {
-                "technicianId": "tech1",
-                "startDate": "2026-01-19T09:00:00-06:00",
-                "endDate": "2026-01-19T10:00:00-06:00",
-            },
-        ]
-        indexed = index_appointments_by_tech(appointments)
-
-        result = check_slot_conflicts(
-            slot_start=time(9, 0),
-            slot_end=time(10, 0),
-            date=datetime(2026, 1, 19),
-            appointments=[],
-            tech_id="tech2",  # Different tech
-            indexed_appointments=indexed,
-        )
-        assert result is False  # No conflict
-
-
 class TestMultiDayAvailability:
     """Tests for multi-day service availability calculation."""
 
@@ -753,8 +775,8 @@ class TestMultiDayAvailability:
         assert len(slots) >= 1
         assert "tech1" in slots[0].available_tech_ids
 
-    def test_multiday_service_excludes_tech_with_day2_conflict(self):
-        """Should exclude tech if they have a conflict on day 2."""
+    def test_multiday_day2_overlap_reduces_capacity(self):
+        """Day-2 overlap reduces a multi-day slot's available_techs."""
         config = {
             "business_hours": {
                 "monday": {"open": "09:00", "close": "17:00"},
@@ -763,15 +785,14 @@ class TestMultiDayAvailability:
             "default_slot_duration_minutes": 600,
             "slot_interval_minutes": 60,
         }
-        # No appointments on day 1
         appointments = []
-        # Conflict on day 2 for tech1 (9am-10am)
+        # One overlapping order on day 2 morning - reduces capacity by 1.
         future_appointments = {
             "2026-01-20": [
                 {
-                    "technicianId": "tech1",
-                    "startDate": "2026-01-20T09:00:00Z",
-                    "endDate": "2026-01-20T10:00:00Z",
+                    "orderId": "ord_day2",
+                    "startDate": "2026-01-20T15:00:00Z",  # 9am CST
+                    "endDate": "2026-01-20T16:00:00Z",
                 }
             ]
         }
@@ -785,98 +806,122 @@ class TestMultiDayAvailability:
             future_appointments=future_appointments,
         )
 
-        # Should have slots, but tech1 should be excluded from morning slots
-        # (they need to work at start of day 2 which conflicts)
-        if slots:
-            # Check that at least some slots exclude tech1
-            morning_slot = next((s for s in slots if s.start == time(9, 0)), None)
-            if morning_slot:
-                # tech1 should not be available for 9am slot because
-                # a 10-hour service starting at 9am needs day 2 morning
-                assert (
-                    "tech1" not in morning_slot.available_tech_ids
-                    or "tech2" in morning_slot.available_tech_ids
-                )
+        morning_slot = next((s for s in slots if s.start == time(9, 0)), None)
+        # 2 qualified techs - 1 day-2 overlap = 1 remaining capacity.
+        assert morning_slot is not None
+        assert morning_slot.available_techs == 1
+
+    def test_multiday_day2_full_blocks_slot(self):
+        """When day-2 overlap >= tech count, slot is unavailable."""
+        config = {
+            "business_hours": {
+                "monday": {"open": "09:00", "close": "17:00"},
+                "tuesday": {"open": "09:00", "close": "17:00"},
+            },
+            "default_slot_duration_minutes": 600,
+            "slot_interval_minutes": 60,
+        }
+        future_appointments = {
+            "2026-01-20": [
+                {
+                    "orderId": "ord_a",
+                    "startDate": "2026-01-20T15:00:00Z",
+                    "endDate": "2026-01-20T16:00:00Z",
+                },
+                {
+                    "orderId": "ord_b",
+                    "startDate": "2026-01-20T15:00:00Z",
+                    "endDate": "2026-01-20T16:00:00Z",
+                },
+            ]
+        }
+        slots = calculate_available_slots(
+            date=datetime(2026, 1, 19),
+            tech_ids=["tech1", "tech2"],
+            appointments=[],
+            config=config,
+            slot_duration_minutes=600,
+            future_appointments=future_appointments,
+        )
+        morning_slot = next((s for s in slots if s.start == time(9, 0)), None)
+        # 2 techs - 2 overlaps = 0 capacity; slot dropped from list.
+        assert morning_slot is None
 
 
 class TestTimezoneAwareConflictDetection:
     """Regression coverage for the booking-vs-availability TZ mismatch.
 
-    Pre-fix, `check_slot_conflicts` stripped tzinfo without converting, so a
-    UTC appointment time was compared as-if-naive against a slot expressed in
-    business-local time. That allowed double-bookings when Shopmonkey
-    appointments existed in CDT/CST: a 9am Central appointment came back as
-    14:00 or 15:00 UTC, was treated as 14:00 local, and didn't appear to
-    overlap a 9am slot.
+    Pre-fix, the conflict check stripped tzinfo without converting, so a
+    UTC appointment time was compared as-if-naive against a slot expressed
+    in business-local time. That allowed double-bookings when Shopmonkey
+    appointments existed in CDT/CST: a 9am Central appointment came back
+    as 14:00 or 15:00 UTC, was treated as 14:00 local, and didn't appear
+    to overlap a 9am slot.
     """
 
-    def test_cdt_appointment_blocks_local_slot_in_may(self):
-        # 9am CDT on May 20, 2026 -> 14:00 UTC. Shopmonkey returns it with a
-        # Z suffix; the conflict check must convert before comparing.
+    def test_cdt_appointment_counts_against_local_slot_in_may(self):
+        # 9am CDT on May 20, 2026 → 14:00 UTC. Shopmonkey returns it with a
+        # Z suffix; counting must convert before comparing.
         appointments = [
             {
-                "technicianId": "tech1",
+                "orderId": "ord_abc",
                 "startDate": "2026-05-20T14:00:00Z",  # 9am CDT
                 "endDate": "2026-05-20T15:30:00Z",  # 10:30am CDT
             }
         ]
-        # A slot at 9am-10:30am local should be flagged as a conflict.
-        has_conflict = check_slot_conflicts(
+        count = count_overlapping_appointments(
             slot_start=time(9, 0),
             slot_end=time(10, 30),
             date=datetime(2026, 5, 20),
             appointments=appointments,
-            tech_id="tech1",
         )
-        assert has_conflict is True
+        assert count == 1
 
-    def test_cst_appointment_blocks_local_slot_in_january(self):
-        # 9am CST on Jan 19, 2026 -> 15:00 UTC (CST is -06:00).
+    def test_cst_appointment_counts_against_local_slot_in_january(self):
+        # 9am CST on Jan 19, 2026 → 15:00 UTC (CST is -06:00).
         appointments = [
             {
-                "technicianId": "tech1",
+                "orderId": "ord_abc",
                 "startDate": "2026-01-19T15:00:00Z",
                 "endDate": "2026-01-19T16:00:00Z",
             }
         ]
-        has_conflict = check_slot_conflicts(
+        count = count_overlapping_appointments(
             slot_start=time(9, 0),
             slot_end=time(10, 0),
             date=datetime(2026, 1, 19),
             appointments=appointments,
-            tech_id="tech1",
         )
-        assert has_conflict is True
+        assert count == 1
 
-    def test_appointment_outside_business_hours_does_not_block(self):
+    def test_appointment_outside_business_hours_does_not_count(self):
         # 4am CDT on May 20 (UTC 09:00) shouldn't conflict with a 9am local slot.
         appointments = [
             {
-                "technicianId": "tech1",
+                "orderId": "ord_abc",
                 "startDate": "2026-05-20T09:00:00Z",  # 4am CDT
                 "endDate": "2026-05-20T10:00:00Z",  # 5am CDT
             }
         ]
-        has_conflict = check_slot_conflicts(
+        count = count_overlapping_appointments(
             slot_start=time(9, 0),
             slot_end=time(10, 0),
             date=datetime(2026, 5, 20),
             appointments=appointments,
-            tech_id="tech1",
         )
-        assert has_conflict is False
+        assert count == 0
 
     def test_is_slot_available_respects_business_tz(self):
-        # Both qualified techs are booked 9-10am CDT (14-15 UTC). The slot
-        # check should report neither available.
+        # Two overlapping bookings 9-10am CDT (14-15 UTC). With 2 qualified
+        # techs, capacity goes to 0 and the slot is reported full.
         appointments = [
             {
-                "technicianId": "tech1",
+                "orderId": "ord_a",
                 "startDate": "2026-05-20T14:00:00Z",
                 "endDate": "2026-05-20T15:00:00Z",
             },
             {
-                "technicianId": "tech2",
+                "orderId": "ord_b",
                 "startDate": "2026-05-20T14:00:00Z",
                 "endDate": "2026-05-20T15:00:00Z",
             },
@@ -896,7 +941,7 @@ class TestTimezoneAwareConflictDetection:
         # Eastern time: 9am ET = 13:00 UTC. Verify config drives the offset.
         appointments = [
             {
-                "technicianId": "tech1",
+                "orderId": "ord_abc",
                 "startDate": "2026-05-20T13:00:00Z",
                 "endDate": "2026-05-20T14:00:00Z",
             }

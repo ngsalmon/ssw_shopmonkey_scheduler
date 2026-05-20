@@ -176,52 +176,36 @@ def parse_appointment_times(appointment: dict[str, Any]) -> tuple[datetime, date
         return None
 
 
-def index_appointments_by_tech(
-    appointments: list[dict[str, Any]],
-) -> dict[str, list[dict[str, Any]]]:
-    """
-    Index appointments by technician ID for O(1) lookup.
-
-    Args:
-        appointments: List of appointment dictionaries
-
-    Returns:
-        Dict mapping tech_id to list of their appointments
-    """
-    indexed: dict[str, list[dict[str, Any]]] = {}
-    for appt in appointments:
-        tech_id = appt.get("technicianId") or appt.get("userId")
-        if tech_id:
-            if tech_id not in indexed:
-                indexed[tech_id] = []
-            indexed[tech_id].append(appt)
-    return indexed
-
-
-def check_slot_conflicts(
+def count_overlapping_appointments(
     slot_start: time,
     slot_end: time,
     date: datetime,
     appointments: list[dict[str, Any]],
-    tech_id: str,
-    indexed_appointments: dict[str, list[dict[str, Any]]] | None = None,
     tz: ZoneInfo | None = None,
-) -> bool:
-    """
-    Check if a tech has a conflicting appointment during a time slot.
+) -> int:
+    """Count "real customer" appointments overlapping the slot.
+
+    Shopmonkey's `/v3/appointment` records do not carry a `technicianId` or
+    `userId` field, so we cannot do per-tech conflict detection from the
+    appointment payload alone (the previous per-tech check was a silent
+    no-op - every tech always looked free and the system happily
+    double-booked). Instead we count overlapping appointments as a
+    shop-level capacity proxy.
+
+    Only counts appointments with `orderId` set, which excludes one-off
+    calendar blocks like "Robert Out", "Lunch - All employees", and
+    "PTO All Day". Those are tech-specific time-off entries that don't
+    occupy a service bay, so counting them would over-restrict capacity.
 
     Args:
-        slot_start: Start time of the slot (interpreted in the business TZ).
-        slot_end: End time of the slot (interpreted in the business TZ).
-        date: Date to check (interpreted in the business TZ).
-        appointments: List of appointments (used if indexed_appointments not provided)
-        tech_id: Technician ID to check
-        indexed_appointments: Optional pre-indexed appointments by tech_id for O(1) lookup
-        tz: Business timezone for comparison. Defaults to America/Chicago when
-            omitted, which matches the default in config.yaml.
+        slot_start: Start time of the slot (interpreted in the business TZ)
+        slot_end: End time of the slot (interpreted in the business TZ)
+        date: Date to check (interpreted in the business TZ)
+        appointments: List of Shopmonkey appointment records for that date
+        tz: Business timezone. Defaults to America/Chicago.
 
     Returns:
-        True if there's a conflict, False if the slot is free.
+        Number of overlapping customer appointments.
     """
     if tz is None:
         tz = ZoneInfo(DEFAULT_TIMEZONE)
@@ -229,17 +213,12 @@ def check_slot_conflicts(
     slot_start_dt = datetime.combine(date.date(), slot_start)
     slot_end_dt = datetime.combine(date.date(), slot_end)
 
-    # Use indexed appointments if provided, otherwise filter from full list
-    if indexed_appointments is not None:
-        tech_appointments = indexed_appointments.get(tech_id, [])
-    else:
-        tech_appointments = [
-            appt
-            for appt in appointments
-            if (appt.get("technicianId") or appt.get("userId")) == tech_id
-        ]
+    count = 0
+    for appt in appointments:
+        # Skip personal blocks / shop events / time-off (no linked order).
+        if not appt.get("orderId"):
+            continue
 
-    for appt in tech_appointments:
         times = parse_appointment_times(appt)
         if times is None:
             continue
@@ -248,19 +227,18 @@ def check_slot_conflicts(
 
         # Shopmonkey returns appointments in UTC. Convert to the business TZ
         # before stripping tzinfo so the naive comparison stays in the same
-        # wall-clock frame as the slot times. Skipping the astimezone step
-        # leaves a UTC value masquerading as local and causes the system to
-        # report techs free when they're actually booked (the 5h DST gap).
+        # wall-clock frame as the slot times.
         if appt_start.tzinfo is not None:
             appt_start = appt_start.astimezone(tz).replace(tzinfo=None)
         if appt_end.tzinfo is not None:
             appt_end = appt_end.astimezone(tz).replace(tzinfo=None)
 
-        # Check for overlap
+        # Half-open overlap: an appointment ending exactly at slot_start
+        # doesn't conflict (matches the canonical overlap definition).
         if appt_start < slot_end_dt and appt_end > slot_start_dt:
-            return True  # Conflict found
+            count += 1
 
-    return False  # No conflict
+    return count
 
 
 def get_next_business_day(date: datetime, config: dict[str, Any]) -> datetime | None:
@@ -334,58 +312,43 @@ def calculate_days_needed(
     return days_needed
 
 
-def check_tech_multiday_availability(
-    tech_id: str,
+def count_multiday_overlap_capacity(
     days_needed: list[tuple[datetime, int]],
     first_day_appointments: list[dict[str, Any]],
     first_day_start_time: time,
     first_day_close_time: time,
     future_appointments: dict[str, list[dict[str, Any]]],
     config: dict[str, Any],
-    indexed_first_day: dict[str, list[dict[str, Any]]] | None = None,
-) -> bool:
-    """
-    Check if a technician is available for all days of a multi-day service.
+    qualified_tech_count: int,
+) -> int:
+    """Compute remaining capacity (techs - max overlap) for a multi-day slot.
 
-    Args:
-        tech_id: Technician ID to check
-        days_needed: List of (date, minutes_needed) from calculate_days_needed
-        first_day_appointments: Appointments for the first day
-        first_day_start_time: Service start time on first day
-        first_day_close_time: Business close time on first day
-        future_appointments: Dict mapping date strings to appointment lists
-        config: Configuration with business hours
-        indexed_first_day: Optional pre-indexed first day appointments
-
-    Returns:
-        True if tech is available for all required days, False otherwise
+    Returns the *minimum* free capacity across all required days: a multi-day
+    booking only works if every day it spans has at least one tech free, so
+    the bottleneck day governs.
     """
     if not days_needed:
-        return False
+        return 0
 
     tz = get_timezone(config)
 
-    # Check first day availability (from start_time to close)
+    # First day: count overlaps from start_time to close
     first_date, _ = days_needed[0]
-    has_conflict = check_slot_conflicts(
+    first_overlap = count_overlapping_appointments(
         first_day_start_time,
         first_day_close_time,
         first_date,
         first_day_appointments,
-        tech_id,
-        indexed_first_day,
         tz=tz,
     )
-    if has_conflict:
-        return False
+    min_capacity = qualified_tech_count - first_overlap
 
-    # Check subsequent days
+    # Subsequent days: from open until minutes_needed
     for date, minutes_needed in days_needed[1:]:
         day_hours = get_business_hours(config, date)
         if not day_hours.is_open:
-            return False
+            return 0
 
-        # Tech needs to be free from open until minutes_needed
         needed_end = (
             datetime.combine(date.date(), day_hours.open_time) + timedelta(minutes=minutes_needed)
         ).time()
@@ -393,22 +356,18 @@ def check_tech_multiday_availability(
         date_str = date.strftime("%Y-%m-%d")
         day_appointments = future_appointments.get(date_str, [])
 
-        # Index future day appointments for this check
-        indexed_future = index_appointments_by_tech(day_appointments)
-
-        has_conflict = check_slot_conflicts(
+        overlap = count_overlapping_appointments(
             day_hours.open_time,
             needed_end,
             date,
             day_appointments,
-            tech_id,
-            indexed_future,
             tz=tz,
         )
-        if has_conflict:
-            return False
+        capacity = qualified_tech_count - overlap
+        if capacity < min_capacity:
+            min_capacity = capacity
 
-    return True
+    return max(min_capacity, 0)
 
 
 def generate_slot_start_times(
@@ -472,10 +431,8 @@ def calculate_available_slots(
     if future_appointments is None:
         future_appointments = {}
 
-    # Index appointments once for O(1) lookup per tech
-    indexed_appointments = index_appointments_by_tech(appointments)
-
     tz = get_timezone(config)
+    tech_count = len(tech_ids)
 
     # Generate slot start times (hourly intervals)
     slot_interval = config.get("slot_interval_minutes", 60)
@@ -494,106 +451,41 @@ def calculate_available_slots(
         is_multiday = len(days_needed) > 1
 
         if is_multiday:
-            available_tech_ids = _calculate_multiday_slot_availability(
-                tech_ids=tech_ids,
+            capacity = count_multiday_overlap_capacity(
                 days_needed=days_needed,
                 first_day_appointments=appointments,
                 first_day_start_time=slot_start,
-                business_hours=business_hours,
+                first_day_close_time=business_hours.close_time,
                 future_appointments=future_appointments,
                 config=config,
-                indexed_appointments=indexed_appointments,
+                qualified_tech_count=tech_count,
             )
-
-            if available_tech_ids:
-                # For multi-day services, end time is close of first day
-                available_slots.append(
-                    TimeSlot(
-                        start=slot_start,
-                        end=business_hours.close_time,
-                        available_techs=len(available_tech_ids),
-                        available_tech_ids=available_tech_ids,
-                    )
-                )
+            slot_end = business_hours.close_time
         else:
-            # Service fits within business hours
             slot_end = (
                 datetime.combine(date.date(), slot_start) + timedelta(minutes=slot_duration_minutes)
             ).time()
+            overlap = count_overlapping_appointments(
+                slot_start, slot_end, date, appointments, tz=tz
+            )
+            capacity = max(tech_count - overlap, 0)
 
-            available_tech_ids = []
-            for tech_id in tech_ids:
-                has_conflict = check_slot_conflicts(
-                    slot_start,
-                    slot_end,
-                    date,
-                    appointments,
-                    tech_id,
-                    indexed_appointments,
-                    tz=tz,
+        if capacity > 0:
+            # We can't tell from the appointment payload which specific tech
+            # is busy (Shopmonkey doesn't expose technicianId on
+            # appointments), so hand back the full qualified list and let
+            # priority/round-robin pick one. Capacity governs whether the
+            # slot is even shown to the customer.
+            available_slots.append(
+                TimeSlot(
+                    start=slot_start,
+                    end=slot_end,
+                    available_techs=capacity,
+                    available_tech_ids=list(tech_ids),
                 )
-                if not has_conflict:
-                    available_tech_ids.append(tech_id)
-
-            if available_tech_ids:
-                available_slots.append(
-                    TimeSlot(
-                        start=slot_start,
-                        end=slot_end,
-                        available_techs=len(available_tech_ids),
-                        available_tech_ids=available_tech_ids,
-                    )
-                )
+            )
 
     return available_slots
-
-
-def _calculate_multiday_slot_availability(
-    tech_ids: list[str],
-    days_needed: list[tuple[datetime, int]],
-    first_day_appointments: list[dict[str, Any]],
-    first_day_start_time: time,
-    business_hours: BusinessHours,
-    future_appointments: dict[str, list[dict[str, Any]]],
-    config: dict[str, Any],
-    indexed_appointments: dict[str, list[dict[str, Any]]],
-) -> list[str]:
-    """
-    Calculate which techs are available for a multi-day service slot.
-
-    This is an internal helper for calculate_available_slots that handles
-    the complexity of checking tech availability across multiple days.
-
-    Args:
-        tech_ids: List of technician IDs to check
-        days_needed: Days and minutes required from calculate_days_needed
-        first_day_appointments: Appointments for the first day
-        first_day_start_time: When the service would start on day 1
-        business_hours: Business hours for the first day
-        future_appointments: Dict of date string -> appointments for future days
-        config: Configuration with business hours
-        indexed_appointments: Pre-indexed first day appointments by tech ID
-
-    Returns:
-        List of tech IDs available for all required days
-    """
-    available_tech_ids = []
-
-    for tech_id in tech_ids:
-        is_available = check_tech_multiday_availability(
-            tech_id=tech_id,
-            days_needed=days_needed,
-            first_day_appointments=first_day_appointments,
-            first_day_start_time=first_day_start_time,
-            first_day_close_time=business_hours.close_time,
-            future_appointments=future_appointments,
-            config=config,
-            indexed_first_day=indexed_appointments,
-        )
-        if is_available:
-            available_tech_ids.append(tech_id)
-
-    return available_tech_ids
 
 
 def is_slot_available(
@@ -604,26 +496,24 @@ def is_slot_available(
     appointments: list[dict[str, Any]],
     config: dict[str, Any] | None = None,
 ) -> tuple[bool, list[str]]:
-    """
-    Check if a specific slot is still available.
+    """Re-check that a specific slot still has shop capacity.
 
-    Pass `config` so the conflict check uses the configured business
-    timezone (defaults to America/Chicago).
+    Used by /book inside the booking lock to catch races between the
+    availability check and the actual create. See
+    `count_overlapping_appointments` for why this is shop-level capacity,
+    not per-tech.
 
     Returns:
-        Tuple of (is_available, list of available tech IDs)
+        Tuple of (is_available, list of qualified tech IDs eligible for
+        assignment). The tech list is the full qualified set when there's
+        remaining capacity; empty when the shop is full.
     """
     tz = get_timezone(config)
-    available_tech_ids = []
-
-    for tech_id in tech_ids:
-        has_conflict = check_slot_conflicts(
-            slot_start, slot_end, date, appointments, tech_id, tz=tz
-        )
-        if not has_conflict:
-            available_tech_ids.append(tech_id)
-
-    return (len(available_tech_ids) > 0, available_tech_ids)
+    overlap = count_overlapping_appointments(slot_start, slot_end, date, appointments, tz=tz)
+    capacity = len(tech_ids) - overlap
+    if capacity <= 0:
+        return (False, [])
+    return (True, list(tech_ids))
 
 
 def get_buffer_minutes(

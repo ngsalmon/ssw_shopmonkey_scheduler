@@ -67,13 +67,16 @@ class MockShopmonkeyClient:
     async def get_appointments_for_date(
         self, date_str: str, tech_ids: list[str] | None = None
     ) -> list[dict[str, Any]]:
+        """Return all appointments for the date.
+
+        Mirrors the real Shopmonkey API: there is no `technicianId` on
+        appointment records, so the tech_ids argument is intentionally
+        ignored. Conflict detection uses overlap-count instead.
+        """
         _raise_if_error("get_appointments_for_date", self._state)
         result: list[dict[str, Any]] = []
-        tech_filter = set(tech_ids) if tech_ids else None
         for appt in self._state.appointments:
             if _parse_iso_to_date(appt.start_date) != date_str:
-                continue
-            if tech_filter is not None and appt.technician_id not in tech_filter:
                 continue
             result.append(appt.to_dict())
         return result
