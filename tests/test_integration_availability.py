@@ -22,18 +22,24 @@ docstrings and reflect the tech matrix on 2026-05-20.
 
 from __future__ import annotations
 
-import asyncio
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
+from dotenv import load_dotenv
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Load .env before the module-level skip check below (main.py would load
+# it later via lifespan, but the skip runs at import time).
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 pytestmark = [pytest.mark.integration, pytest.mark.booking]
 
@@ -68,14 +74,20 @@ def app_client():
 
 
 @pytest.fixture(scope="module")
-def sm_client():
-    """Standalone ShopmonkeyClient for the test to inspect orders/labors
-    independently of the FastAPI app instance."""
-    from shopmonkey_client import ShopmonkeyClient
+def sm_http():
+    """Synchronous httpx client to Shopmonkey, used only for read-back
+    inspection (fetching the order/tech assignment after a booking).
 
-    client = ShopmonkeyClient()
-    yield client
-    asyncio.run(client.close())
+    We use sync httpx instead of the async ShopmonkeyClient because the
+    async client's httpx.AsyncClient binds to the event loop it's created
+    in - and TestClient closes its own loop between calls, leaving the
+    standalone client unusable. Sync httpx sidesteps the loop entirely.
+    """
+    base = os.environ.get("SHOPMONKEY_API_BASE_URL", "https://api.shopmonkey.cloud").rstrip("/")
+    token = os.environ["SHOPMONKEY_API_TOKEN"]
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    with httpx.Client(base_url=base, headers=headers, timeout=30.0) as c:
+        yield c
 
 
 @pytest.fixture(scope="module")
@@ -105,12 +117,17 @@ def services_catalog(app_client) -> list[dict[str, Any]]:
 
 @pytest.fixture(scope="module")
 def test_customer() -> dict[str, str]:
-    """Stable test identity so find_or_create_customer reuses the same record."""
+    """Stable test identity so find_or_create_customer reuses the same record.
+
+    Email and phone both omitted:
+    - Pydantic's EmailStr rejects reserved TLDs (.invalid / .test / .example)
+    - Shopmonkey rejects 555-prefix test phone numbers ("Phone number not valid")
+    - find_or_create_customer accepts name-only matches and returns the first
+      same-name record on subsequent runs.
+    """
     return {
         "firstName": "Claude",
         "lastName": "TestUser",
-        "email": "claude-integration@salmonspeedworx.invalid",
-        "phone": "+15555550101",  # 555-555-01xx is the reserved test range
     }
 
 
@@ -184,8 +201,27 @@ def _capacity_at(slots: list[dict], hhmm: str) -> int:
     return 0
 
 
+def _retry_on_rate_limit(call):
+    """Retry the given zero-arg callable on 502 (Shopmonkey 429 surfaces as
+    our 502) with exponential backoff. Up to 4 attempts."""
+    delay = 1.5
+    last = None
+    for attempt in range(4):
+        resp = call()
+        last = resp
+        if resp.status_code != 502:
+            return resp
+        # 502 from our app is almost always a wrapped Shopmonkey 429.
+        # Backoff and retry.
+        time.sleep(delay)
+        delay *= 2
+    return last
+
+
 def _availability(app_client, service_id: str, date_str: str) -> list[dict]:
-    resp = app_client.get(f"/availability?service_id={service_id}&date={date_str}")
+    resp = _retry_on_rate_limit(
+        lambda: app_client.get(f"/availability?service_id={service_id}&date={date_str}")
+    )
     assert resp.status_code == 200, f"availability call failed: {resp.text}"
     return resp.json()["slots"]
 
@@ -212,7 +248,7 @@ def _book(
         "customer": customer,
         "vehicle": vehicle,
     }
-    return app_client.post("/book", json=body)
+    return _retry_on_rate_limit(lambda: app_client.post("/book", json=body))
 
 
 def _record_for_cleanup(
@@ -220,23 +256,29 @@ def _record_for_cleanup(
     confirmation: str,
     service_name: str,
     when: str,
-    sm_client,
+    sm_http: httpx.Client,
 ) -> dict[str, Any]:
     """Inspect the freshly created appointment for order_id + assigned tech,
-    then append to the cleanup log."""
-    order_id = None
+    then append to the cleanup log. Uses sync httpx to avoid event-loop
+    rebinding issues with TestClient's lifespan."""
+    order_id: str | None = None
     assigned_tech: str | None = None
     try:
-        appt = asyncio.run(sm_client.get_appointment(appointment_id))
-        order_id = (appt or {}).get("orderId")
+        appt_resp = sm_http.get(f"/v3/appointment/{appointment_id}")
+        appt_resp.raise_for_status()
+        appt = (appt_resp.json() or {}).get("data") or {}
+        order_id = appt.get("orderId")
         if order_id:
-            techs = asyncio.run(
-                sm_client.get_busy_techs_for_appointments(
-                    [{"id": appointment_id, "orderId": order_id}]
-                )
-            )
-            tech_set = techs.get(appointment_id) or set()
-            assigned_tech = next(iter(tech_set), None)
+            svc_resp = sm_http.get(f"/v3/order/{order_id}/service")
+            svc_resp.raise_for_status()
+            services = (svc_resp.json() or {}).get("data") or []
+            for svc in services:
+                for labor in svc.get("labors") or []:
+                    if labor.get("technicianId"):
+                        assigned_tech = labor["technicianId"]
+                        break
+                if assigned_tech:
+                    break
     except Exception as e:
         print(f"  (couldn't fetch order/tech for {appointment_id}: {e})")
 
@@ -256,7 +298,7 @@ def _record_for_cleanup(
 
 
 def test_01_booking_decrements_capacity_for_same_slot(
-    app_client, services_catalog, target_date, test_customer, test_vehicle, sm_client
+    app_client, services_catalog, target_date, test_customer, test_vehicle, sm_http
 ):
     """A single booking reduces available_techs at the same slot by 1.
 
@@ -283,7 +325,7 @@ def test_01_booking_decrements_capacity_for_same_slot(
         body["confirmation_number"],
         service["name"],
         f"{target_date} {slot}",
-        sm_client,
+        sm_http,
     )
 
     after_slots = _availability(app_client, service["id"], target_date)
@@ -299,7 +341,7 @@ def test_02_booking_does_not_affect_disjoint_dept(
     target_date,
     test_customer,
     test_vehicle,
-    sm_client,
+    sm_http,
 ):
     """Booking a Window Tint service should leave Alignment capacity intact.
 
@@ -327,7 +369,7 @@ def test_02_booking_does_not_affect_disjoint_dept(
         body["confirmation_number"],
         tint["name"],
         f"{target_date} {slot}",
-        sm_client,
+        sm_http,
     )
 
     tint_after = _capacity_at(_availability(app_client, tint["id"], target_date), slot)
@@ -346,7 +388,7 @@ def test_02_booking_does_not_affect_disjoint_dept(
 
 
 def test_03_full_slot_returns_409_on_extra_booking(
-    app_client, services_catalog, target_date, test_customer, test_vehicle, sm_client
+    app_client, services_catalog, target_date, test_customer, test_vehicle, sm_http
 ):
     """A 1-tech department fills after one booking; the next attempt 409s.
 
@@ -368,7 +410,7 @@ def test_03_full_slot_returns_409_on_extra_booking(
         first.json()["confirmation_number"],
         service["name"],
         f"{target_date} {slot}",
-        sm_client,
+        sm_http,
     )
 
     mid = _capacity_at(_availability(app_client, service["id"], target_date), slot)
@@ -394,7 +436,7 @@ def test_03_full_slot_returns_409_on_extra_booking(
 
 
 def test_04a_unique_tech_assignment_leaves_overlapping_dept_alone(
-    app_client, services_catalog, target_date, test_customer, test_vehicle, sm_client
+    app_client, services_catalog, target_date, test_customer, test_vehicle, sm_http
 ):
     """When booking assigns a tech UNIQUE to one dept, the dept whose pool
     only shares OTHER techs is unaffected.
@@ -421,7 +463,7 @@ def test_04a_unique_tech_assignment_leaves_overlapping_dept_alone(
         body["confirmation_number"],
         sales["name"],
         f"{target_date} {slot}",
-        sm_client,
+        sm_http,
     )
 
     sales_after = _capacity_at(_availability(app_client, sales["id"], target_date), slot)
@@ -448,7 +490,7 @@ def test_04a_unique_tech_assignment_leaves_overlapping_dept_alone(
 
 
 def test_04b_shared_tech_booking_reduces_overlapping_dept(
-    app_client, services_catalog, target_date, test_customer, test_vehicle, sm_client
+    app_client, services_catalog, target_date, test_customer, test_vehicle, sm_http
 ):
     """When a booking's ONLY qualified tech is shared with another dept,
     the other dept's availability drops by 1.
@@ -477,7 +519,7 @@ def test_04b_shared_tech_booking_reduces_overlapping_dept(
         body["confirmation_number"],
         custom_exh["name"],
         f"{target_date} {slot}",
-        sm_client,
+        sm_http,
     )
 
     custom_after = _capacity_at(_availability(app_client, custom_exh["id"], target_date), slot)
