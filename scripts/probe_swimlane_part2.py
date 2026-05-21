@@ -135,9 +135,7 @@ def main() -> int:
         # Pick a real tech id
         user_resp = c.get(
             "/v3/user",
-            params=loc(
-                {"where": json.dumps({"assignedTechnician": True}), "limit": "1"}
-            ),
+            params=loc({"where": json.dumps({"assignedTechnician": True}), "limit": "1"}),
         ).json()
         if not user_resp.get("data"):
             print("  no tech users - skipping")
@@ -216,7 +214,12 @@ def main() -> int:
         # 5. Webhook / event subscription endpoints
         # -----------------------------------------------------------------
         header("5. Webhooks - does Shopmonkey publish appointment.tech changes?")
-        for path in ("/v3/webhook", "/v3/event", "/v3/event_subscription", "/v3/webhook_subscription"):
+        for path in (
+            "/v3/webhook",
+            "/v3/event",
+            "/v3/event_subscription",
+            "/v3/webhook_subscription",
+        ):
             r = c.get(path, params=loc({"limit": "1"}))
             print(f"  {path}: HTTP {r.status_code}")
 

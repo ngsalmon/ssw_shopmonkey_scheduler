@@ -107,9 +107,7 @@ def main() -> int:
             "/v3/appointment",
             params=loc(
                 {
-                    "where": json.dumps(
-                        {"startDate": {"gte": "2026-05-20T00:00:00Z"}}
-                    ),
+                    "where": json.dumps({"startDate": {"gte": "2026-05-20T00:00:00Z"}}),
                     "limit": "10",
                 }
             ),
@@ -148,10 +146,7 @@ def main() -> int:
                 rel_keys = [
                     k
                     for k in body.keys()
-                    if any(
-                        t in k.lower()
-                        for t in ("user", "tech", "assign")
-                    )
+                    if any(t in k.lower() for t in ("user", "tech", "assign"))
                 ]
                 print(f"  {param}: HTTP 200, tech/user-ish keys={rel_keys}")
             else:
@@ -218,7 +213,7 @@ def main() -> int:
                     "userIds",
                     "technicianIds",
                 ):
-                    rows = try_get(
+                    try_get(
                         c,
                         "/v3/appointment",
                         params=loc(
@@ -269,7 +264,8 @@ def main() -> int:
             if r.status_code == 200:
                 body = r.json().get("data") or {}
                 rel_keys = [
-                    k for k in body.keys()
+                    k
+                    for k in body.keys()
                     if any(t in k.lower() for t in ("user", "tech", "assign"))
                 ]
                 print(f"  {url_suffix}: HTTP 200, tech/user keys={rel_keys}")
