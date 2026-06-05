@@ -163,6 +163,19 @@ export class WidgetPage {
     return label.trim();
   }
 
+  /** Slots flagged as overnight (multi-day) by the widget. */
+  overnightSlots(): Locator {
+    return this.timeSlotsContainer().locator('.time-slot.overnight');
+  }
+
+  slotByStart(start: string): Locator {
+    return this.timeSlotsContainer().locator(`.time-slot[data-start="${start}"]`);
+  }
+
+  async selectSlotByStart(start: string): Promise<void> {
+    await this.slotByStart(start).click();
+  }
+
   // Customer form
   async fillCustomerForm(opts: {
     firstName: string;

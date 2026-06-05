@@ -865,3 +865,156 @@ class TestInputValidation:
         }
         response = test_client.post("/book", json=booking_request)
         assert response.status_code == 422
+
+
+class TestMultidayBooking:
+    """Tests for multi-day booking creation in /book.
+
+    Regression for Anne's June 3 report: a multi-day slot was booked as a
+    single 30-minute stub (start → close on day 1) and the continuation
+    day was never reserved. /book now derives the true span server-side
+    and creates one appointment per spanned business day.
+    """
+
+    def _multiday_service(self):
+        """A 2-hour service: at 16:00 with a 17:00 close it spans 2 days."""
+        return {
+            "id": "svc-1",
+            "name": "Window Tint",
+            "totalCents": 15000,
+            "labels": [{"name": "Window Tint"}],
+            "labors": [{"hours": 2.0}],
+        }
+
+    def _booking_request(self):
+        # 16:00 Monday with a 17:00 close: 60 min day 1 + 60 min Tuesday.
+        # slot_end mirrors what the widget sends for a multi-day slot:
+        # the day-1 close time, NOT start + duration.
+        return {
+            "service_id": "svc-1",
+            "slot_start": "2026-01-19T16:00:00",
+            "slot_end": "2026-01-19T17:00:00",
+            "customer": {"firstName": "Javion", "lastName": "Cotton"},
+            "vehicle": {"year": 2026, "make": "Honda", "model": "Accord"},
+        }
+
+    def test_multiday_booking_creates_one_appointment_per_day(
+        self, test_client, mock_shopmonkey_client
+    ):
+        mock_shopmonkey_client.get_canned_service = AsyncMock(
+            return_value=self._multiday_service()
+        )
+        mock_shopmonkey_client.create_appointment = AsyncMock(
+            side_effect=[{"id": "appt-day1"}, {"id": "appt-day2"}]
+        )
+
+        response = test_client.post("/book", json=self._booking_request())
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        # The first day's appointment is the one returned to the customer.
+        assert data["appointment_id"] == "appt-day1"
+        confirmation = data["confirmation_number"]
+
+        assert mock_shopmonkey_client.create_appointment.call_count == 2
+        day1 = mock_shopmonkey_client.create_appointment.call_args_list[0].kwargs
+        day2 = mock_shopmonkey_client.create_appointment.call_args_list[1].kwargs
+
+        # Day 1: requested start through close (January -> CST, -06:00).
+        assert day1["start_date"] == "2026-01-19T16:00:00.000-06:00"
+        assert day1["end_date"] == "2026-01-19T17:00:00.000-06:00"
+        # Day 2: open until the remaining 60 minutes are used up.
+        assert day2["start_date"] == "2026-01-20T09:00:00.000-06:00"
+        assert day2["end_date"] == "2026-01-20T10:00:00.000-06:00"
+
+        # Both tiles labeled so staff see the linkage on the calendar.
+        assert day1["title"].endswith("(Day 1 of 2)")
+        assert day2["title"].endswith("(Day 2 of 2)")
+
+        # Same confirmation, tech, and order linkage on every segment.
+        assert confirmation in day1["notes"]
+        assert confirmation in day2["notes"]
+        assert "Multi-day service: 2 days" in day1["notes"]
+        assert "Day 2 of 2" in day2["notes"]
+        assert day1["technician_id"] == day2["technician_id"]
+        assert day1["order_id"] == day2["order_id"]
+
+    def test_multiday_booking_blocked_when_day2_full_returns_409(
+        self, test_client, mock_shopmonkey_client
+    ):
+        """Day-2 conflicts must block the booking - the old code never
+        looked at day 2 at all."""
+        mock_shopmonkey_client.get_canned_service = AsyncMock(
+            return_value=self._multiday_service()
+        )
+
+        async def appointments_for(date_str, tech_ids=None):
+            if date_str == "2026-01-20":
+                # Two unattributed orders covering the morning fill both techs.
+                return [
+                    {
+                        "orderId": "ord-a",
+                        "startDate": "2026-01-20T09:00:00-06:00",
+                        "endDate": "2026-01-20T11:00:00-06:00",
+                    },
+                    {
+                        "orderId": "ord-b",
+                        "startDate": "2026-01-20T09:00:00-06:00",
+                        "endDate": "2026-01-20T11:00:00-06:00",
+                    },
+                ]
+            return []
+
+        mock_shopmonkey_client.get_appointments_for_date = AsyncMock(
+            side_effect=appointments_for
+        )
+
+        response = test_client.post("/book", json=self._booking_request())
+        assert response.status_code == 409
+        assert "no longer available" in response.json()["detail"]
+        mock_shopmonkey_client.create_appointment.assert_not_called()
+
+    def test_multiday_booking_rolls_back_on_partial_failure(
+        self, test_client, mock_shopmonkey_client
+    ):
+        """If day 2 creation fails, day 1 must be deleted - a half-created
+        multi-day booking silently under-reserves the calendar."""
+        from shopmonkey_client import ShopmonkeyAPIError
+
+        mock_shopmonkey_client.get_canned_service = AsyncMock(
+            return_value=self._multiday_service()
+        )
+        mock_shopmonkey_client.create_appointment = AsyncMock(
+            side_effect=[
+                {"id": "appt-day1"},
+                ShopmonkeyAPIError("boom", status_code=500),
+            ]
+        )
+        mock_shopmonkey_client.delete_appointment = AsyncMock(return_value=True)
+
+        response = test_client.post("/book", json=self._booking_request())
+        assert response.status_code == 502
+
+        mock_shopmonkey_client.delete_appointment.assert_called_once_with("appt-day1")
+
+    def test_single_day_booking_derives_end_from_service_duration(
+        self, test_client, mock_shopmonkey_client
+    ):
+        """The server-derived span wins over a bogus client slot_end."""
+        # svc-1 fixture has estimatedDuration 60; client claims a 2h slot.
+        booking_request = {
+            "service_id": "svc-1",
+            "slot_start": "2026-01-19T09:00:00",
+            "slot_end": "2026-01-19T11:00:00",
+            "customer": {"firstName": "Test", "lastName": "Customer"},
+            "vehicle": {"year": 2022, "make": "Toyota", "model": "Camry"},
+        }
+        response = test_client.post("/book", json=booking_request)
+        assert response.status_code == 200
+
+        assert mock_shopmonkey_client.create_appointment.call_count == 1
+        kwargs = mock_shopmonkey_client.create_appointment.call_args.kwargs
+        assert kwargs["start_date"] == "2026-01-19T09:00:00.000-06:00"
+        assert kwargs["end_date"] == "2026-01-19T10:00:00.000-06:00"
+        # Single-day bookings keep the plain OOTB title - no day suffix.
+        assert "(Day" not in kwargs["title"]

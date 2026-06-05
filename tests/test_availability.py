@@ -11,8 +11,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from availability import (
     BusinessHours,
+    build_appointment_segments,
     calculate_available_slots,
     calculate_days_needed,
+    check_slot_availability_for_duration,
+    collect_multiday_future_dates,
     count_overlapping_appointments,
     generate_time_slots,
     get_buffer_minutes,
@@ -1086,3 +1089,220 @@ class TestTimezoneAwareConflictDetection:
             config={"timezone": "America/New_York"},
         )
         assert is_avail is False
+
+
+class TestCollectMultidayFutureDates:
+    """Tests for collect_multiday_future_dates - which continuation days
+    /availability must fetch so multi-day capacity checks see real data.
+
+    Regression context (Anne's June 3 report): a 157-minute tint starting
+    30 minutes before close is multi-day, but the old `> 300 minutes` gate
+    never fetched day-2 appointments for it.
+    """
+
+    CONFIG = {
+        "business_hours": {
+            "monday": {"open": "09:00", "close": "17:00"},
+            "tuesday": {"open": "09:00", "close": "17:00"},
+            "wednesday": {"open": "09:00", "close": "17:00"},
+            "thursday": {"open": "09:00", "close": "17:00"},
+            "friday": {"open": "09:00", "close": "17:00"},
+        },
+        "default_slot_duration_minutes": 60,
+        "slot_interval_minutes": 60,
+    }
+
+    def test_short_service_needs_no_future_dates(self):
+        """A 60-min service fits after every hourly start (last start 16:00)."""
+        result = collect_multiday_future_dates(
+            datetime(2026, 1, 19), 60, self.CONFIG  # Monday
+        )
+        assert result == []
+
+    def test_service_under_5h_rolling_past_close_needs_next_day(self):
+        """157 min from the 16:00 start rolls into Tuesday - even though it
+        is far below the old 5-hour threshold."""
+        result = collect_multiday_future_dates(
+            datetime(2026, 1, 19), 157, self.CONFIG  # Monday
+        )
+        assert result == ["2026-01-20"]
+
+    def test_friday_rollover_skips_weekend(self):
+        """Friday rollover lands on Monday, not Saturday."""
+        result = collect_multiday_future_dates(
+            datetime(2026, 1, 23), 157, self.CONFIG  # Friday
+        )
+        assert result == ["2026-01-26"]  # Monday
+
+    def test_long_service_collects_union_across_starts(self):
+        """A 20-hour service: 09:00 start needs Tue+Wed, 16:00 start needs
+        Tue+Wed+Thu. Union covers all three."""
+        result = collect_multiday_future_dates(
+            datetime(2026, 1, 19), 1200, self.CONFIG  # Monday
+        )
+        assert result == ["2026-01-20", "2026-01-21", "2026-01-22"]
+
+    def test_closed_day_returns_empty(self):
+        result = collect_multiday_future_dates(
+            datetime(2026, 1, 24), 157, self.CONFIG  # Saturday
+        )
+        assert result == []
+
+
+class TestCheckSlotAvailabilityForDuration:
+    """Tests for the /book-side re-check that derives the true span from
+    the service duration instead of trusting the client's slot_end."""
+
+    CONFIG = {
+        "business_hours": {
+            "monday": {"open": "09:00", "close": "17:00"},
+            "tuesday": {"open": "09:00", "close": "17:00"},
+        },
+        "default_slot_duration_minutes": 60,
+        "slot_interval_minutes": 60,
+    }
+
+    def test_single_day_slot_available(self):
+        ok, free, days = check_slot_availability_for_duration(
+            date=datetime(2026, 1, 19),
+            slot_start=time(9, 0),
+            duration_minutes=60,
+            tech_ids=["tech1"],
+            appointments=[],
+            future_appointments={},
+            config=self.CONFIG,
+        )
+        assert ok is True
+        assert free == ["tech1"]
+        assert len(days) == 1
+
+    def test_single_day_conflict_blocks(self):
+        appointments = [
+            {
+                "orderId": "ord_x",
+                "startDate": "2026-01-19T15:00:00Z",  # 09:00 CST
+                "endDate": "2026-01-19T16:00:00Z",
+            }
+        ]
+        ok, free, _ = check_slot_availability_for_duration(
+            date=datetime(2026, 1, 19),
+            slot_start=time(9, 0),
+            duration_minutes=60,
+            tech_ids=["tech1"],
+            appointments=appointments,
+            future_appointments={},
+            config=self.CONFIG,
+        )
+        assert ok is False
+        assert free == []
+
+    def test_multiday_slot_available_returns_segmentation(self):
+        """157 min at 16:00 Monday: 60 min day 1 + 97 min Tuesday."""
+        ok, free, days = check_slot_availability_for_duration(
+            date=datetime(2026, 1, 19),
+            slot_start=time(16, 0),
+            duration_minutes=157,
+            tech_ids=["tech1"],
+            appointments=[],
+            future_appointments={"2026-01-20": []},
+            config=self.CONFIG,
+        )
+        assert ok is True
+        assert free == ["tech1"]
+        assert len(days) == 2
+        assert days[0][1] == 60
+        assert days[1][1] == 97
+
+    def test_multiday_blocked_when_day2_full(self):
+        """Two unattributed day-2 overlaps consume both techs' capacity."""
+        future = {
+            "2026-01-20": [
+                {
+                    "orderId": "ord_a",
+                    "startDate": "2026-01-20T15:00:00Z",  # 09:00 CST
+                    "endDate": "2026-01-20T16:00:00Z",
+                },
+                {
+                    "orderId": "ord_b",
+                    "startDate": "2026-01-20T15:00:00Z",
+                    "endDate": "2026-01-20T16:00:00Z",
+                },
+            ]
+        }
+        ok, free, days = check_slot_availability_for_duration(
+            date=datetime(2026, 1, 19),
+            slot_start=time(16, 0),
+            duration_minutes=157,
+            tech_ids=["tech1", "tech2"],
+            appointments=[],
+            future_appointments=future,
+            config=self.CONFIG,
+        )
+        assert ok is False
+        assert free == []
+        assert len(days) == 2  # segmentation still reported for logging
+
+    def test_multiday_drops_only_the_busy_tech_on_day2(self):
+        """A day-2 booking attributed to tech1 leaves tech2 free."""
+        future = {
+            "2026-01-20": [
+                {
+                    "orderId": "ord_a",
+                    "startDate": "2026-01-20T15:00:00Z",
+                    "endDate": "2026-01-20T16:00:00Z",
+                    "_busyTechIds": ["tech1"],
+                }
+            ]
+        }
+        ok, free, _ = check_slot_availability_for_duration(
+            date=datetime(2026, 1, 19),
+            slot_start=time(16, 0),
+            duration_minutes=157,
+            tech_ids=["tech1", "tech2"],
+            appointments=[],
+            future_appointments=future,
+            config=self.CONFIG,
+        )
+        assert ok is True
+        assert free == ["tech2"]
+
+    def test_closed_day_returns_unavailable(self):
+        ok, free, days = check_slot_availability_for_duration(
+            date=datetime(2026, 1, 24),  # Saturday
+            slot_start=time(9, 0),
+            duration_minutes=60,
+            tech_ids=["tech1"],
+            appointments=[],
+            future_appointments={},
+            config=self.CONFIG,
+        )
+        assert ok is False
+        assert free == []
+        assert days == []
+
+
+class TestBuildAppointmentSegments:
+    """Tests for converting a days_needed segmentation into concrete
+    per-day appointment windows."""
+
+    CONFIG = {
+        "business_hours": {
+            "monday": {"open": "09:00", "close": "17:00"},
+            "tuesday": {"open": "09:00", "close": "17:00"},
+        },
+        "default_slot_duration_minutes": 60,
+    }
+
+    def test_single_day_segment(self):
+        days = calculate_days_needed(60, datetime(2026, 1, 19), time(9, 0), self.CONFIG)
+        segments = build_appointment_segments(days, time(9, 0), self.CONFIG)
+        assert segments == [(datetime(2026, 1, 19, 9, 0), datetime(2026, 1, 19, 10, 0))]
+
+    def test_multiday_segments_day1_to_close_day2_from_open(self):
+        """157 min at 16:00 Monday: day 1 16:00-17:00, day 2 09:00-10:37."""
+        days = calculate_days_needed(157, datetime(2026, 1, 19), time(16, 0), self.CONFIG)
+        segments = build_appointment_segments(days, time(16, 0), self.CONFIG)
+        assert segments == [
+            (datetime(2026, 1, 19, 16, 0), datetime(2026, 1, 19, 17, 0)),
+            (datetime(2026, 1, 20, 9, 0), datetime(2026, 1, 20, 10, 37)),
+        ]

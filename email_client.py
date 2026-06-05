@@ -105,9 +105,18 @@ class EmailClient:
 
         subject = f"Online Booking: {booking.service_name} - {date_str} at {time_str}"
 
-        # Format time range
+        # Format time range. Multi-day bookings (end_time on a later date)
+        # show the full date range and an overnight note so staff and the
+        # confirmation match the calendar reservation.
         start_time_str = booking.start_time.strftime("%-I:%M %p")
         end_time_str = booking.end_time.strftime("%-I:%M %p")
+        if booking.end_time.date() != booking.start_time.date():
+            end_date_str = booking.end_time.strftime("%A, %B %d, %Y")
+            date_str = f"{date_str} - {end_date_str}"
+            end_time_str = (
+                f"{end_time_str} on {booking.end_time.strftime('%A, %B %d')} "
+                "(multi-day service - vehicle stays overnight)"
+            )
 
         # Format customer info
         customer_name = f"{booking.customer_first_name} {booking.customer_last_name}"

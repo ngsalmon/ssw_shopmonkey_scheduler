@@ -29,6 +29,16 @@ export function nextWeekday(minDaysAhead: number = 1): Date {
   return d;
 }
 
+/** The next business day (Mon-Fri) strictly after the given date. Mirrors
+ * availability.get_next_business_day for the default config (no holidays). */
+export function nextBusinessDayAfter(d: Date): Date {
+  let next = new Date(d.getTime() + 24 * 60 * 60 * 1000);
+  while (next.getDay() === 0 || next.getDay() === 6) {
+    next = new Date(next.getTime() + 24 * 60 * 60 * 1000);
+  }
+  return next;
+}
+
 /** Today's date in YYYYMMDD form, for matching confirmation numbers SM-YYYYMMDD-XXXXXX. */
 export function todayYYYYMMDD(): string {
   return toISODate(new Date()).replace(/-/g, '');

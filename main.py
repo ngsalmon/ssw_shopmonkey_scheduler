@@ -6,7 +6,7 @@ import re
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Annotated, Any
 
 import structlog
@@ -19,12 +19,15 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
 from availability import (
+    build_appointment_segments,
     calculate_available_slots,
+    calculate_days_needed,
+    check_slot_availability_for_duration,
+    collect_multiday_future_dates,
     get_buffer_minutes,
     get_business_hours,
     get_service_duration_minutes,
     get_timezone,
-    is_slot_available,
     load_config,
     validate_config,
 )
@@ -793,21 +796,21 @@ async def get_availability(
             total_minutes=slot_duration,
         )
 
-        # For multi-day services, fetch appointments for upcoming days
-        # (also enriched with _busyTechIds so per-tech availability holds
-        # across day boundaries).
+        # For multi-day slots, fetch appointments for exactly the future days
+        # any slot start could roll over into (also enriched with
+        # _busyTechIds so per-tech availability holds across day boundaries).
+        # Derived from the duration instead of a fixed >5h threshold: even a
+        # 1-hour service starting 30 minutes before close rolls into the
+        # next business day, and its day-2 conflicts must be visible.
         future_appointments: dict[str, list] = {}
-        if slot_duration > 300:  # Only fetch future days for services > 5 hours
-            check_date = target_date
-            for _ in range(5):
-                check_date = check_date + timedelta(days=1)
-                date_str = check_date.strftime("%Y-%m-%d")
-                try:
-                    future_appts = await _fetch_appointments_with_busy_techs(date_str)
-                    future_appointments[date_str] = future_appts
-                except ShopmonkeyAPIError:
-                    logger.warning("future_appointments_fetch_failed", date=date_str)
-                    # Continue even if future date fetch fails
+        for future_date_str in collect_multiday_future_dates(target_date, slot_duration, config):
+            try:
+                future_appointments[future_date_str] = await _fetch_appointments_with_busy_techs(
+                    future_date_str
+                )
+            except ShopmonkeyAPIError:
+                logger.warning("future_appointments_fetch_failed", date=future_date_str)
+                # Continue even if future date fetch fails
 
         # Calculate available slots
         available_slots = calculate_available_slots(
@@ -898,17 +901,42 @@ async def book_appointment(_: ApiKeyDep, request: BookingRequest):
             service_name = service.get("name", "Service")
             tech_ids = [t["tech_id"] for t in qualified_techs]
 
+            # Derive the true booking span server-side from the service
+            # duration. The widget's slot_end is the END OF DAY 1 ONLY for
+            # multi-day slots (availability returns end=close), so trusting
+            # it produced 30-minute calendar stubs like Anne's June 3 report
+            # - the rollover days were never reserved.
+            labor_duration = get_service_duration_minutes(
+                service, config.get("default_slot_duration_minutes", 60)
+            )
+            buffer_minutes = get_buffer_minutes(service, config)
+            duration_minutes = labor_duration + buffer_minutes
+
+            # Fetch continuation-day schedules when the requested start rolls
+            # past close, so the re-check below validates EVERY spanned day.
+            days_probe = calculate_days_needed(
+                duration_minutes, slot_start_dt, slot_start_dt.time(), config
+            )
+            future_appointments: dict[str, list] = {}
+            if days_probe and len(days_probe) > 1:
+                for future_day, _ in days_probe[1:]:
+                    future_date_str = future_day.strftime("%Y-%m-%d")
+                    future_appointments[future_date_str] = (
+                        await _fetch_appointments_with_busy_techs(future_date_str)
+                    )
+
             # Re-check availability (inside lock to prevent race conditions).
             # Enriched appointments carry _busyTechIds from labor.technicianId
             # so we filter out specifically-busy techs and only fail when no
-            # qualified tech is actually free.
+            # qualified tech is actually free - on every day the service spans.
             appointments = await _fetch_appointments_with_busy_techs(date_str)
-            is_available, available_tech_ids = is_slot_available(
+            is_available, available_tech_ids, days_needed = check_slot_availability_for_duration(
                 date=slot_start_dt,
                 slot_start=slot_start_dt.time(),
-                slot_end=slot_end_dt.time(),
+                duration_minutes=duration_minutes,
                 tech_ids=tech_ids,
                 appointments=appointments,
+                future_appointments=future_appointments,
                 config=config,
             )
 
@@ -917,10 +945,25 @@ async def book_appointment(_: ApiKeyDep, request: BookingRequest):
                     "slot_no_longer_available",
                     slot_start=request.slot_start,
                     slot_end=request.slot_end,
+                    duration_minutes=duration_minutes,
+                    days_spanned=len(days_needed),
                 )
                 raise HTTPException(
                     status_code=409,
                     detail="The selected time slot is no longer available",
+                )
+
+            # One (start, end) window per business day the service occupies.
+            segments = build_appointment_segments(days_needed, slot_start_dt.time(), config)
+            total_days = len(segments)
+            if slot_end_dt != segments[-1][1]:
+                # Informational: the server-derived span wins over the
+                # client-submitted slot_end.
+                logger.info(
+                    "slot_end_derived_server_side",
+                    client_slot_end=request.slot_end,
+                    derived_end=segments[-1][1].isoformat(),
+                    days_spanned=total_days,
                 )
 
             # Pick the tech upfront so we can stamp technicianId onto the
@@ -1084,9 +1127,14 @@ async def book_appointment(_: ApiKeyDep, request: BookingRequest):
                 if customer_name_mismatch
                 else ""
             )
+            multiday_line = (
+                f"\nMulti-day service: {total_days} days - vehicle stays overnight."
+                if total_days > 1
+                else ""
+            )
             work_order_notes = f"""*** ONLINE BOOKING ***
 Confirmation: {confirmation_number}
-{tech_line}{mismatch_line}
+{tech_line}{mismatch_line}{multiday_line}
 Service requested: {service_name}
 Booked online via scheduling API."""
 
@@ -1094,22 +1142,61 @@ Booked online via scheduling API."""
             # Shopmonkey. zoneinfo picks the right offset for the date (e.g.
             # -05:00 in CDT, -06:00 in CST) so DST transitions are handled
             # without manual offset toggles.
+            #
+            # Multi-day bookings create ONE APPOINTMENT PER BUSINESS DAY (day
+            # 1: start → close; later days: open → remaining minutes), all
+            # linked to the same order and confirmation number, so every
+            # spanned day is actually reserved on the calendar (Anne's June 3
+            # report: only the first day's 30-minute stub was ever created).
             tz = get_timezone(config)
-            start_date_iso = slot_start_dt.replace(tzinfo=tz).isoformat(timespec="milliseconds")
-            end_date_iso = slot_end_dt.replace(tzinfo=tz).isoformat(timespec="milliseconds")
+            created_appointments: list[dict[str, Any]] = []
+            try:
+                for day_index, (seg_start, seg_end) in enumerate(segments):
+                    day_suffix = (
+                        f" (Day {day_index + 1} of {total_days})" if total_days > 1 else ""
+                    )
+                    if day_index == 0:
+                        seg_notes = work_order_notes
+                    else:
+                        seg_notes = f"""*** ONLINE BOOKING ***
+Confirmation: {confirmation_number}
+Day {day_index + 1} of {total_days} - continuation of the {segments[0][0].strftime("%Y-%m-%d")} booking.
+{tech_line}
+Service requested: {service_name}
+Booked online via scheduling API."""
 
-            appointment = await shopmonkey_client.create_appointment(
-                customer_id=customer_id,
-                vehicle_id=vehicle_id,
-                start_date=start_date_iso,
-                end_date=end_date_iso,
-                title=ootb_name,
-                notes=work_order_notes,
-                technician_id=assigned_tech_id,
-                order_id=order_id,
-            )
+                    appointment = await shopmonkey_client.create_appointment(
+                        customer_id=customer_id,
+                        vehicle_id=vehicle_id,
+                        start_date=seg_start.replace(tzinfo=tz).isoformat(timespec="milliseconds"),
+                        end_date=seg_end.replace(tzinfo=tz).isoformat(timespec="milliseconds"),
+                        title=f"{ootb_name}{day_suffix}",
+                        notes=seg_notes,
+                        technician_id=assigned_tech_id,
+                        order_id=order_id,
+                    )
+                    created_appointments.append(appointment)
+            except Exception:
+                # Partial multi-day creation would silently under-reserve the
+                # calendar (the exact bug this fixes), so roll back whatever
+                # was created and surface the failure to the customer.
+                logger.exception(
+                    "appointment_creation_failed_rolling_back",
+                    created=len(created_appointments),
+                    total=total_days,
+                    confirmation_number=confirmation_number,
+                )
+                for created in created_appointments:
+                    created_id = created.get("id", "")
+                    try:
+                        await shopmonkey_client.delete_appointment(created_id)
+                    except Exception:
+                        logger.exception(
+                            "appointment_rollback_failed", appointment_id=created_id
+                        )
+                raise
 
-            appointment_id = appointment.get("id", "")
+            appointment_id = created_appointments[0].get("id", "")
 
             logger.info(
                 "booking_successful",
@@ -1117,6 +1204,8 @@ Booked online via scheduling API."""
                 confirmation_number=confirmation_number,
                 service_name=service_name,
                 technician_id=assigned_tech_id,
+                days_spanned=total_days,
+                appointment_count=len(created_appointments),
             )
 
             # Send email notification (fire-and-forget, doesn't block response)
@@ -1125,8 +1214,11 @@ Booked online via scheduling API."""
                 booking_details = BookingDetails(
                     confirmation_number=confirmation_number,
                     service_name=service_name,
-                    start_time=slot_start_dt,
-                    end_time=slot_end_dt,
+                    start_time=segments[0][0],
+                    # Final segment end: for multi-day bookings this lands on
+                    # a LATER DATE than start_time, and the email renders the
+                    # date range + overnight note off that difference.
+                    end_time=segments[-1][1],
                     technician_name=assigned_tech_name,
                     customer_first_name=request.customer.firstName,
                     customer_last_name=request.customer.lastName,

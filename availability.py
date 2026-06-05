@@ -439,6 +439,111 @@ def count_multiday_overlap_capacity(
     return max(min_capacity, 0), free_in_order
 
 
+def collect_multiday_future_dates(
+    date: datetime,
+    duration_minutes: int,
+    config: dict[str, Any],
+) -> list[str]:
+    """Return the future date strings ("YYYY-MM-DD") that any slot on `date`
+    could roll over into, given the service duration.
+
+    A slot is multi-day when the duration exceeds the minutes between its
+    start and close, so late starts need their continuation days' schedules
+    to judge capacity. This is the union across every generated slot start,
+    so callers can fetch exactly the days the multi-day capacity check will
+    look at - no more, no fewer. Empty list when no slot rolls over.
+    """
+    business_hours = get_business_hours(config, date)
+    if not business_hours.is_open:
+        return []
+
+    slot_interval = config.get("slot_interval_minutes", 60)
+    future_dates: set[str] = set()
+    for slot_start in generate_slot_start_times(business_hours, slot_interval):
+        days_needed = calculate_days_needed(duration_minutes, date, slot_start, config)
+        if not days_needed:
+            continue
+        for day, _ in days_needed[1:]:
+            future_dates.add(day.strftime("%Y-%m-%d"))
+
+    return sorted(future_dates)
+
+
+def check_slot_availability_for_duration(
+    date: datetime,
+    slot_start: time,
+    duration_minutes: int,
+    tech_ids: list[str],
+    appointments: list[dict[str, Any]],
+    future_appointments: dict[str, list[dict[str, Any]]],
+    config: dict[str, Any],
+) -> tuple[bool, list[str], list[tuple[datetime, int]]]:
+    """Re-check a slot for /book, deriving the real span from the service
+    duration instead of trusting the client-submitted slot_end.
+
+    Single-day slots check `slot_start → slot_start + duration`. Multi-day
+    slots check the first day through close plus the needed window on each
+    continuation day (same logic the /availability endpoint advertises
+    slots with).
+
+    Returns `(is_available, free_tech_ids, days_needed)`. `days_needed` is
+    the `calculate_days_needed` segmentation so the caller can create one
+    appointment per day; empty list when the slot can't be completed at all
+    (closed day, or service overflows the 7-business-day lookahead).
+    """
+    days_needed = calculate_days_needed(duration_minutes, date, slot_start, config)
+    if not days_needed:
+        return (False, [], [])
+
+    tz = get_timezone(config)
+
+    if len(days_needed) == 1:
+        slot_end = (
+            datetime.combine(date.date(), slot_start) + timedelta(minutes=duration_minutes)
+        ).time()
+        capacity, free_techs = slot_capacity(
+            slot_start, slot_end, date, appointments, tech_ids, tz=tz
+        )
+    else:
+        business_hours = get_business_hours(config, date)
+        capacity, free_techs = count_multiday_overlap_capacity(
+            days_needed=days_needed,
+            first_day_appointments=appointments,
+            first_day_start_time=slot_start,
+            first_day_close_time=business_hours.close_time,
+            future_appointments=future_appointments,
+            config=config,
+            tech_ids=tech_ids,
+        )
+
+    if capacity <= 0:
+        return (False, [], days_needed)
+    return (True, free_techs, days_needed)
+
+
+def build_appointment_segments(
+    days_needed: list[tuple[datetime, int]],
+    slot_start: time,
+    config: dict[str, Any],
+) -> list[tuple[datetime, datetime]]:
+    """Convert a `calculate_days_needed` segmentation into concrete
+    (start_dt, end_dt) appointment windows, one per business day.
+
+    Day 1 runs from the requested start for its allotted minutes (through
+    close for multi-day bookings); continuation days run from open until
+    their remaining minutes are used up.
+    """
+    segments: list[tuple[datetime, datetime]] = []
+    for i, (day, minutes_needed) in enumerate(days_needed):
+        if i == 0:
+            seg_start = datetime.combine(day.date(), slot_start)
+        else:
+            day_hours = get_business_hours(config, day)
+            seg_start = datetime.combine(day.date(), day_hours.open_time)
+        segments.append((seg_start, seg_start + timedelta(minutes=minutes_needed)))
+    return segments
+
+
 def generate_slot_start_times(
     business_hours: BusinessHours,
     slot_interval_minutes: int = 60,
