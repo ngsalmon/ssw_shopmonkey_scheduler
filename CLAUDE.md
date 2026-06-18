@@ -50,9 +50,12 @@ Client (widget.html/js) → FastAPI (main.py) → Shopmonkey Client + Sheets Cli
 
 **Data Flow - Availability Check:**
 1. Get service from Shopmonkey (extracts department from labels)
-2. Query Google Sheets for techs qualified in that department
+2. Query Google Sheets for techs qualified in that department, plus the
+   department's max service concurrency (the `MAX CONCURRENCY` row in Tech/Dept)
 3. Fetch existing appointments for those techs on the date
-4. Calculate available slots respecting business hours, service duration, existing bookings
+4. Calculate available slots respecting business hours, service duration,
+   existing bookings, and the department concurrency ceiling
+   (`min(free_qualified_techs, max_concurrency − overlapping_dept_bookings)`)
 
 **Data Flow - Booking:**
 1. Re-validate slot availability (prevents race conditions)
@@ -64,6 +67,7 @@ Client (widget.html/js) → FastAPI (main.py) → Shopmonkey Client + Sheets Cli
 
 - **Async patterns**: FastAPI endpoints and Shopmonkey client are async; Sheets client is sync
 - **Department mapping**: Uses Shopmonkey service labels (not Google Sheets service mapping)
+- **Department concurrency**: A `MAX CONCURRENCY` row (column A) in the Tech/Dept tab caps how many of a department's services run at once. Each department column holds its limit; a blank/zero/non-numeric cell means no cap. The row is skipped when parsing techs (blank ID + name guard).
 - **Multi-day services**: availability.py handles services that span multiple business days
 - **Cache clearing**: Call `sheets_client.clear_cache()` after Google Sheets updates
 - **Environment variables**: SHOPMONKEY_API_TOKEN, GOOGLE_SHEETS_ID, GOOGLE_APPLICATION_CREDENTIALS (see .env.example)

@@ -348,6 +348,33 @@ def calculate_days_needed(
     return days_needed
 
 
+def cap_by_concurrency(
+    capacity: int,
+    free_count: int,
+    qualified_count: int,
+    max_concurrency: int | None,
+) -> int:
+    """Clamp tech-based capacity by a department's max service concurrency.
+
+    The occupancy ceiling models a physical resource (bays / equipment): a
+    department may run at most `max_concurrency` services at once. The
+    department services already overlapping the slot are exactly the qualified
+    techs currently busy (`qualified_count - free_count`), so the remaining
+    concurrency is `max_concurrency - busy_in_dept`. We never offer more than
+    that, nor more than the free-tech `capacity`.
+
+    Unattributed overlaps (orderId-bearing appointments whose labors carry no
+    technicianId) are intentionally NOT counted toward department occupancy:
+    they already reduce the free-tech `capacity`, and we can't attribute them
+    to a specific department. `max_concurrency is None` means no cap (the
+    original tech-only behavior).
+    """
+    if max_concurrency is None:
+        return capacity
+    busy_in_dept = qualified_count - free_count
+    return max(min(capacity, max_concurrency - busy_in_dept), 0)
+
+
 def slot_capacity(
     slot_start: time,
     slot_end: time,
@@ -355,6 +382,7 @@ def slot_capacity(
     appointments: list[dict[str, Any]],
     tech_ids: list[str],
     tz: ZoneInfo | None = None,
+    max_concurrency: int | None = None,
 ) -> tuple[int, list[str]]:
     """Compute `(remaining_capacity, free_tech_ids)` for a slot.
 
@@ -368,10 +396,16 @@ def slot_capacity(
     the caller still treats overall capacity as `len(free_tech_ids) -
     unattributed`, because we can't tell which of the "free" techs might
     actually be the unattributed-busy one.
+
+    `max_concurrency`, when set, further clamps the result to the department's
+    maximum simultaneous services (see `cap_by_concurrency`). The returned
+    `free_tech_ids` list is unchanged - the cap only limits how many of those
+    free techs may be offered/booked, and assignment still picks from the list.
     """
     busy, unattributed = get_overlap_info_for_slot(slot_start, slot_end, date, appointments, tz=tz)
     free = [t for t in tech_ids if t not in busy]
     capacity = max(len(free) - unattributed, 0)
+    capacity = cap_by_concurrency(capacity, len(free), len(tech_ids), max_concurrency)
     return capacity, free
 
 
@@ -383,6 +417,7 @@ def count_multiday_overlap_capacity(
     future_appointments: dict[str, list[dict[str, Any]]],
     config: dict[str, Any],
     tech_ids: list[str],
+    max_concurrency: int | None = None,
 ) -> tuple[int, list[str]]:
     """Compute remaining capacity and free techs for a multi-day slot.
 
@@ -390,6 +425,10 @@ def count_multiday_overlap_capacity(
     INTERSECTION of free techs across every required day (a tech has to
     be free on all spanned days to take a multi-day booking). The
     bottleneck day governs the capacity number.
+
+    `max_concurrency`, when set, clamps each day's capacity to the
+    department's max simultaneous services; since the bottleneck day already
+    governs `min_capacity`, the day with the least remaining concurrency wins.
     """
     if not days_needed:
         return 0, []
@@ -405,6 +444,7 @@ def count_multiday_overlap_capacity(
         first_day_appointments,
         tech_ids,
         tz=tz,
+        max_concurrency=max_concurrency,
     )
     min_capacity = first_capacity
     free_set = set(first_free)
@@ -429,6 +469,7 @@ def count_multiday_overlap_capacity(
             day_appointments,
             tech_ids,
             tz=tz,
+            max_concurrency=max_concurrency,
         )
         if cap < min_capacity:
             min_capacity = cap
@@ -477,6 +518,7 @@ def check_slot_availability_for_duration(
     appointments: list[dict[str, Any]],
     future_appointments: dict[str, list[dict[str, Any]]],
     config: dict[str, Any],
+    max_concurrency: int | None = None,
 ) -> tuple[bool, list[str], list[tuple[datetime, int]]]:
     """Re-check a slot for /book, deriving the real span from the service
     duration instead of trusting the client-submitted slot_end.
@@ -502,7 +544,8 @@ def check_slot_availability_for_duration(
             datetime.combine(date.date(), slot_start) + timedelta(minutes=duration_minutes)
         ).time()
         capacity, free_techs = slot_capacity(
-            slot_start, slot_end, date, appointments, tech_ids, tz=tz
+            slot_start, slot_end, date, appointments, tech_ids, tz=tz,
+            max_concurrency=max_concurrency,
         )
     else:
         business_hours = get_business_hours(config, date)
@@ -514,6 +557,7 @@ def check_slot_availability_for_duration(
             future_appointments=future_appointments,
             config=config,
             tech_ids=tech_ids,
+            max_concurrency=max_concurrency,
         )
 
     if capacity <= 0:
@@ -575,6 +619,7 @@ def calculate_available_slots(
     config: dict[str, Any],
     slot_duration_minutes: int | None = None,
     future_appointments: dict[str, list[dict[str, Any]]] | None = None,
+    max_concurrency: int | None = None,
 ) -> list[TimeSlot]:
     """
     Calculate available time slots for a given date.
@@ -590,6 +635,8 @@ def calculate_available_slots(
         slot_duration_minutes: Duration of each slot (uses config default if not provided)
         future_appointments: Dict mapping date strings to appointments for those dates
                            (used for checking multi-day availability)
+        max_concurrency: Department's maximum simultaneous services (an
+            occupancy ceiling on top of free-tech capacity); None means no cap.
 
     Returns:
         List of TimeSlot objects with availability info
@@ -632,6 +679,7 @@ def calculate_available_slots(
                 future_appointments=future_appointments,
                 config=config,
                 tech_ids=tech_ids,
+                max_concurrency=max_concurrency,
             )
             slot_end = business_hours.close_time
         else:
@@ -639,7 +687,8 @@ def calculate_available_slots(
                 datetime.combine(date.date(), slot_start) + timedelta(minutes=slot_duration_minutes)
             ).time()
             capacity, free_techs = slot_capacity(
-                slot_start, slot_end, date, appointments, tech_ids, tz=tz
+                slot_start, slot_end, date, appointments, tech_ids, tz=tz,
+                max_concurrency=max_concurrency,
             )
 
         if capacity > 0:
@@ -665,6 +714,7 @@ def is_slot_available(
     tech_ids: list[str],
     appointments: list[dict[str, Any]],
     config: dict[str, Any] | None = None,
+    max_concurrency: int | None = None,
 ) -> tuple[bool, list[str]]:
     """Re-check that a specific slot still has capacity for a qualified tech.
 
@@ -676,7 +726,10 @@ def is_slot_available(
     chain walk.
     """
     tz = get_timezone(config)
-    capacity, free_techs = slot_capacity(slot_start, slot_end, date, appointments, tech_ids, tz=tz)
+    capacity, free_techs = slot_capacity(
+        slot_start, slot_end, date, appointments, tech_ids, tz=tz,
+        max_concurrency=max_concurrency,
+    )
     if capacity <= 0:
         return (False, [])
     return (True, free_techs)

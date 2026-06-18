@@ -24,6 +24,14 @@ class SheetsClient:
     )
     TECH_DEPARTMENTS_TAB = "Tech/Dept"
 
+    # Sentinel values in the Name column (A) of the Tech/Dept tab marking the
+    # row that holds per-department maximum service concurrency instead of a
+    # technician. Matched case-insensitively so the sheet can read
+    # "MAX CONCURRENCY", "Max Concurrency", etc.
+    MAX_CONCURRENCY_ROW_NAMES = frozenset(
+        {"max concurrency", "max_concurrency", "concurrency", "max"}
+    )
+
     def __init__(
         self,
         spreadsheet_id: str | None = None,
@@ -197,6 +205,13 @@ class SheetsClient:
         for row in rows[1:]:
             if len(row) >= 2:
                 tech_name = row[0].strip()
+
+                # The MAX CONCURRENCY row carries department caps, not a tech.
+                # (It normally has a blank ID and would be skipped below anyway,
+                # but guard by name so a stray ID can't turn it into a "tech".)
+                if tech_name.lower() in self.MAX_CONCURRENCY_ROW_NAMES:
+                    continue
+
                 tech_id = row[1].strip()
                 role = row[2].strip() if len(row) > 2 else ""
 
@@ -313,6 +328,22 @@ class SheetsClient:
             self._sync_get_techs_for_department, department, active_tech_ids
         )
 
+    def _department_column_span(self, header: list[str]) -> tuple[int, int]:
+        """Return (start_index, end_index) of the department columns in a header.
+
+        Departments start at column D (index 3) and run up to (but not
+        including) the Status column; if no Status column is present they run
+        to the end of the header.
+        """
+        status_col_index = None
+        for i, col_name in enumerate(header):
+            if "status" in col_name.lower():
+                status_col_index = i
+                break
+        dept_start_index = 3
+        dept_end_index = status_col_index if status_col_index else len(header)
+        return dept_start_index, dept_end_index
+
     def _sync_get_all_departments(self) -> list[str]:
         """Synchronous implementation of get_all_departments."""
         range_name = f"'{self.TECH_DEPARTMENTS_TAB}'!A1:Z1"
@@ -322,22 +353,86 @@ class SheetsClient:
             return []
 
         header = rows[0]
-
-        # Find status column to know where departments end
-        status_col_index = None
-        for i, col_name in enumerate(header):
-            if "status" in col_name.lower():
-                status_col_index = i
-                break
-
-        # Department names start from column D (index 3), up to status column
-        dept_start_index = 3
-        dept_end_index = status_col_index if status_col_index else len(header)
+        dept_start_index, dept_end_index = self._department_column_span(header)
         return [d.strip() for d in header[dept_start_index:dept_end_index] if d.strip()]
 
     async def get_all_departments(self) -> list[str]:
         """Get list of all department names from the Tech/Dept tab."""
         return await asyncio.to_thread(self._sync_get_all_departments)
+
+    @staticmethod
+    def _parse_concurrency_value(raw: str) -> int | None:
+        """Parse a single department cap cell.
+
+        Blank, zero, or non-numeric values return None ("no cap") so an empty
+        cell never accidentally disables a department. Only a positive integer
+        is treated as a real concurrency limit.
+        """
+        value = raw.strip()
+        if not value:
+            return None
+        try:
+            n = int(value)
+        except ValueError:
+            return None
+        return n if n > 0 else None
+
+    def _sync_get_department_concurrency(self) -> dict[str, int]:
+        """Synchronous implementation of get_department_concurrency."""
+        range_name = f"'{self.TECH_DEPARTMENTS_TAB}'!A:Z"
+        rows = self._sync_read_sheet(range_name)
+
+        if not rows or len(rows) < 2:
+            return {}
+
+        header = rows[0]
+        dept_start_index, dept_end_index = self._department_column_span(header)
+        department_names = [
+            d.strip() for d in header[dept_start_index:dept_end_index] if d.strip()
+        ]
+
+        for row in rows[1:]:
+            if not row:
+                continue
+            if row[0].strip().lower() not in self.MAX_CONCURRENCY_ROW_NAMES:
+                continue
+
+            caps: dict[str, int] = {}
+            for i, dept_name in enumerate(department_names):
+                col_index = dept_start_index + i
+                if col_index < len(row):
+                    cap = self._parse_concurrency_value(row[col_index])
+                    if cap is not None:
+                        caps[dept_name] = cap
+            return caps
+
+        return {}
+
+    async def get_department_concurrency(self) -> dict[str, int]:
+        """
+        Read the MAX CONCURRENCY row from the Tech/Dept tab.
+
+        The row lives in the same tab as the per-tech priorities, identified by
+        a sentinel Name (column A) value such as "MAX CONCURRENCY". Each
+        department column holds the maximum number of that department's
+        services that may run at once (a physical resource limit, e.g. bays).
+
+        Returns:
+            Dict mapping department name to its max concurrency. Departments
+            with a blank/zero/invalid cell are omitted (callers treat a missing
+            entry as "no cap"). Returns {} when no MAX CONCURRENCY row exists.
+        """
+        return await asyncio.to_thread(self._sync_get_department_concurrency)
+
+    def _sync_get_max_concurrency_for_department(self, department: str) -> int | None:
+        """Synchronous implementation of get_max_concurrency_for_department."""
+        return self._sync_get_department_concurrency().get(department)
+
+    async def get_max_concurrency_for_department(self, department: str) -> int | None:
+        """Return the max concurrent services for a department, or None (no cap)."""
+        return await asyncio.to_thread(
+            self._sync_get_max_concurrency_for_department, department
+        )
 
     async def health_check(self) -> bool:
         """

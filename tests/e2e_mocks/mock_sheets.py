@@ -83,6 +83,12 @@ class MockSheetsClient:
             seen.update(tech.departments.keys())
         return sorted(seen)
 
+    async def get_department_concurrency(self) -> dict[str, int]:
+        return dict(self._state.department_concurrency)
+
+    async def get_max_concurrency_for_department(self, department: str) -> int | None:
+        return self._state.department_concurrency.get(department)
+
     async def health_check(self) -> bool:
         if "sheets_health_check" in self._state.errors:
             return False

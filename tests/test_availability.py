@@ -14,6 +14,7 @@ from availability import (
     build_appointment_segments,
     calculate_available_slots,
     calculate_days_needed,
+    cap_by_concurrency,
     check_slot_availability_for_duration,
     collect_multiday_future_dates,
     count_overlapping_appointments,
@@ -1279,6 +1280,198 @@ class TestCheckSlotAvailabilityForDuration:
         assert ok is False
         assert free == []
         assert days == []
+
+
+class TestConcurrencyCap:
+    """Tests for the per-department max-concurrency occupancy ceiling.
+
+    The cap models a physical resource (bays/equipment): a department may run
+    at most `max_concurrency` services at once. Effective capacity is
+    `min(free_qualified_techs, max_concurrency - overlapping_dept_bookings)`.
+    """
+
+    def _busy_appt(self, busy):
+        return {
+            "orderId": "ord_x",
+            "startDate": "2026-01-19T09:00:00-06:00",
+            "endDate": "2026-01-19T10:00:00-06:00",
+            "_busyTechIds": busy,
+        }
+
+    def test_cap_helper_none_is_passthrough(self):
+        assert cap_by_concurrency(3, 3, 4, None) == 3
+
+    def test_cap_helper_binds_to_max(self):
+        # 4 techs free, max 1, none busy -> offer 1.
+        assert cap_by_concurrency(4, 4, 4, 1) == 1
+
+    def test_cap_helper_shrinks_as_dept_fills(self):
+        # 3 free, 1 of 4 qualified busy, max 2 -> remaining = 2-1 = 1.
+        assert cap_by_concurrency(3, 3, 4, 2) == 1
+
+    def test_cap_helper_zero_when_dept_full(self):
+        # 3 free but max 1 already consumed by the 1 busy tech -> 0.
+        assert cap_by_concurrency(3, 3, 4, 1) == 0
+
+    def test_cap_helper_noop_when_max_exceeds_techs(self):
+        assert cap_by_concurrency(4, 4, 4, 10) == 4
+
+    CONFIG = {
+        "business_hours": {"monday": {"open": "09:00", "close": "11:00"}},
+        "default_slot_duration_minutes": 60,
+    }
+
+    def test_available_slots_capped_with_no_bookings(self):
+        """4 qualified techs, max 2, empty calendar -> every slot offers 2."""
+        slots = calculate_available_slots(
+            date=datetime(2026, 1, 19),  # Monday
+            tech_ids=["t1", "t2", "t3", "t4"],
+            appointments=[],
+            config=self.CONFIG,
+            max_concurrency=2,
+        )
+        assert len(slots) == 2
+        assert all(s.available_techs == 2 for s in slots)
+
+    def test_available_slots_occupancy_shrinks_remaining(self):
+        """A single overlapping dept booking drops the 9-10 slot to 1."""
+        slots = calculate_available_slots(
+            date=datetime(2026, 1, 19),
+            tech_ids=["t1", "t2", "t3", "t4"],
+            appointments=[self._busy_appt(["t1"])],  # busies t1, 9-10
+            config=self.CONFIG,
+            max_concurrency=2,
+        )
+        nine = next(s for s in slots if s.start == time(9, 0))
+        ten = next(s for s in slots if s.start == time(10, 0))
+        # 9-10: 2 cap - 1 busy = 1. 10-11: no overlap -> full cap 2.
+        assert nine.available_techs == 1
+        assert ten.available_techs == 2
+
+    def test_available_slots_full_when_cap_consumed(self):
+        """Two overlapping dept bookings hit max=2 -> 9-10 slot disappears."""
+        slots = calculate_available_slots(
+            date=datetime(2026, 1, 19),
+            tech_ids=["t1", "t2", "t3", "t4"],
+            appointments=[self._busy_appt(["t1"]), self._busy_appt(["t2"])],
+            config=self.CONFIG,
+            max_concurrency=2,
+        )
+        assert all(s.start != time(9, 0) for s in slots)
+
+    def test_no_cap_leaves_full_tech_capacity(self):
+        slots = calculate_available_slots(
+            date=datetime(2026, 1, 19),
+            tech_ids=["t1", "t2", "t3", "t4"],
+            appointments=[],
+            config=self.CONFIG,
+            max_concurrency=None,
+        )
+        assert all(s.available_techs == 4 for s in slots)
+
+    BOOK_CONFIG = {
+        "business_hours": {
+            "monday": {"open": "09:00", "close": "17:00"},
+            "tuesday": {"open": "09:00", "close": "17:00"},
+        },
+        "default_slot_duration_minutes": 60,
+        "slot_interval_minutes": 60,
+    }
+
+    def test_book_recheck_allows_under_cap(self):
+        ok, free, _ = check_slot_availability_for_duration(
+            date=datetime(2026, 1, 19),
+            slot_start=time(9, 0),
+            duration_minutes=60,
+            tech_ids=["t1", "t2", "t3"],
+            appointments=[],
+            future_appointments={},
+            config=self.BOOK_CONFIG,
+            max_concurrency=1,
+        )
+        assert ok is True
+        assert free == ["t1", "t2", "t3"]
+
+    def test_book_recheck_blocks_when_cap_reached(self):
+        """max=1 and one dept booking already overlaps -> slot is full."""
+        ok, free, _ = check_slot_availability_for_duration(
+            date=datetime(2026, 1, 19),
+            slot_start=time(9, 0),
+            duration_minutes=60,
+            tech_ids=["t1", "t2", "t3"],
+            appointments=[self._busy_appt(["t1"])],
+            future_appointments={},
+            config=self.BOOK_CONFIG,
+            max_concurrency=1,
+        )
+        assert ok is False
+        assert free == []
+
+    def test_multiday_cap_allows_under_ceiling(self):
+        """157 min at 16:00 Mon spans into Tue; max=1, empty calendar -> ok."""
+        ok, free, days = check_slot_availability_for_duration(
+            date=datetime(2026, 1, 19),
+            slot_start=time(16, 0),
+            duration_minutes=157,
+            tech_ids=["t1", "t2", "t3"],
+            appointments=[],
+            future_appointments={"2026-01-20": []},
+            config=self.BOOK_CONFIG,
+            max_concurrency=1,
+        )
+        assert ok is True
+        assert free == ["t1", "t2", "t3"]
+        assert len(days) == 2
+
+    def test_multiday_cap_full_via_day2_occupancy(self):
+        """A day-2 dept booking consumes the only concurrency slot (max=1)
+        -> the bottleneck (day 2) governs and the multi-day slot is blocked,
+        even though day 1 is wide open."""
+        future = {
+            "2026-01-20": [
+                {
+                    "orderId": "ord_day2",
+                    "startDate": "2026-01-20T15:00:00Z",  # 09:00 CST, in the day-2 window
+                    "endDate": "2026-01-20T16:00:00Z",
+                    "_busyTechIds": ["t1"],
+                }
+            ]
+        }
+        ok, free, days = check_slot_availability_for_duration(
+            date=datetime(2026, 1, 19),
+            slot_start=time(16, 0),
+            duration_minutes=157,
+            tech_ids=["t1", "t2", "t3"],
+            appointments=[],
+            future_appointments=future,
+            config=self.BOOK_CONFIG,
+            max_concurrency=1,
+        )
+        # Day 1: 3 free, 0 busy, remaining = 1. Day 2: 2 free, 1 busy in dept,
+        # remaining = 1-1 = 0. min across days = 0 -> blocked.
+        assert ok is False
+        assert free == []
+        assert len(days) == 2
+
+    def test_unattributed_overlap_not_double_counted_against_cap(self):
+        """An unattributed overlap (orderId, no _busyTechIds) reduces the
+        free-tech arm but NOT the department-occupancy arm. With 4 techs and
+        max=2, one unattributed overlap leaves min(4-1, 2-0)=2, not 1."""
+        unattributed = {
+            "orderId": "ord_u",
+            "startDate": "2026-01-19T09:00:00-06:00",
+            "endDate": "2026-01-19T10:00:00-06:00",
+            "_busyTechIds": [],
+        }
+        slots = calculate_available_slots(
+            date=datetime(2026, 1, 19),
+            tech_ids=["t1", "t2", "t3", "t4"],
+            appointments=[unattributed],
+            config=self.CONFIG,
+            max_concurrency=2,
+        )
+        nine = next(s for s in slots if s.start == time(9, 0))
+        assert nine.available_techs == 2
 
 
 class TestBuildAppointmentSegments:

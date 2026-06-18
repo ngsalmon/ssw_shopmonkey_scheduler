@@ -611,7 +611,7 @@ def get_department_from_service(service: dict[str, Any]) -> str | None:
 
 async def get_qualified_techs_for_service(
     service_id: str,
-) -> tuple[dict[str, Any], str, list[dict[str, str]]]:
+) -> tuple[dict[str, Any], str, list[dict[str, str]], int | None]:
     """
     Get service details and qualified technicians.
 
@@ -622,7 +622,9 @@ async def get_qualified_techs_for_service(
         service_id: The Shopmonkey service ID
 
     Returns:
-        Tuple of (service, department, qualified_techs)
+        Tuple of (service, department, qualified_techs, max_concurrency).
+        max_concurrency is the department's maximum simultaneous services from
+        the Tech/Dept MAX CONCURRENCY row, or None when no cap is configured.
 
     Raises:
         HTTPException: On various error conditions (404, 500)
@@ -674,6 +676,8 @@ async def get_qualified_techs_for_service(
         qualified_techs = await sheets_client.get_techs_for_department(
             department, active_tech_ids=active_tech_ids
         )
+        # Per-department occupancy ceiling (bays/equipment). None = no cap.
+        max_concurrency = await sheets_client.get_max_concurrency_for_department(department)
     except Exception as e:
         logger.error("sheets_api_error", department=department, error=str(e))
         raise HTTPException(status_code=502, detail="Unable to reach scheduling service")
@@ -689,9 +693,10 @@ async def get_qualified_techs_for_service(
         "qualified_techs_found",
         department=department,
         tech_count=len(qualified_techs),
+        max_concurrency=max_concurrency,
     )
 
-    return service, department, qualified_techs
+    return service, department, qualified_techs, max_concurrency
 
 
 # API Endpoints
@@ -775,7 +780,12 @@ async def get_availability(
 
     try:
         # Get service and qualified techs using shared helper
-        service, department, qualified_techs = await get_qualified_techs_for_service(service_id)
+        (
+            service,
+            department,
+            qualified_techs,
+            max_concurrency,
+        ) = await get_qualified_techs_for_service(service_id)
         tech_ids = [t["tech_id"] for t in qualified_techs]
 
         # Get existing appointments for the date and enrich each with the
@@ -820,6 +830,7 @@ async def get_availability(
             config=config,
             slot_duration_minutes=slot_duration,
             future_appointments=future_appointments,
+            max_concurrency=max_concurrency,
         )
 
         # Get business hours for the close time
@@ -897,6 +908,7 @@ async def book_appointment(_: ApiKeyDep, request: BookingRequest):
                 service,
                 department,
                 qualified_techs,
+                max_concurrency,
             ) = await get_qualified_techs_for_service(request.service_id)
             service_name = service.get("name", "Service")
             tech_ids = [t["tech_id"] for t in qualified_techs]
@@ -938,6 +950,7 @@ async def book_appointment(_: ApiKeyDep, request: BookingRequest):
                 appointments=appointments,
                 future_appointments=future_appointments,
                 config=config,
+                max_concurrency=max_concurrency,
             )
 
             if not is_available:

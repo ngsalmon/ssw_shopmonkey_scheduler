@@ -65,6 +65,8 @@ def mock_sheets_client():
         ]
     )
     client.get_all_departments = AsyncMock(return_value=["Window Tint", "Vinyl", "Detail"])
+    # No concurrency cap by default (matches an empty MAX CONCURRENCY row).
+    client.get_max_concurrency_for_department = AsyncMock(return_value=None)
     client.get_tech_departments = AsyncMock(
         return_value={
             "tech-1": {"tech_name": "John Doe", "departments": {"Window Tint": 1}},

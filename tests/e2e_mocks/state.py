@@ -126,6 +126,9 @@ class MockState:
     def __init__(self) -> None:
         self.services: dict[str, MockService] = {}
         self.techs: dict[str, MockTech] = {}
+        # Department name -> max simultaneous services (occupancy ceiling).
+        # Mirrors the MAX CONCURRENCY row in the real Tech/Dept sheet tab.
+        self.department_concurrency: dict[str, int] = {}
         self.appointments: list[MockAppointment] = []
         self.customers: list[MockCustomer] = []
         self.vehicles: list[MockVehicle] = []
@@ -141,6 +144,7 @@ class MockState:
     def reset(self) -> None:
         self.services.clear()
         self.techs.clear()
+        self.department_concurrency.clear()
         self.appointments.clear()
         self.customers.clear()
         self.vehicles.clear()
@@ -238,6 +242,11 @@ class MockState:
                     name=a.get("name", "Existing booking"),
                     order_id=order_id,
                 )
+        if "department_concurrency" in payload:
+            self.department_concurrency = {
+                str(dept): int(cap)
+                for dept, cap in dict(payload["department_concurrency"]).items()
+            }
         if "errors" in payload:
             self.errors = copy.deepcopy(payload["errors"])
 
@@ -264,6 +273,7 @@ class MockState:
                 }
                 for t in self.techs.values()
             ],
+            "department_concurrency": dict(self.department_concurrency),
             "appointments": [a.to_dict() for a in self.appointments],
             "orders": list(self.orders.values()),
             "errors": copy.deepcopy(self.errors),

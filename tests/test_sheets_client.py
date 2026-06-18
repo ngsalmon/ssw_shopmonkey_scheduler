@@ -300,6 +300,98 @@ class TestSheetsClientGetAllDepartments:
         assert result == []
 
 
+class TestSheetsClientDepartmentConcurrency:
+    """Tests for the MAX CONCURRENCY row parsing in the Tech/Dept tab."""
+
+    SHEET = {
+        "values": [
+            ["Name", "ID", "Role", "Vinyl", "Tint", "Bedliner", "Status"],
+            ["MAX CONCURRENCY", "", "", "2", "1", "", ""],
+            ["John Doe", "tech-1", "Technician", "1", "0", "2", "Active"],
+            ["Jane Smith", "tech-2", "Technician", "2", "1", "0", "Active"],
+        ]
+    }
+
+    def _client(self, mock_build, values):
+        from sheets_client import SheetsClient
+
+        mock_service = MagicMock()
+        mock_build.return_value = mock_service
+        mock_service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = values
+        return SheetsClient(spreadsheet_id="test-id", credentials_path="test.json")
+
+    @patch("sheets_client.service_account.Credentials.from_service_account_file")
+    @patch("sheets_client.build")
+    def test_parses_concurrency_row(self, mock_build, mock_creds):
+        """Positive integers become caps; blank cells are omitted (no cap)."""
+        client = self._client(mock_build, self.SHEET)
+        caps = client._sync_get_department_concurrency()
+
+        assert caps == {"Vinyl": 2, "Tint": 1}
+        assert "Bedliner" not in caps  # blank cell -> no cap
+
+    @patch("sheets_client.service_account.Credentials.from_service_account_file")
+    @patch("sheets_client.build")
+    def test_get_max_concurrency_for_department(self, mock_build, mock_creds):
+        client = self._client(mock_build, self.SHEET)
+        assert client._sync_get_max_concurrency_for_department("Tint") == 1
+        assert client._sync_get_max_concurrency_for_department("Vinyl") == 2
+        # Blank cell and entirely-unknown department both return None.
+        assert client._sync_get_max_concurrency_for_department("Bedliner") is None
+        assert client._sync_get_max_concurrency_for_department("Nope") is None
+
+    @patch("sheets_client.service_account.Credentials.from_service_account_file")
+    @patch("sheets_client.build")
+    def test_concurrency_row_is_not_treated_as_a_tech(self, mock_build, mock_creds):
+        """The MAX CONCURRENCY row must never appear in the tech mapping."""
+        client = self._client(mock_build, self.SHEET)
+        techs = client._sync_get_tech_departments()
+
+        assert set(techs) == {"tech-1", "tech-2"}
+        assert all(
+            t["tech_name"].lower() != "max concurrency" for t in techs.values()
+        )
+
+    @patch("sheets_client.service_account.Credentials.from_service_account_file")
+    @patch("sheets_client.build")
+    def test_concurrency_row_ignored_even_with_stray_id(self, mock_build, mock_creds):
+        """A stray ID on the cap row still doesn't make it a tech."""
+        values = {
+            "values": [
+                ["Name", "ID", "Role", "Tint", "Status"],
+                ["Max Concurrency", "oops-id", "", "1", ""],
+                ["Real Tech", "tech-1", "Technician", "1", "Active"],
+            ]
+        }
+        client = self._client(mock_build, values)
+        techs = client._sync_get_tech_departments()
+        assert set(techs) == {"tech-1"}
+
+    @patch("sheets_client.service_account.Credentials.from_service_account_file")
+    @patch("sheets_client.build")
+    def test_zero_and_invalid_values_are_no_cap(self, mock_build, mock_creds):
+        values = {
+            "values": [
+                ["Name", "ID", "Role", "Vinyl", "Tint", "Status"],
+                ["MAX CONCURRENCY", "", "", "0", "abc", ""],
+            ]
+        }
+        client = self._client(mock_build, values)
+        assert client._sync_get_department_concurrency() == {}
+
+    @patch("sheets_client.service_account.Credentials.from_service_account_file")
+    @patch("sheets_client.build")
+    def test_returns_empty_when_no_concurrency_row(self, mock_build, mock_creds):
+        values = {
+            "values": [
+                ["Name", "ID", "Role", "Tint", "Status"],
+                ["John", "tech-1", "Technician", "1", "Active"],
+            ]
+        }
+        client = self._client(mock_build, values)
+        assert client._sync_get_department_concurrency() == {}
+
+
 class TestSheetsClientNormalizeDepartment:
     """Tests for _normalize_department method."""
 
