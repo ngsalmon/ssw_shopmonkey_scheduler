@@ -387,9 +387,7 @@ class SheetsClient:
 
         header = rows[0]
         dept_start_index, dept_end_index = self._department_column_span(header)
-        department_names = [
-            d.strip() for d in header[dept_start_index:dept_end_index] if d.strip()
-        ]
+        department_names = [d.strip() for d in header[dept_start_index:dept_end_index] if d.strip()]
 
         for row in rows[1:]:
             if not row:
@@ -430,9 +428,7 @@ class SheetsClient:
 
     async def get_max_concurrency_for_department(self, department: str) -> int | None:
         """Return the max concurrent services for a department, or None (no cap)."""
-        return await asyncio.to_thread(
-            self._sync_get_max_concurrency_for_department, department
-        )
+        return await asyncio.to_thread(self._sync_get_max_concurrency_for_department, department)
 
     async def health_check(self) -> bool:
         """

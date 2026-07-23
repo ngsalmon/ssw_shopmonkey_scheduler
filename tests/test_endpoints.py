@@ -941,9 +941,7 @@ class TestMultidayBooking:
     def test_multiday_booking_creates_one_appointment_per_day(
         self, test_client, mock_shopmonkey_client
     ):
-        mock_shopmonkey_client.get_canned_service = AsyncMock(
-            return_value=self._multiday_service()
-        )
+        mock_shopmonkey_client.get_canned_service = AsyncMock(return_value=self._multiday_service())
         mock_shopmonkey_client.create_appointment = AsyncMock(
             side_effect=[{"id": "appt-day1"}, {"id": "appt-day2"}]
         )
@@ -984,9 +982,7 @@ class TestMultidayBooking:
     ):
         """Day-2 conflicts must block the booking - the old code never
         looked at day 2 at all."""
-        mock_shopmonkey_client.get_canned_service = AsyncMock(
-            return_value=self._multiday_service()
-        )
+        mock_shopmonkey_client.get_canned_service = AsyncMock(return_value=self._multiday_service())
 
         async def appointments_for(date_str, tech_ids=None):
             if date_str == "2026-01-20":
@@ -1005,9 +1001,7 @@ class TestMultidayBooking:
                 ]
             return []
 
-        mock_shopmonkey_client.get_appointments_for_date = AsyncMock(
-            side_effect=appointments_for
-        )
+        mock_shopmonkey_client.get_appointments_for_date = AsyncMock(side_effect=appointments_for)
 
         response = test_client.post("/book", json=self._booking_request())
         assert response.status_code == 409
@@ -1021,9 +1015,7 @@ class TestMultidayBooking:
         multi-day booking silently under-reserves the calendar."""
         from shopmonkey_client import ShopmonkeyAPIError
 
-        mock_shopmonkey_client.get_canned_service = AsyncMock(
-            return_value=self._multiday_service()
-        )
+        mock_shopmonkey_client.get_canned_service = AsyncMock(return_value=self._multiday_service())
         mock_shopmonkey_client.create_appointment = AsyncMock(
             side_effect=[
                 {"id": "appt-day1"},

@@ -544,7 +544,12 @@ def check_slot_availability_for_duration(
             datetime.combine(date.date(), slot_start) + timedelta(minutes=duration_minutes)
         ).time()
         capacity, free_techs = slot_capacity(
-            slot_start, slot_end, date, appointments, tech_ids, tz=tz,
+            slot_start,
+            slot_end,
+            date,
+            appointments,
+            tech_ids,
+            tz=tz,
             max_concurrency=max_concurrency,
         )
     else:
@@ -687,7 +692,12 @@ def calculate_available_slots(
                 datetime.combine(date.date(), slot_start) + timedelta(minutes=slot_duration_minutes)
             ).time()
             capacity, free_techs = slot_capacity(
-                slot_start, slot_end, date, appointments, tech_ids, tz=tz,
+                slot_start,
+                slot_end,
+                date,
+                appointments,
+                tech_ids,
+                tz=tz,
                 max_concurrency=max_concurrency,
             )
 
@@ -747,7 +757,12 @@ def is_slot_available(
     """
     tz = get_timezone(config)
     capacity, free_techs = slot_capacity(
-        slot_start, slot_end, date, appointments, tech_ids, tz=tz,
+        slot_start,
+        slot_end,
+        date,
+        appointments,
+        tech_ids,
+        tz=tz,
         max_concurrency=max_concurrency,
     )
     if capacity <= 0:

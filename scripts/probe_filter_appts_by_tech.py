@@ -48,9 +48,7 @@ def get(c: httpx.Client, path: str, params: dict[str, Any]) -> httpx.Response:
 
 
 def rows_with_tech(rows: list[dict[str, Any]]) -> int:
-    return sum(
-        1 for a in rows if any(t.get("id") == TECH_ID for t in (a.get("technicians") or []))
-    )
+    return sum(1 for a in rows if any(t.get("id") == TECH_ID for t in (a.get("technicians") or [])))
 
 
 def main() -> int:

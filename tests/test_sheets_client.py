@@ -348,9 +348,7 @@ class TestSheetsClientDepartmentConcurrency:
         techs = client._sync_get_tech_departments()
 
         assert set(techs) == {"tech-1", "tech-2"}
-        assert all(
-            t["tech_name"].lower() != "max concurrency" for t in techs.values()
-        )
+        assert all(t["tech_name"].lower() != "max concurrency" for t in techs.values())
 
     @patch("sheets_client.service_account.Credentials.from_service_account_file")
     @patch("sheets_client.build")

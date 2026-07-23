@@ -52,9 +52,7 @@ def search(c: httpx.Client, body: dict[str, Any]) -> list[dict[str, Any]]:
 
 def with_any(rows: list[dict[str, Any]], tech_ids: set[str]) -> int:
     return sum(
-        1
-        for a in rows
-        if any(t.get("id") in tech_ids for t in (a.get("technicians") or []))
+        1 for a in rows if any(t.get("id") in tech_ids for t in (a.get("technicians") or []))
     )
 
 

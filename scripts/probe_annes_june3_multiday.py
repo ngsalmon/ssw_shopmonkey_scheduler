@@ -103,9 +103,7 @@ def main() -> int:
             name = svc.get("name") or ""
             if "ceramic" in name.lower() and "sedan" in name.lower():
                 detail = get(c, f"/v3/canned_service/{svc['id']}").get("data", {})
-                hours = sum(
-                    float(labor.get("hours") or 0) for labor in detail.get("labors") or []
-                )
+                hours = sum(float(labor.get("hours") or 0) for labor in detail.get("labors") or [])
                 print(f"  {name!r} id={svc['id'][:8]} labor hours={hours}")
 
     return 0

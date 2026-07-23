@@ -966,9 +966,9 @@ async def book_appointment(_: ApiKeyDep, request: BookingRequest):
             if days_probe and len(days_probe) > 1:
                 for future_day, _ in days_probe[1:]:
                     future_date_str = future_day.strftime("%Y-%m-%d")
-                    future_appointments[future_date_str] = (
-                        await _fetch_appointments_with_busy_techs(future_date_str)
-                    )
+                    future_appointments[
+                        future_date_str
+                    ] = await _fetch_appointments_with_busy_techs(future_date_str)
 
             # Re-check availability (inside lock to prevent race conditions).
             # Enriched appointments carry _busyTechIds from labor.technicianId
@@ -1198,9 +1198,7 @@ Booked online via scheduling API."""
             created_appointments: list[dict[str, Any]] = []
             try:
                 for day_index, (seg_start, seg_end) in enumerate(segments):
-                    day_suffix = (
-                        f" (Day {day_index + 1} of {total_days})" if total_days > 1 else ""
-                    )
+                    day_suffix = f" (Day {day_index + 1} of {total_days})" if total_days > 1 else ""
                     if day_index == 0:
                         seg_notes = work_order_notes
                     else:
@@ -1237,9 +1235,7 @@ Booked online via scheduling API."""
                     try:
                         await shopmonkey_client.delete_appointment(created_id)
                     except Exception:
-                        logger.exception(
-                            "appointment_rollback_failed", appointment_id=created_id
-                        )
+                        logger.exception("appointment_rollback_failed", appointment_id=created_id)
                 raise
 
             appointment_id = created_appointments[0].get("id", "")

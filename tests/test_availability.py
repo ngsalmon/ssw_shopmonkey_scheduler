@@ -1118,7 +1118,9 @@ class TestCollectMultidayFutureDates:
     def test_short_service_needs_no_future_dates(self):
         """A 60-min service fits after every hourly start (last start 16:00)."""
         result = collect_multiday_future_dates(
-            datetime(2026, 1, 19), 60, self.CONFIG  # Monday
+            datetime(2026, 1, 19),
+            60,
+            self.CONFIG,  # Monday
         )
         assert result == []
 
@@ -1126,14 +1128,18 @@ class TestCollectMultidayFutureDates:
         """157 min from the 16:00 start rolls into Tuesday - even though it
         is far below the old 5-hour threshold."""
         result = collect_multiday_future_dates(
-            datetime(2026, 1, 19), 157, self.CONFIG  # Monday
+            datetime(2026, 1, 19),
+            157,
+            self.CONFIG,  # Monday
         )
         assert result == ["2026-01-20"]
 
     def test_friday_rollover_skips_weekend(self):
         """Friday rollover lands on Monday, not Saturday."""
         result = collect_multiday_future_dates(
-            datetime(2026, 1, 23), 157, self.CONFIG  # Friday
+            datetime(2026, 1, 23),
+            157,
+            self.CONFIG,  # Friday
         )
         assert result == ["2026-01-26"]  # Monday
 
@@ -1141,13 +1147,17 @@ class TestCollectMultidayFutureDates:
         """A 20-hour service: 09:00 start needs Tue+Wed, 16:00 start needs
         Tue+Wed+Thu. Union covers all three."""
         result = collect_multiday_future_dates(
-            datetime(2026, 1, 19), 1200, self.CONFIG  # Monday
+            datetime(2026, 1, 19),
+            1200,
+            self.CONFIG,  # Monday
         )
         assert result == ["2026-01-20", "2026-01-21", "2026-01-22"]
 
     def test_closed_day_returns_empty(self):
         result = collect_multiday_future_dates(
-            datetime(2026, 1, 24), 157, self.CONFIG  # Saturday
+            datetime(2026, 1, 24),
+            157,
+            self.CONFIG,  # Saturday
         )
         assert result == []
 
