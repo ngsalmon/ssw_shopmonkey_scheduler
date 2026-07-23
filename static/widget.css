@@ -235,16 +235,9 @@ body:not(.embedded) .widget-container {
 /* Category Tabs */
 .category-tabs {
     display: flex;
+    flex-wrap: wrap;
     gap: 8px;
     margin-bottom: 16px;
-    overflow-x: auto;
-    padding-bottom: 4px;
-    scrollbar-width: none;
-    -ms-overflow-style: none;
-}
-
-.category-tabs::-webkit-scrollbar {
-    display: none;
 }
 
 .category-tab {
