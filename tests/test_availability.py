@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from availability import (
     BusinessHours,
+    TimeSlot,
     build_appointment_segments,
     calculate_available_slots,
     calculate_days_needed,
@@ -18,6 +19,7 @@ from availability import (
     check_slot_availability_for_duration,
     collect_multiday_future_dates,
     count_overlapping_appointments,
+    drop_elapsed_slots,
     generate_time_slots,
     get_buffer_minutes,
     get_business_hours,
@@ -1499,3 +1501,44 @@ class TestBuildAppointmentSegments:
             (datetime(2026, 1, 19, 16, 0), datetime(2026, 1, 19, 17, 0)),
             (datetime(2026, 1, 20, 9, 0), datetime(2026, 1, 20, 10, 37)),
         ]
+
+
+class TestDropElapsedSlots:
+    """Tests for drop_elapsed_slots - never offer a slot that has started."""
+
+    @staticmethod
+    def _slots(*hours):
+        return [
+            TimeSlot(
+                start=time(h, 0),
+                end=time(h, 30),
+                available_techs=1,
+                available_tech_ids=["t1"],
+            )
+            for h in hours
+        ]
+
+    def test_today_drops_started_slots_keeps_future(self):
+        """At noon, morning slots drop and only later ones survive."""
+        date = datetime(2026, 1, 20)
+        now = datetime(2026, 1, 20, 12, 0)
+        kept = drop_elapsed_slots(self._slots(9, 10, 12, 13, 14), date, now)
+        assert [s.start for s in kept] == [time(13, 0), time(14, 0)]
+
+    def test_slot_starting_exactly_now_is_dropped(self):
+        """A slot must start strictly in the future to remain bookable."""
+        date = datetime(2026, 1, 20)
+        now = datetime(2026, 1, 20, 10, 0)
+        kept = drop_elapsed_slots(self._slots(10, 11), date, now)
+        assert [s.start for s in kept] == [time(11, 0)]
+
+    def test_past_date_drops_all_slots(self):
+        date = datetime(2026, 1, 19)
+        now = datetime(2026, 1, 20, 8, 0)
+        assert drop_elapsed_slots(self._slots(9, 12, 16), date, now) == []
+
+    def test_future_date_keeps_all_slots(self):
+        date = datetime(2026, 1, 21)
+        now = datetime(2026, 1, 20, 23, 0)
+        slots = self._slots(9, 12, 16)
+        assert drop_elapsed_slots(slots, date, now) == slots

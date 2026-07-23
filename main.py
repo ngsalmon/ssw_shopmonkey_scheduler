@@ -24,6 +24,7 @@ from availability import (
     calculate_days_needed,
     check_slot_availability_for_duration,
     collect_multiday_future_dates,
+    drop_elapsed_slots,
     get_buffer_minutes,
     get_business_hours,
     get_service_duration_minutes,
@@ -83,6 +84,16 @@ booking_lock = asyncio.Lock()
 # Key: department name, Value: index of last assigned tech within that priority group
 # NOTE: Resets on server restart. For persistence, use Redis or database.
 round_robin_tracker: dict[str, dict[int, int]] = {}
+
+
+def _now_local(tz) -> datetime:
+    """Current wall-clock time in the business timezone, as a naive datetime.
+
+    Isolated in one function (rather than calling datetime.now inline) so the
+    elapsed-slot guards can be exercised deterministically in tests by freezing
+    "now", without patching datetime globally.
+    """
+    return datetime.now(tz).replace(tzinfo=None)
 
 
 def build_ootb_booking_name(
@@ -833,6 +844,11 @@ async def get_availability(
             max_concurrency=max_concurrency,
         )
 
+        # Never advertise a slot that has already started (9:00 AM once it's
+        # noon) or any slot on a past date. Compared in the business timezone.
+        now_local = _now_local(get_timezone(config))
+        available_slots = drop_elapsed_slots(available_slots, target_date, now_local)
+
         # Get business hours for the close time
         business_hours = get_business_hours(config, target_date)
         close_time = (
@@ -902,6 +918,23 @@ async def book_appointment(_: ApiKeyDep, request: BookingRequest):
             slot_start_dt = datetime.fromisoformat(request.slot_start.replace("Z", "+00:00"))
             slot_end_dt = datetime.fromisoformat(request.slot_end.replace("Z", "+00:00"))
             date_str = slot_start_dt.strftime("%Y-%m-%d")
+
+            # Reject a slot that has already started (or a past date) before
+            # doing any work. Defense-in-depth mirror of the /availability
+            # elapsed-slot filter, so a stale widget can't book 9:00 AM at noon.
+            tz = get_timezone(config)
+            now_local = _now_local(tz)
+            start_local = (
+                slot_start_dt.astimezone(tz).replace(tzinfo=None)
+                if slot_start_dt.tzinfo is not None
+                else slot_start_dt
+            )
+            if start_local <= now_local:
+                logger.warning("booking_slot_in_past", slot_start=request.slot_start)
+                raise HTTPException(
+                    status_code=409,
+                    detail="That time slot has already passed. Please choose a later time.",
+                )
 
             # Get service and qualified techs using shared helper
             (

@@ -707,6 +707,26 @@ def calculate_available_slots(
     return available_slots
 
 
+def drop_elapsed_slots(
+    slots: list[TimeSlot],
+    date: datetime,
+    now: datetime,
+) -> list[TimeSlot]:
+    """Remove slots that have already started relative to `now`.
+
+    `now` and `date` are naive wall-clock datetimes in the business timezone
+    (the same convention used elsewhere in this module). A slot survives only
+    if its start is strictly in the future:
+
+    - past date  -> every slot's start is <= now, so all are dropped
+    - today      -> only slots that haven't started yet remain
+    - future date-> all starts are > now, so the list is unchanged
+
+    This prevents offering e.g. a 9:00 AM slot once it's already noon.
+    """
+    return [s for s in slots if datetime.combine(date.date(), s.start) > now]
+
+
 def is_slot_available(
     date: datetime,
     slot_start: time,

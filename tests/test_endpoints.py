@@ -2,6 +2,7 @@
 
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -109,6 +110,11 @@ def test_client(mock_shopmonkey_client, mock_sheets_client, mock_config):
             patch("main.SheetsClient", return_value=mock_sheets_client),
             patch("main.load_config", return_value=mock_config),
             patch("main.validate_config"),
+            # Freeze "now" well before every fixture date so the elapsed-slot
+            # guard is a no-op for existing tests (they use 2026-01-15+ dates).
+            # Elapsed-slot behavior is exercised by dedicated tests that
+            # re-patch main._now_local.
+            patch("main._now_local", return_value=datetime(2026, 1, 1, 0, 0, 0)),
         ):
             from main import app
 
@@ -128,6 +134,7 @@ def test_client_with_api_key(mock_shopmonkey_client, mock_sheets_client, mock_co
             patch("main.load_config", return_value=mock_config),
             patch("main.validate_config"),
             patch("main.API_KEY", "test-api-key-123"),
+            patch("main._now_local", return_value=datetime(2026, 1, 1, 0, 0, 0)),
         ):
             from main import app
 
@@ -201,6 +208,17 @@ class TestAvailabilityEndpoint:
         assert data["date"] == "2026-01-19"
         assert "slots" in data
 
+    def test_drops_slots_that_have_already_started_today(self, test_client):
+        """Slots whose start time is in the past for today are not offered."""
+        # It's noon on the requested day; morning slots have elapsed.
+        with patch("main._now_local", return_value=datetime(2026, 1, 19, 12, 0, 0)):
+            response = test_client.get("/availability?service_id=svc-1&date=2026-01-19")
+        assert response.status_code == 200
+        starts = [s["start"] for s in response.json()["slots"]]
+        assert starts, "expected some afternoon slots to remain"
+        assert "09:00" not in starts
+        assert all(s > "12:00" for s in starts)
+
     def test_invalid_date_format_returns_400(self, test_client):
         """Should return 400 for invalid date format."""
         response = test_client.get("/availability?service_id=svc-1&date=invalid")
@@ -271,6 +289,24 @@ class TestBookEndpoint:
         assert "appointment_id" in data
         assert "confirmation_number" in data
         assert data["confirmation_number"].startswith("SM-")
+
+    def test_rejects_booking_for_elapsed_slot(self, test_client, mock_shopmonkey_client):
+        """A slot whose start is already in the past is rejected with 409,
+        before any customer/vehicle/appointment work happens."""
+        booking_request = {
+            "service_id": "svc-1",
+            "slot_start": "2026-01-19T09:00:00",
+            "slot_end": "2026-01-19T10:00:00",
+            "customer": {"firstName": "Test", "lastName": "Customer"},
+            "vehicle": {"year": 2022, "make": "Toyota", "model": "Camry"},
+        }
+        # Now is noon on the same day -> the 9:00 AM slot has elapsed.
+        with patch("main._now_local", return_value=datetime(2026, 1, 19, 12, 0, 0)):
+            response = test_client.post("/book", json=booking_request)
+        assert response.status_code == 409
+        assert "already passed" in response.json()["detail"].lower()
+        # Fail-fast: no booking side effects occurred.
+        mock_shopmonkey_client.create_appointment.assert_not_called()
 
     def test_booking_creates_customer(self, test_client, mock_shopmonkey_client):
         """Should call find_or_create_customer with correct data."""
@@ -403,6 +439,7 @@ class TestBookEndpoint:
                 patch("main.SheetsClient", return_value=mock_sheets_client),
                 patch("main.load_config", return_value=config_with_flag),
                 patch("main.validate_config"),
+                patch("main._now_local", return_value=datetime(2026, 1, 1, 0, 0, 0)),
             ):
                 from main import app
 
@@ -515,6 +552,7 @@ class TestBookEndpoint:
                 patch("main.SheetsClient", return_value=mock_sheets_client),
                 patch("main.load_config", return_value=config_with_flag),
                 patch("main.validate_config"),
+                patch("main._now_local", return_value=datetime(2026, 1, 1, 0, 0, 0)),
             ):
                 from main import app
 
