@@ -50,6 +50,7 @@
         windowTint: { label: 'Window Tint', priority: 3 },
         alignment: { label: 'Alignment', priority: 4 },
         detail: { label: 'Detail', priority: 5 },
+        quickServices: { label: 'Quick Services', priority: 6 },
         other: { label: 'Other', priority: 99 }
     };
 
@@ -82,6 +83,8 @@
             result.categoryKey = 'alignment';
         } else if (lowerCategory.includes('detail') || lowerName.startsWith('detail')) {
             result.categoryKey = 'detail';
+        } else if (lowerCategory.includes('quick service') || lowerName.includes('oil change')) {
+            result.categoryKey = 'quickServices';
         }
 
         // Parse Window Tint services: "Window Tint - [Area] - [Type]"
@@ -388,6 +391,7 @@
             windowTint: [],
             alignment: [],
             detail: [],
+            quickServices: [],
             other: []
         };
 
@@ -513,7 +517,7 @@
     function renderSubFilters(services, categoryKey) {
         if (!elements.subFilters) return;
 
-        if (!categoryKey || categoryKey === 'alignment' || categoryKey === 'other') {
+        if (!categoryKey || categoryKey === 'alignment' || categoryKey === 'other' || categoryKey === 'quickServices') {
             elements.subFilters.innerHTML = '';
             elements.subFilters.style.display = 'none';
             return;
