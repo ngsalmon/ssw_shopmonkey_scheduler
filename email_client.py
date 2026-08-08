@@ -40,9 +40,24 @@ class EmailConfig:
         if not all([host, username, password, notification_email]):
             return None
 
+        # os.getenv's default only applies when the key is ABSENT, but
+        # .env.example ships an SMTP_PORT line, so present-but-empty is the
+        # normal state of a copied .env. Treat blank as unset; treat genuinely
+        # malformed as "disable email" rather than letting ValueError escape.
+        # get_email_client() runs AFTER the appointment is created, so an
+        # exception here surfaces as a 500 on a booking that actually
+        # succeeded - the customer then retries and double-books a slot they
+        # already hold. Email problems must never affect the booking flow.
+        raw_port = (os.getenv("SMTP_PORT") or "").strip()
+        try:
+            port = int(raw_port) if raw_port else 587
+        except ValueError:
+            logger.warning("invalid_smtp_port_email_disabled", smtp_port=raw_port)
+            return None
+
         return cls(
             host=host,
-            port=int(os.getenv("SMTP_PORT", "587")),
+            port=port,
             username=username,
             password=password,
             use_tls=os.getenv("SMTP_USE_TLS", "true").lower() == "true",

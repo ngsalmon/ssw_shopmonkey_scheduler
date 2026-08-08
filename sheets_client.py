@@ -28,9 +28,12 @@ class SheetsClient:
     # row that holds per-department maximum service concurrency instead of a
     # technician. Matched case-insensitively so the sheet can read
     # "MAX CONCURRENCY", "Max Concurrency", etc.
-    MAX_CONCURRENCY_ROW_NAMES = frozenset(
-        {"max concurrency", "max_concurrency", "concurrency", "max"}
-    )
+    # Deliberately does NOT include the bare "max": it is a real person's name,
+    # and a technician called Max would be silently dropped from the roster
+    # while his per-department priority numbers were promoted into shop-wide
+    # concurrency caps. Every sentinel here has to be a phrase no human is
+    # plausibly named.
+    MAX_CONCURRENCY_ROW_NAMES = frozenset({"max concurrency", "max_concurrency", "concurrency"})
 
     def __init__(
         self,
@@ -196,10 +199,10 @@ class SheetsClient:
                 status_col_index = i
                 break
 
-        # Department columns are from index 3 up to (but not including) status column
-        dept_start_index = 3
-        dept_end_index = status_col_index if status_col_index else len(header)
-        department_names = [d.strip() for d in header[dept_start_index:dept_end_index] if d.strip()]
+        # Department columns are from index 3 up to (but not including) status
+        # column, each paired with its ABSOLUTE index so a blank spacer column
+        # can't shift every department to its right (see _department_columns).
+        department_columns = self._department_columns(header)
 
         result = {}
         for row in rows[1:]:
@@ -233,8 +236,7 @@ class SheetsClient:
 
                 # Parse department priorities (0=not qualified, 1+=priority, lower=higher)
                 departments = {}
-                for i, dept_name in enumerate(department_names):
-                    col_index = dept_start_index + i
+                for dept_name, col_index in department_columns:
                     if col_index < len(row):
                         value = row[col_index].strip().upper()
                         # Support both old boolean format and new priority format
@@ -344,6 +346,24 @@ class SheetsClient:
         dept_end_index = status_col_index if status_col_index else len(header)
         return dept_start_index, dept_end_index
 
+    def _department_columns(self, header: list[str]) -> list[tuple[str, int]]:
+        """Return [(department_name, absolute_column_index), ...] for a header.
+
+        The name and its column index MUST travel together. Deriving the index
+        from a department's position in a blank-filtered name list is wrong the
+        moment the sheet contains a spacer column: every department to the right
+        of the blank reads its neighbour's cell, so techs appear qualified for
+        the wrong department and concurrency caps land on the wrong one. The
+        failure is silent - a department simply shows zero qualified techs and
+        never offers availability - and it is armed by any future column edit.
+        """
+        start, end = self._department_column_span(header)
+        return [
+            (name.strip(), index)
+            for index, name in enumerate(header[start:end], start=start)
+            if name.strip()
+        ]
+
     def _sync_get_all_departments(self) -> list[str]:
         """Synchronous implementation of get_all_departments."""
         range_name = f"'{self.TECH_DEPARTMENTS_TAB}'!A1:Z1"
@@ -386,8 +406,7 @@ class SheetsClient:
             return {}
 
         header = rows[0]
-        dept_start_index, dept_end_index = self._department_column_span(header)
-        department_names = [d.strip() for d in header[dept_start_index:dept_end_index] if d.strip()]
+        department_columns = self._department_columns(header)
 
         for row in rows[1:]:
             if not row:
@@ -396,8 +415,7 @@ class SheetsClient:
                 continue
 
             caps: dict[str, int] = {}
-            for i, dept_name in enumerate(department_names):
-                col_index = dept_start_index + i
+            for dept_name, col_index in department_columns:
                 if col_index < len(row):
                     cap = self._parse_concurrency_value(row[col_index])
                     if cap is not None:

@@ -330,6 +330,16 @@ def calculate_days_needed(
     close_dt = datetime.combine(start_date.date(), business_hours.close_time)
     minutes_until_close = int((close_dt - start_dt).total_seconds() / 60)
 
+    # A start at or after closing leaves no working minutes on day 1. Falling
+    # through would make minutes_until_close negative, so the caller would build
+    # a first segment whose end precedes its start and then bill the "remaining"
+    # duration to a spurious continuation day - corrupt data written into
+    # Shopmonkey. /availability never offers such a start, but /book takes
+    # slot_start from the client, so a stale widget or hand-crafted request
+    # reaches here. Refuse instead (the caller turns this into a 409).
+    if minutes_until_close <= 0:
+        return None
+
     # If service fits in first day, return single day
     if duration_minutes <= minutes_until_close:
         return [(start_date, duration_minutes)]
@@ -494,7 +504,13 @@ def count_multiday_overlap_capacity(
 
     # Preserve qualified order in the returned free list
     free_in_order = [t for t in tech_ids if t in free_set]
-    return max(min_capacity, 0), free_in_order
+    # A multi-day booking needs ONE tech free on every spanned day, so capacity
+    # can never exceed the size of the cross-day intersection. Without this the
+    # two halves of the return value disagree: with techs {A} free on day 1 and
+    # {B} on day 2, the bottleneck day reports capacity 1 while the intersection
+    # is empty, so /availability advertises the slot and /book confirms it with
+    # no technician assigned.
+    return max(min(min_capacity, len(free_in_order)), 0), free_in_order
 
 
 def collect_multiday_future_dates(
@@ -860,7 +876,11 @@ def get_service_duration_minutes(service: dict[str, Any], default_duration: int 
             except (ValueError, TypeError):
                 pass
         if total_hours > 0:
-            return int(total_hours * 60)
+            # round(), not int(): binary floating point makes some exact
+            # quarter-hours land just under their true product (2.05 * 60 is
+            # 122.99999999999999), and truncating there under-books the service
+            # by a minute on every appointment of that duration.
+            return round(total_hours * 60)
 
     # Fallback: try common field names for duration
     duration = (

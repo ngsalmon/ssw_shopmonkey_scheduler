@@ -2006,3 +2006,140 @@ class TestDropElapsedSlots:
         now = datetime(2026, 1, 20, 23, 0)
         slots = self._slots(9, 12, 16)
         assert drop_elapsed_slots(slots, date, now) == slots
+
+
+class TestMultidayCapacityMatchesTheTechList:
+    """Regression: capacity and the free-tech list must agree.
+
+    A multi-day service needs ONE tech free on every spanned day, so
+    `count_multiday_overlap_capacity` returns the cross-day INTERSECTION. The
+    capacity number used to come from the bottleneck day alone, so with
+    different techs free on different days it reported spare capacity
+    alongside an empty tech list - /availability advertised the slot and /book
+    confirmed it with nobody assigned.
+    """
+
+    CONFIG = {
+        "business_hours": {
+            "monday": {"open": "09:00", "close": "17:00"},
+            "tuesday": {"open": "09:00", "close": "17:00"},
+        },
+        "default_slot_duration_minutes": 60,
+    }
+
+    def _busy(self, date_str, tech):
+        return [
+            {
+                "orderId": f"ord_{tech}",
+                "startDate": f"{date_str}T09:00:00-06:00",
+                "endDate": f"{date_str}T17:00:00-06:00",
+                "_busyTechIds": [tech],
+            }
+        ]
+
+    def test_no_capacity_when_no_single_tech_spans_every_day(self):
+        """tech1 is booked solid Monday, tech2 solid Tuesday. Each day has one
+        tech free, but nobody is free BOTH days, so the slot is unbookable."""
+        days_needed = [(datetime(2026, 1, 19), 480), (datetime(2026, 1, 20), 60)]
+        capacity, free = count_multiday_overlap_capacity(
+            days_needed=days_needed,
+            first_day_appointments=self._busy("2026-01-19", "tech1"),
+            first_day_start_time=time(9, 0),
+            first_day_close_time=time(17, 0),
+            future_appointments={"2026-01-20": self._busy("2026-01-20", "tech2")},
+            config=self.CONFIG,
+            tech_ids=["tech1", "tech2"],
+        )
+        assert free == []
+        # The bug: bottleneck day reported 1 while the intersection was empty.
+        assert capacity == 0
+
+    def test_capacity_still_offered_when_one_tech_spans_every_day(self):
+        """The guard must not suppress genuinely bookable multi-day slots."""
+        days_needed = [(datetime(2026, 1, 19), 480), (datetime(2026, 1, 20), 60)]
+        capacity, free = count_multiday_overlap_capacity(
+            days_needed=days_needed,
+            first_day_appointments=self._busy("2026-01-19", "tech1"),
+            first_day_start_time=time(9, 0),
+            first_day_close_time=time(17, 0),
+            future_appointments={"2026-01-20": self._busy("2026-01-20", "tech1")},
+            config=self.CONFIG,
+            tech_ids=["tech1", "tech2"],
+        )
+        assert free == ["tech2"]
+        assert capacity == 1
+
+    def test_booking_recheck_refuses_the_split_tech_slot(self):
+        """End to end through the /book re-check path."""
+        ok, free, _ = check_slot_availability_for_duration(
+            date=datetime(2026, 1, 19),
+            slot_start=time(16, 0),
+            duration_minutes=120,  # spills into Tuesday
+            tech_ids=["tech1", "tech2"],
+            appointments=self._busy("2026-01-19", "tech1"),
+            future_appointments={"2026-01-20": self._busy("2026-01-20", "tech2")},
+            config=self.CONFIG,
+        )
+        assert ok is False
+        assert free == []
+
+
+class TestStartAfterCloseIsRefused:
+    """Regression: /book takes slot_start from the client, and a start at or
+    after closing produced a NEGATIVE first-day duration - an appointment whose
+    end preceded its start, written into Shopmonkey, plus a spurious
+    continuation day billed the "remaining" minutes.
+    """
+
+    CONFIG = {
+        "business_hours": {
+            "monday": {"open": "09:00", "close": "17:00"},
+            "tuesday": {"open": "09:00", "close": "17:00"},
+        },
+        "default_slot_duration_minutes": 60,
+    }
+
+    def test_start_after_close_has_no_segmentation(self):
+        assert calculate_days_needed(60, datetime(2026, 1, 19), time(17, 30), self.CONFIG) is None
+
+    def test_start_exactly_at_close_has_no_segmentation(self):
+        """Closing time itself leaves zero working minutes."""
+        assert calculate_days_needed(60, datetime(2026, 1, 19), time(17, 0), self.CONFIG) is None
+
+    def test_booking_recheck_refuses_a_post_close_start(self):
+        ok, free, days = check_slot_availability_for_duration(
+            date=datetime(2026, 1, 19),
+            slot_start=time(17, 30),
+            duration_minutes=60,
+            tech_ids=["tech1"],
+            appointments=[],
+            future_appointments={},
+            config=self.CONFIG,
+        )
+        assert ok is False
+        assert free == []
+        assert days == []
+
+    def test_last_bookable_minute_still_works(self):
+        """One minute before close must still segment, or the guard is too broad."""
+        days = calculate_days_needed(60, datetime(2026, 1, 19), time(16, 59), self.CONFIG)
+        assert days is not None
+        assert days[0][0] == datetime(2026, 1, 19)
+
+
+class TestDurationRounding:
+    """Regression: `int(total_hours * 60)` truncated, and binary floating point
+    puts some exact quarter-hours just under their true product, under-booking
+    the service by a minute on every appointment of that duration.
+    """
+
+    def test_fractional_hours_do_not_lose_a_minute(self):
+        # 2.05 * 60 == 122.99999999999999 in IEEE 754.
+        assert get_service_duration_minutes({"labors": [{"hours": 2.05}]}) == 123
+
+    def test_summed_labors_do_not_lose_a_minute(self):
+        assert get_service_duration_minutes({"labors": [{"hours": 1.1}, {"hours": 0.95}]}) == 123
+
+    def test_whole_hours_are_unchanged(self):
+        assert get_service_duration_minutes({"labors": [{"hours": 2}]}) == 120
+        assert get_service_duration_minutes({"labors": [{"hours": 2.5}]}) == 150

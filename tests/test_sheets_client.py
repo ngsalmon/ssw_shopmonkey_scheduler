@@ -1406,3 +1406,104 @@ class TestGetSheetsClientFactory:
                     module.get_sheets_client()
         finally:
             module.get_sheets_client.cache_clear()
+
+
+class TestBlankSpacerColumnDoesNotShiftDepartments:
+    """Regression: department names were filtered for blanks but each name's
+    column index was re-derived from its position in the FILTERED list, so one
+    empty spacer column shifted every department to its right by one. Silent:
+    a department just reads its neighbour's cell and can show zero qualified
+    techs forever. Armed by any future spreadsheet edit.
+    """
+
+    # Column E (index 4) is an empty spacer. Vinyl is at index 3, Tint at 5.
+    SHEET = {
+        "values": [
+            ["Name", "ID", "Primary Role", "Vinyl", "", "Tint", "Status"],
+            ["John", "tech-1", "Technician", "1", "", "2", "Active"],
+            ["MAX CONCURRENCY", "", "", "2", "", "3", ""],
+        ]
+    }
+
+    def _client(self, mock_build, values):
+        from sheets_client import SheetsClient
+
+        mock_service = MagicMock()
+        mock_build.return_value = mock_service
+        mock_service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = values
+        return SheetsClient(spreadsheet_id="test-id", credentials_path="test.json")
+
+    @patch("sheets_client.service_account.Credentials.from_service_account_file")
+    @patch("sheets_client.build")
+    def test_tech_qualifications_read_the_right_columns(self, mock_build, mock_creds):
+        """Tint sits right of the spacer; it must read index 5, not index 4."""
+        client = self._client(mock_build, self.SHEET)
+        techs = client._sync_get_tech_departments()
+
+        assert techs["tech-1"]["departments"] == {"Vinyl": 1, "Tint": 2}
+
+    @patch("sheets_client.service_account.Credentials.from_service_account_file")
+    @patch("sheets_client.build")
+    def test_concurrency_caps_read_the_right_columns(self, mock_build, mock_creds):
+        """The cap row is shifted by the same bug, so Tint would lose its cap."""
+        client = self._client(mock_build, self.SHEET)
+
+        assert client._sync_get_department_concurrency() == {"Vinyl": 2, "Tint": 3}
+
+    @patch("sheets_client.service_account.Credentials.from_service_account_file")
+    @patch("sheets_client.build")
+    def test_department_list_still_omits_the_spacer(self, mock_build, mock_creds):
+        """The blank column is not itself a department."""
+        client = self._client(mock_build, self.SHEET)
+
+        assert client._sync_get_all_departments() == ["Vinyl", "Tint"]
+
+
+class TestTechnicianNamedMaxIsNotASentinel:
+    """Regression: the MAX CONCURRENCY sentinel set contained the bare "max",
+    so a technician actually named Max was silently dropped from the roster AND
+    his per-department priorities were read as shop-wide concurrency caps.
+    """
+
+    SHEET = {
+        "values": [
+            ["Name", "ID", "Primary Role", "Vinyl", "Tint", "Status"],
+            ["Max", "tech-max", "Technician", "1", "2", "Active"],
+            ["MAX CONCURRENCY", "", "", "4", "5", ""],
+        ]
+    }
+
+    def _client(self, mock_build, values):
+        from sheets_client import SheetsClient
+
+        mock_service = MagicMock()
+        mock_build.return_value = mock_service
+        mock_service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = values
+        return SheetsClient(spreadsheet_id="test-id", credentials_path="test.json")
+
+    @patch("sheets_client.service_account.Credentials.from_service_account_file")
+    @patch("sheets_client.build")
+    def test_max_stays_on_the_roster(self, mock_build, mock_creds):
+        client = self._client(mock_build, self.SHEET)
+        techs = client._sync_get_tech_departments()
+
+        assert "tech-max" in techs, "a tech named Max must not be eaten by the sentinel"
+        assert techs["tech-max"]["tech_name"] == "Max"
+        assert techs["tech-max"]["departments"] == {"Vinyl": 1, "Tint": 2}
+
+    @patch("sheets_client.service_account.Credentials.from_service_account_file")
+    @patch("sheets_client.build")
+    def test_his_priorities_are_not_read_as_shop_caps(self, mock_build, mock_creds):
+        """Caps must come from the real sentinel row, not from Max's priorities."""
+        client = self._client(mock_build, self.SHEET)
+
+        assert client._sync_get_department_concurrency() == {"Vinyl": 4, "Tint": 5}
+
+    @patch("sheets_client.service_account.Credentials.from_service_account_file")
+    @patch("sheets_client.build")
+    def test_the_real_sentinel_row_is_still_recognised(self, mock_build, mock_creds):
+        """Narrowing the sentinel set must not break the actual cap row."""
+        client = self._client(mock_build, self.SHEET)
+        techs = client._sync_get_tech_departments()
+
+        assert all(t["tech_name"].lower() != "max concurrency" for t in techs.values())

@@ -349,7 +349,22 @@ class ShopmonkeyClient:
             target_digits = "".join(ch for ch in phone if ch.isdigit())
             for entry in customer.get("phoneNumbers") or []:
                 entry_digits = "".join(ch for ch in (entry.get("number") or "") if ch.isdigit())
-                if entry_digits and entry_digits.endswith(target_digits[-10:]):
+                if not entry_digits:
+                    continue
+                # Suffix matching exists to make "+1 816 555 1234", "816-555-1234"
+                # and "8165551234" the same person, so it needs a full national
+                # number to be meaningful. Below 10 digits the suffix is too weak
+                # to establish identity: "5551234" would match a DIFFERENT
+                # same-named customer's +19995551234, and an empty target
+                # (a phone with no digits at all) would match every customer who
+                # has any phone number, since "".endswith("") is True. Both
+                # silently attach a booking to the wrong person - the same class
+                # of misattribution this function was rewritten to prevent - so
+                # short inputs require exact equality instead.
+                if len(target_digits) >= 10:
+                    if entry_digits.endswith(target_digits[-10:]):
+                        return True
+                elif target_digits and entry_digits == target_digits:
                     return True
         return False
 

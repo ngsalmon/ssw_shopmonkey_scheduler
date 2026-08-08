@@ -393,3 +393,54 @@ class TestGetEmailClient:
         second = get_email_client()
 
         assert first is second
+
+
+class TestSmtpPortIsNeverFatal:
+    """Regression: a bad SMTP_PORT used to raise ValueError out of from_env().
+
+    get_email_client() runs AFTER the appointment has been created, so the
+    exception surfaced as a 500 on a booking that actually succeeded - the
+    customer then retried and double-booked a slot they already held. Worse,
+    .env.example ships an SMTP_PORT line, so present-but-empty (which
+    os.getenv's default does NOT cover) is the normal state of a copied .env.
+    """
+
+    def _configure(self, monkeypatch):
+        monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
+        monkeypatch.setenv("SMTP_USER", "user@example.com")
+        monkeypatch.setenv("SMTP_PASSWORD", "secret")
+        monkeypatch.setenv("NOTIFICATION_EMAIL", "shop@example.com")
+
+    @pytest.mark.parametrize("blank", ["", "   "])
+    def test_blank_port_falls_back_to_the_default(self, clean_smtp_env, monkeypatch, blank):
+        """Present-but-empty means "unset", not "broken" - mail stays enabled."""
+        self._configure(monkeypatch)
+        monkeypatch.setenv("SMTP_PORT", blank)
+
+        config = EmailConfig.from_env()
+
+        assert config is not None, "a blank port must not disable notifications"
+        assert config.port == 587
+
+    @pytest.mark.parametrize("bad", ["abc", "58 7", "5.87"])
+    def test_malformed_port_disables_email_instead_of_raising(
+        self, clean_smtp_env, monkeypatch, bad
+    ):
+        """A genuinely malformed port turns notifications off. It must NOT
+        raise: booking must never fail because of the mailer."""
+        self._configure(monkeypatch)
+        monkeypatch.setenv("SMTP_PORT", bad)
+
+        config = EmailConfig.from_env()  # must not raise
+
+        assert config is None
+
+    def test_valid_port_is_still_honoured(self, clean_smtp_env, monkeypatch):
+        """The guard must not swallow a correctly configured port."""
+        self._configure(monkeypatch)
+        monkeypatch.setenv("SMTP_PORT", "2525")
+
+        config = EmailConfig.from_env()
+
+        assert config is not None
+        assert config.port == 2525

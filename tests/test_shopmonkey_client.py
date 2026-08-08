@@ -1416,3 +1416,53 @@ class TestGetAppointmentsForDateExtras:
         with patch.object(client, "_get_client", return_value=mock_client):
             assert await client.get_appointments_for_date("2026-05-27") == [{"id": "appt-1"}]
         await client.close()
+
+
+class TestCustomerPhoneMatchingRequiresAFullNumber:
+    """Regression: `entry_digits.endswith(target_digits[-10:])` had no minimum
+    length, so a short phone matched on suffix alone and a digit-free phone
+    matched ANY customer holding any number at all. Both silently attach a
+    booking to the wrong person - the misattribution class this function was
+    rewritten to prevent.
+    """
+
+    def _customer(self, number, email=None):
+        return {
+            "id": "cust-existing",
+            "firstName": "Jane",
+            "lastName": "Doe",
+            "emails": [{"email": email}] if email else [],
+            "phoneNumbers": [{"number": number}],
+        }
+
+    def test_seven_digit_local_number_does_not_match_a_different_number(self):
+        """validate_phone accepts 7 digits, so "555-1234" reaches here. It must
+        not suffix-match a different person's +19995551234."""
+        assert (
+            ShopmonkeyClient._customer_matches(self._customer("+19995551234"), None, "555-1234")
+            is False
+        )
+
+    def test_phone_with_no_digits_matches_nobody(self):
+        """ "".endswith("") is True, which previously matched every customer."""
+        assert (
+            ShopmonkeyClient._customer_matches(self._customer("+19998887777"), None, "call my cell")
+            is False
+        )
+
+    def test_short_number_still_matches_itself_exactly(self):
+        """Below 10 digits we require exact equality rather than no match at
+        all, so a shop that stores extensions still resolves them."""
+        assert ShopmonkeyClient._customer_matches(self._customer("5551234"), None, "555-1234")
+
+    def test_full_national_number_still_matches_across_formats(self):
+        """The whole point of suffix matching: +1/dashes/bare are one person."""
+        cust = self._customer("+18165551234")
+        for written in ("+1 816 555 1234", "816-555-1234", "8165551234", "(816) 555-1234"):
+            assert ShopmonkeyClient._customer_matches(cust, None, written), written
+
+    def test_different_full_numbers_still_do_not_match(self):
+        assert (
+            ShopmonkeyClient._customer_matches(self._customer("+18165551234"), None, "816-555-9999")
+            is False
+        )

@@ -1026,6 +1026,27 @@ async def book_appointment(_: ApiKeyDep, request: BookingRequest):
                 department=department,
             )
 
+            if not assigned_tech_id:
+                # Defense in depth. count_multiday_overlap_capacity now derives
+                # capacity from the same cross-day intersection it returns, so
+                # an available slot always has at least one tech and this should
+                # be unreachable. Refuse anyway rather than book unassigned: the
+                # customer would hold a confirmation for work nobody is
+                # scheduled to do, and because no labor would carry a
+                # technicianId the next availability pass would read the booking
+                # as unattributed shop capacity instead of a specific tech hold.
+                logger.error(
+                    "no_tech_available_after_recheck",
+                    slot_start=request.slot_start,
+                    department=department,
+                    days_spanned=len(days_needed),
+                    qualified_count=len(qualified_techs),
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail="The selected time slot is no longer available",
+                )
+
             # Find or create customer
             logger.debug("creating_customer")
             customer = await shopmonkey_client.find_or_create_customer(
@@ -1254,9 +1275,19 @@ Booked online via scheduling API."""
                 appointment_count=len(created_appointments),
             )
 
-            # Send email notification (fire-and-forget, doesn't block response)
-            email_client = get_email_client()
-            if email_client.enabled:
+            # Send email notification (fire-and-forget, doesn't block response).
+            # Wrapped because everything from here on runs AFTER the appointment
+            # exists in Shopmonkey: any exception would surface as a 500 on a
+            # booking that actually succeeded, and the customer would retry and
+            # double-book a slot they already hold. A failed notification is a
+            # staffing inconvenience; a lost confirmation is a customer problem.
+            try:
+                email_client = get_email_client()
+            except Exception:
+                logger.exception("email_client_init_failed", confirmation=confirmation_number)
+                email_client = None
+
+            if email_client is not None and email_client.enabled:
                 booking_details = BookingDetails(
                     confirmation_number=confirmation_number,
                     service_name=service_name,

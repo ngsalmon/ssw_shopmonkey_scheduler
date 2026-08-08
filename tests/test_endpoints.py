@@ -2110,3 +2110,73 @@ class TestModuleHelpers:
         with patch("main.static_dir", "/nonexistent-static-dir"):
             response = test_client.get("/schedule")
         assert response.status_code == 404
+
+
+class TestBookingNeverConfirmsWithoutATechnician:
+    """Regression guard for the multi-day no-technician booking.
+
+    Capacity now derives from the same cross-day intersection it returns, so an
+    available slot always has at least one tech and this guard should be
+    unreachable. It is kept because confirming unassigned is bad enough to
+    warrant defense in depth: the customer holds a confirmation for work nobody
+    is scheduled to do, and because no labor carries a technicianId the next
+    availability pass reads the booking as unattributed shop capacity rather
+    than a specific tech hold, so the error compounds.
+    """
+
+    BOOKING = {
+        "service_id": "svc-1",
+        "slot_start": "2026-01-19T09:00:00",
+        "slot_end": "2026-01-19T10:00:00",
+        "customer": {"firstName": "Test", "lastName": "User"},
+        "vehicle": {"year": 2022, "make": "Toyota", "model": "Camry"},
+    }
+
+    def test_refuses_when_no_tech_can_be_selected(self, test_client, mock_shopmonkey_client):
+        with patch("main.select_tech_by_priority", return_value=None):
+            response = test_client.post("/book", json=self.BOOKING)
+
+        assert response.status_code == 409
+        assert "no longer available" in response.json()["detail"]
+
+    def test_writes_nothing_when_no_tech_can_be_selected(self, test_client, mock_shopmonkey_client):
+        """The refusal must happen BEFORE any record is created, or we leak an
+        orphan customer/vehicle for a booking that never completes."""
+        with patch("main.select_tech_by_priority", return_value=None):
+            test_client.post("/book", json=self.BOOKING)
+
+        mock_shopmonkey_client.create_appointment.assert_not_called()
+        mock_shopmonkey_client.find_or_create_customer.assert_not_called()
+        mock_shopmonkey_client.find_or_create_vehicle.assert_not_called()
+
+    def test_normal_booking_still_succeeds(self, test_client):
+        """The guard must not block bookings that do have a tech."""
+        response = test_client.post("/book", json=self.BOOKING)
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+
+
+class TestNotificationFailureNeverLosesTheBooking:
+    """Regression: everything after the appointment is created must not be able
+    to fail the request. get_email_client() runs post-creation, so an exception
+    there returned a 500 for a booking that actually succeeded - and the
+    customer retried, double-booking a slot they already held.
+    """
+
+    BOOKING = {
+        "service_id": "svc-1",
+        "slot_start": "2026-01-19T09:00:00",
+        "slot_end": "2026-01-19T10:00:00",
+        "customer": {"firstName": "Test", "lastName": "User"},
+        "vehicle": {"year": 2022, "make": "Toyota", "model": "Camry"},
+    }
+
+    def test_mailer_init_failure_still_confirms_the_booking(self, test_client):
+        """A broken mailer is a staffing inconvenience, not a customer problem."""
+        with patch("main.get_email_client", side_effect=ValueError("bad SMTP_PORT")):
+            response = test_client.post("/book", json=self.BOOKING)
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["success"] is True
+        assert body["confirmation_number"]
