@@ -204,7 +204,9 @@ class TestCountOverlappingAppointments:
         )
 
     def test_ignores_block_without_order_id(self):
-        """Time-off / lunch / PTO blocks lack orderId and must not count."""
+        """This shop-level counter deliberately counts only ticketed work, so
+        ticketless blocks don't count here. Whether a block makes a specific
+        TECH unavailable is `get_overlap_info_for_slot`'s job, not this one."""
         appointments = [
             {
                 # No orderId - this is e.g. "Robert Out" or "Lunch".
@@ -365,8 +367,9 @@ class TestCalculateAvailableSlots:
         assert len(slots) == 1
         assert slots[0].available_techs == 1
 
-    def test_blocks_without_order_id_do_not_consume_capacity(self):
-        """Calendar blocks (lunch / PTO) without orderId must not reduce capacity."""
+    def test_blocks_naming_no_tech_do_not_consume_capacity(self):
+        """A ticketless entry that names nobody (a shop-wide "Cars & Coffee")
+        blocks no one, so the slot stays fully available."""
         config = {
             "business_hours": {
                 "monday": {"open": "09:00", "close": "10:00"},
@@ -375,10 +378,10 @@ class TestCalculateAvailableSlots:
         }
         appointments = [
             {
-                # "Robert Out"-style block: no orderId.
+                # No orderId and no tech assigned.
                 "startDate": "2026-01-19T09:00:00-06:00",
                 "endDate": "2026-01-19T10:00:00-06:00",
-                "name": "Tech Out",
+                "name": "Cars & Coffee",
             }
         ]
         slots = calculate_available_slots(
@@ -389,6 +392,32 @@ class TestCalculateAvailableSlots:
         )
         assert len(slots) == 1
         assert slots[0].available_techs == 1
+
+    def test_time_off_block_removes_the_only_tech_and_drops_the_slot(self):
+        """The reported bug, end to end: the shop's only qualified tech is out
+        on a ticketless block, so the slot must not be offered at all."""
+        config = {
+            "business_hours": {
+                "monday": {"open": "09:00", "close": "10:00"},
+            },
+            "default_slot_duration_minutes": 60,
+        }
+        appointments = [
+            {
+                # "Robert Out"-style block: no orderId, but names the tech.
+                "startDate": "2026-01-19T09:00:00-06:00",
+                "endDate": "2026-01-19T10:00:00-06:00",
+                "name": "Tech Out",
+                "_busyTechIds": ["tech1"],
+            }
+        ]
+        slots = calculate_available_slots(
+            date=datetime(2026, 1, 19),
+            tech_ids=["tech1"],
+            appointments=appointments,
+            config=config,
+        )
+        assert slots == []
 
 
 class TestIsSlotAvailable:
@@ -451,13 +480,13 @@ class TestIsSlotAvailable:
         assert is_avail is False
         assert tech_ids == []
 
-    def test_block_without_order_id_does_not_consume_capacity(self):
-        """A calendar block (no orderId) leaves the slot free."""
+    def test_block_naming_no_tech_does_not_consume_capacity(self):
+        """A ticketless entry naming nobody leaves the slot free."""
         appointments = [
             {
                 "startDate": "2026-01-19T09:00:00-06:00",
                 "endDate": "2026-01-19T10:00:00-06:00",
-                "name": "Tech Out",
+                "name": "Cars & Coffee",
             }
         ]
         is_avail, tech_ids = is_slot_available(
@@ -469,6 +498,28 @@ class TestIsSlotAvailable:
         )
         assert is_avail is True
         assert tech_ids == ["tech1"]
+
+    def test_time_off_block_fails_the_booking_recheck(self):
+        """/book re-validates through this path inside the lock. A tech who
+        went out after the slot was advertised must fail the re-check rather
+        than get booked."""
+        appointments = [
+            {
+                "startDate": "2026-01-19T09:00:00-06:00",
+                "endDate": "2026-01-19T10:00:00-06:00",
+                "name": "Tech Out",
+                "_busyTechIds": ["tech1"],
+            }
+        ]
+        is_avail, tech_ids = is_slot_available(
+            date=datetime(2026, 1, 19),
+            slot_start=time(9, 0),
+            slot_end=time(10, 0),
+            tech_ids=["tech1"],
+            appointments=appointments,
+        )
+        assert is_avail is False
+        assert tech_ids == []
 
 
 class TestGetServiceDurationMinutes:
@@ -887,14 +938,17 @@ class TestPerTechAvailability:
                 busy=["tech_alex"],
             )
         ]
-        busy, unattributed = get_overlap_info_for_slot(
+        unavailable, working, unattributed = get_overlap_info_for_slot(
             time(9, 0), time(10, 0), datetime(2026, 1, 19), appts
         )
-        assert busy == {"tech_alex"}
+        assert unavailable == {"tech_alex"}
+        # On a ticket, so they also occupy a bay.
+        assert working == {"tech_alex"}
         assert unattributed == 0
 
     def test_unattributed_overlap_when_no_busy_tech_ids(self):
-        """Overlapping order with no labor-tech info counts as 1 unattributed."""
+        """Overlapping order with no tech named in either source counts as 1
+        unattributed."""
         appts = [
             self._appt(
                 "ord_a",
@@ -903,11 +957,110 @@ class TestPerTechAvailability:
                 busy=[],
             )
         ]
-        busy, unattributed = get_overlap_info_for_slot(
+        unavailable, working, unattributed = get_overlap_info_for_slot(
             time(9, 0), time(10, 0), datetime(2026, 1, 19), appts
         )
-        assert busy == set()
+        assert unavailable == set()
+        assert working == set()
         assert unattributed == 1
+
+    def test_time_off_block_makes_its_tech_unavailable_without_holding_a_bay(self):
+        """The bug this fixes: a tech assigned to a ticketless calendar entry
+        (vacation, "Mina out") was invisible to the scheduler. They must now
+        leave the pool - but without consuming department concurrency, since
+        an absent tech frees their bay rather than occupying it."""
+        appts = [
+            {
+                "startDate": "2026-01-19T09:00:00-06:00",
+                "endDate": "2026-01-19T10:00:00-06:00",
+                "_busyTechIds": ["tech_mina"],
+                # No orderId: this is "Mina out", not a work order.
+            }
+        ]
+        unavailable, working, unattributed = get_overlap_info_for_slot(
+            time(9, 0), time(10, 0), datetime(2026, 1, 19), appts
+        )
+        assert unavailable == {"tech_mina"}
+        assert working == set()
+        assert unattributed == 0
+
+    def test_ticketless_entry_naming_no_tech_is_ignored(self):
+        """Shop-wide entries ("Cars & Coffee") name nobody and carry no order.
+        There is no one to block, and they must not silently eat capacity."""
+        appts = [
+            {
+                "startDate": "2026-01-19T09:00:00-06:00",
+                "endDate": "2026-01-19T10:00:00-06:00",
+                "_busyTechIds": [],
+            }
+        ]
+        unavailable, working, unattributed = get_overlap_info_for_slot(
+            time(9, 0), time(10, 0), datetime(2026, 1, 19), appts
+        )
+        assert unavailable == set()
+        assert working == set()
+        assert unattributed == 0
+
+    def test_entry_with_unparseable_dates_is_skipped(self):
+        """Ticketless entries now flow through this loop for the first time,
+        so a malformed/missing date must be skipped quietly - not crash the
+        availability check and not block the tech it names."""
+        appts = [
+            {"_busyTechIds": ["tech_alex"]},  # no dates at all
+            {
+                "startDate": "not-a-date",
+                "endDate": "2026-01-19T10:00:00-06:00",
+                "_busyTechIds": ["tech_cam"],
+            },
+        ]
+        unavailable, working, unattributed = get_overlap_info_for_slot(
+            time(9, 0), time(10, 0), datetime(2026, 1, 19), appts
+        )
+        assert unavailable == set()
+        assert working == set()
+        assert unattributed == 0
+
+    def test_slot_capacity_drops_tech_on_time_off(self):
+        """End-to-end through slot_capacity: the tech on PTO is not offered."""
+        appts = [
+            {
+                "startDate": "2026-01-19T09:00:00-06:00",
+                "endDate": "2026-01-19T10:00:00-06:00",
+                "_busyTechIds": ["tech_alex"],
+            }
+        ]
+        capacity, free = slot_capacity(
+            time(9, 0),
+            time(10, 0),
+            datetime(2026, 1, 19),
+            appts,
+            ["tech_alex", "tech_cam", "tech_dave"],
+        )
+        assert capacity == 2
+        assert set(free) == {"tech_cam", "tech_dave"}
+
+    def test_time_off_does_not_consume_department_concurrency(self):
+        """A tech out on PTO holds no bay, so a department capped at 2
+        simultaneous services still has both slots open to the techs who
+        are actually present."""
+        appts = [
+            {
+                "startDate": "2026-01-19T09:00:00-06:00",
+                "endDate": "2026-01-19T10:00:00-06:00",
+                "_busyTechIds": ["tech_alex"],  # out; no orderId
+            }
+        ]
+        capacity, free = slot_capacity(
+            time(9, 0),
+            time(10, 0),
+            datetime(2026, 1, 19),
+            appts,
+            ["tech_alex", "tech_cam", "tech_dave"],
+            max_concurrency=2,
+        )
+        # Were absence miscounted as bay occupancy, this would cap at 1.
+        assert capacity == 2
+        assert set(free) == {"tech_cam", "tech_dave"}
 
     def test_slot_capacity_drops_only_busy_tech(self):
         """A Window Tint tech busy on a Body Shop appointment is dropped
@@ -1279,6 +1432,55 @@ class TestCheckSlotAvailabilityForDuration:
         assert ok is True
         assert free == ["tech2"]
 
+    def test_multiday_tech_on_time_off_day2_is_not_offered(self):
+        """A multi-day service needs the same tech free on EVERY spanned day.
+        tech1 is out on day 2 via a ticketless block, so only tech2 can take
+        it - previously the block was invisible and tech1 stayed eligible."""
+        future = {
+            "2026-01-20": [
+                {
+                    # No orderId: "tech1 out", not a work order.
+                    "startDate": "2026-01-20T15:00:00Z",
+                    "endDate": "2026-01-20T16:00:00Z",
+                    "_busyTechIds": ["tech1"],
+                }
+            ]
+        }
+        ok, free, _ = check_slot_availability_for_duration(
+            date=datetime(2026, 1, 19),
+            slot_start=time(16, 0),
+            duration_minutes=157,
+            tech_ids=["tech1", "tech2"],
+            appointments=[],
+            future_appointments=future,
+            config=self.CONFIG,
+        )
+        assert ok is True
+        assert free == ["tech2"]
+
+    def test_multiday_blocked_when_sole_tech_out_on_day2(self):
+        """With no one else qualified, day-2 time off kills the slot."""
+        future = {
+            "2026-01-20": [
+                {
+                    "startDate": "2026-01-20T15:00:00Z",
+                    "endDate": "2026-01-20T16:00:00Z",
+                    "_busyTechIds": ["tech1"],
+                }
+            ]
+        }
+        ok, free, _ = check_slot_availability_for_duration(
+            date=datetime(2026, 1, 19),
+            slot_start=time(16, 0),
+            duration_minutes=157,
+            tech_ids=["tech1"],
+            appointments=[],
+            future_appointments=future,
+            config=self.CONFIG,
+        )
+        assert ok is False
+        assert free == []
+
     def test_closed_day_returns_unavailable(self):
         ok, free, days = check_slot_availability_for_duration(
             date=datetime(2026, 1, 24),  # Saturday
@@ -1311,22 +1513,26 @@ class TestConcurrencyCap:
         }
 
     def test_cap_helper_none_is_passthrough(self):
-        assert cap_by_concurrency(3, 3, 4, None) == 3
+        assert cap_by_concurrency(3, 0, None) == 3
 
     def test_cap_helper_binds_to_max(self):
-        # 4 techs free, max 1, none busy -> offer 1.
-        assert cap_by_concurrency(4, 4, 4, 1) == 1
+        # 4 techs free, max 1, no bays occupied -> offer 1.
+        assert cap_by_concurrency(4, 0, 1) == 1
 
     def test_cap_helper_shrinks_as_dept_fills(self):
-        # 3 free, 1 of 4 qualified busy, max 2 -> remaining = 2-1 = 1.
-        assert cap_by_concurrency(3, 3, 4, 2) == 1
+        # 3 free, 1 bay occupied, max 2 -> remaining = 2-1 = 1.
+        assert cap_by_concurrency(3, 1, 2) == 1
 
     def test_cap_helper_zero_when_dept_full(self):
-        # 3 free but max 1 already consumed by the 1 busy tech -> 0.
-        assert cap_by_concurrency(3, 3, 4, 1) == 0
+        # 3 free but max 1 already consumed by the 1 working tech -> 0.
+        assert cap_by_concurrency(3, 1, 1) == 0
 
     def test_cap_helper_noop_when_max_exceeds_techs(self):
-        assert cap_by_concurrency(4, 4, 4, 10) == 4
+        assert cap_by_concurrency(4, 0, 10) == 4
+
+    def test_cap_helper_never_returns_negative(self):
+        # More bays occupied than the cap allows (data drift) -> 0, not -1.
+        assert cap_by_concurrency(3, 3, 2) == 0
 
     CONFIG = {
         "business_hours": {"monday": {"open": "09:00", "close": "11:00"}},

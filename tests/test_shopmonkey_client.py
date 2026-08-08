@@ -511,17 +511,97 @@ class TestGetBusyTechsForAppointments:
         await client.close()
 
     @pytest.mark.asyncio
-    async def test_skips_appointments_without_order_id(self):
-        """Time-off / lunch blocks have no orderId; don't fetch services for them."""
+    async def test_time_off_block_reports_its_tech_without_order_fetch(self):
+        """A vacation / "Mina out" block has no orderId, so there's no order to
+        walk - but `technicians[]` still names who is out, and that tech must
+        be reported as occupied."""
         client = ShopmonkeyClient(api_token="test-token")
         mock_client = AsyncMock()
         mock_client.request = AsyncMock()
         with patch.object(client, "_get_client", return_value=mock_client):
             result = await client.get_busy_techs_for_appointments(
-                [{"id": "appt_block", "orderId": None}]
+                [
+                    {
+                        "id": "appt_block",
+                        "orderId": None,
+                        "technicians": [{"id": "tech_mina"}],
+                    }
+                ]
+            )
+        assert result == {"appt_block": {"tech_mina"}}
+        mock_client.request.assert_not_called()
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_block_naming_no_tech_reports_empty(self):
+        """A shop-wide entry ("Cars & Coffee") names nobody and has no order -
+        there is no one to block, so it contributes no techs."""
+        client = ShopmonkeyClient(api_token="test-token")
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock()
+        with patch.object(client, "_get_client", return_value=mock_client):
+            result = await client.get_busy_techs_for_appointments(
+                [{"id": "appt_block", "orderId": None, "technicians": []}]
+            )
+        assert result == {"appt_block": set()}
+        mock_client.request.assert_not_called()
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_failed_order_fetch_falls_back_to_technicians_field(self):
+        """When the order fetch dies we must still keep the assignment the
+        appointment row already gave us - degrading to "nobody is busy" here
+        would hand out a slot to a tech who is demonstrably occupied."""
+        client = ShopmonkeyClient(api_token="test-token")
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(side_effect=ShopmonkeyAPIError("boom", status_code=500))
+        with patch.object(client, "_get_client", return_value=mock_client):
+            result = await client.get_busy_techs_for_appointments(
+                [
+                    {
+                        "id": "appt_1",
+                        "orderId": "ord_a",
+                        "technicians": [{"id": "tech_row"}],
+                    }
+                ]
+            )
+        assert result == {"appt_1": {"tech_row"}}
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_appointment_without_id_is_skipped(self):
+        """A row with no id can't be keyed, so it's dropped rather than
+        crashing the whole availability check."""
+        client = ShopmonkeyClient(api_token="test-token")
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock()
+        with patch.object(client, "_get_client", return_value=mock_client):
+            result = await client.get_busy_techs_for_appointments(
+                [{"orderId": None, "technicians": [{"id": "tech_x"}]}]
             )
         assert result == {}
-        mock_client.request.assert_not_called()
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_unions_technicians_field_with_labor_walk(self):
+        """The two sources disagree in both directions on live data, so the
+        result must be their union - taking either alone loses assignments."""
+        client = ShopmonkeyClient(api_token="test-token")
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(
+            return_value=self._services_response([{"labors": [{"technicianId": "tech_walk"}]}])
+        )
+        with patch.object(client, "_get_client", return_value=mock_client):
+            result = await client.get_busy_techs_for_appointments(
+                [
+                    {
+                        "id": "appt_1",
+                        "orderId": "ord_a",
+                        "technicians": [{"id": "tech_row"}],
+                    }
+                ]
+            )
+        assert result == {"appt_1": {"tech_row", "tech_walk"}}
         await client.close()
 
     @pytest.mark.asyncio

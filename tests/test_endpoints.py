@@ -219,6 +219,63 @@ class TestAvailabilityEndpoint:
         assert "09:00" not in starts
         assert all(s > "12:00" for s in starts)
 
+    def _ooo_block(self, appt_id, name):
+        return {
+            "id": appt_id,
+            "orderId": None,  # time off, not a work order
+            "startDate": "2026-01-19T09:00:00-06:00",
+            "endDate": "2026-01-19T10:00:00-06:00",
+            "name": name,
+        }
+
+    def test_time_off_reduces_advertised_techs(self, test_client, mock_shopmonkey_client):
+        """One of two qualified techs is out on a ticketless block: the 09:00
+        slot stays open but advertises one fewer tech."""
+        mock_shopmonkey_client.get_appointments_for_date = AsyncMock(
+            return_value=[self._ooo_block("appt-ooo-1", "John Out")]
+        )
+        mock_shopmonkey_client.get_busy_techs_for_appointments = AsyncMock(
+            return_value={"appt-ooo-1": {"tech-1"}}
+        )
+        response = test_client.get("/availability?service_id=svc-1&date=2026-01-19")
+        assert response.status_code == 200
+        slots = {s["start"]: s for s in response.json()["slots"]}
+        assert slots["09:00"]["available_techs"] == 1
+        # A later slot the block doesn't touch keeps both techs.
+        assert slots["11:00"]["available_techs"] == 2
+
+    def test_slot_dropped_when_all_techs_are_out(self, test_client, mock_shopmonkey_client):
+        """The reported bug, through the real endpoint: with every qualified
+        tech out, the slot must not be offered at all."""
+        mock_shopmonkey_client.get_appointments_for_date = AsyncMock(
+            return_value=[
+                self._ooo_block("appt-ooo-1", "John Out"),
+                self._ooo_block("appt-ooo-2", "Jane Out"),
+            ]
+        )
+        mock_shopmonkey_client.get_busy_techs_for_appointments = AsyncMock(
+            return_value={"appt-ooo-1": {"tech-1"}, "appt-ooo-2": {"tech-2"}}
+        )
+        response = test_client.get("/availability?service_id=svc-1&date=2026-01-19")
+        assert response.status_code == 200
+        starts = [s["start"] for s in response.json()["slots"]]
+        assert "09:00" not in starts
+        assert starts, "later slots should still be offered"
+
+    def test_shop_wide_block_naming_no_tech_is_ignored(self, test_client, mock_shopmonkey_client):
+        """A ticketless entry naming nobody ("Cars & Coffee") blocks no one -
+        shop-wide closures are deliberately out of scope."""
+        mock_shopmonkey_client.get_appointments_for_date = AsyncMock(
+            return_value=[self._ooo_block("appt-event", "Cars & Coffee")]
+        )
+        mock_shopmonkey_client.get_busy_techs_for_appointments = AsyncMock(
+            return_value={"appt-event": set()}
+        )
+        response = test_client.get("/availability?service_id=svc-1&date=2026-01-19")
+        assert response.status_code == 200
+        slots = {s["start"]: s for s in response.json()["slots"]}
+        assert slots["09:00"]["available_techs"] == 2
+
     def test_invalid_date_format_returns_400(self, test_client):
         """Should return 400 for invalid date format."""
         response = test_client.get("/availability?service_id=svc-1&date=invalid")
@@ -757,6 +814,42 @@ class TestBookEndpoint:
         response = test_client.post("/book", json=booking_request)
         assert response.status_code == 409
         assert "no longer available" in response.json()["detail"]
+
+    def test_time_off_block_returns_409(self, test_client, mock_shopmonkey_client):
+        """Both qualified techs are out on ticketless calendar blocks, so the
+        booking must be refused. Before the time-off fix these entries were
+        skipped entirely and the booking went through."""
+        blocks = [
+            {
+                "id": "appt-ooo-1",
+                "orderId": None,
+                "startDate": "2026-01-19T09:00:00-06:00",
+                "endDate": "2026-01-19T10:00:00-06:00",
+                "name": "John Out",
+            },
+            {
+                "id": "appt-ooo-2",
+                "orderId": None,
+                "startDate": "2026-01-19T09:00:00-06:00",
+                "endDate": "2026-01-19T10:00:00-06:00",
+                "name": "Jane Out",
+            },
+        ]
+        mock_shopmonkey_client.get_appointments_for_date = AsyncMock(return_value=blocks)
+        mock_shopmonkey_client.get_busy_techs_for_appointments = AsyncMock(
+            return_value={"appt-ooo-1": {"tech-1"}, "appt-ooo-2": {"tech-2"}}
+        )
+        booking_request = {
+            "service_id": "svc-1",
+            "slot_start": "2026-01-19T09:00:00",
+            "slot_end": "2026-01-19T10:00:00",
+            "customer": {"firstName": "Test", "lastName": "User"},
+            "vehicle": {"year": 2022, "make": "Toyota", "model": "Camry"},
+        }
+        response = test_client.post("/book", json=booking_request)
+        assert response.status_code == 409
+        assert "no longer available" in response.json()["detail"]
+        mock_shopmonkey_client.create_appointment.assert_not_called()
 
     def test_customer_name_too_long_returns_422(self, test_client):
         """Should return 422 when customer name exceeds max length."""

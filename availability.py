@@ -182,24 +182,33 @@ def get_overlap_info_for_slot(
     date: datetime,
     appointments: list[dict[str, Any]],
     tz: ZoneInfo | None = None,
-) -> tuple[set[str], int]:
-    """Inspect every appointment overlapping the slot and split it into
-    `(busy_tech_ids, unattributed_overlap_count)`.
+) -> tuple[set[str], set[str], int]:
+    """Inspect every appointment overlapping the slot, returning
+    `(unavailable_tech_ids, working_tech_ids, unattributed_overlap_count)`.
 
-    `busy_tech_ids` is the union of `_busyTechIds` across overlapping
-    appointments - those are technician IDs resolved upstream by walking
-    Appointment → Order → Service.labors → technicianId. They identify a
-    specific tech as busy so we can drop only that tech from the qualified
-    pool.
+    `unavailable_tech_ids` is the union of `_busyTechIds` across ALL
+    overlapping appointments, whatever they are. A tech assigned to any
+    calendar entry during the slot cannot take a booking - a work order,
+    a vacation block, "Mina out", "shop cleaning" all count the same. The
+    entry's title and whether a ticket sits behind it are irrelevant; only
+    the assignment matters. These techs come out of the qualified pool.
+
+    `working_tech_ids` is the subset assigned to `orderId`-bearing
+    appointments - i.e. techs actually turning wrenches on a ticket. Only
+    these occupy a service bay, so only these count against a department's
+    max-concurrency ceiling. A tech on PTO frees their bay; counting them
+    as occupying one would wrongly shrink department concurrency.
 
     `unattributed_overlap_count` counts overlapping orderId-bearing
-    appointments where the labor walk found no technicianId (~4% of live
-    bookings on 2026-05-20 - typically older work orders that haven't
-    been triaged yet). We don't know which tech, so each one reduces
-    overall shop capacity by 1 conservatively.
+    appointments naming no tech at all in either source. We don't know
+    who, so each conservatively reduces overall shop capacity by 1. With
+    `technicians[]` and the labor walk now unioned upstream this is rare
+    (0 of 60 sampled on 2026-08-07), but a ticket with no assignment
+    anywhere still shouldn't read as free capacity.
 
-    Appointments without `orderId` (lunch / PTO / "Robert Out" blocks)
-    are intentionally ignored - they don't occupy a service bay.
+    Entries naming no tech and carrying no `orderId` (shop-wide things like
+    "4th of July - Closed" or "Cars & Coffee") are ignored - there's no one
+    to block. Shop-wide closures are deliberately out of scope here.
     """
     if tz is None:
         tz = ZoneInfo(DEFAULT_TIMEZONE)
@@ -207,13 +216,11 @@ def get_overlap_info_for_slot(
     slot_start_dt = datetime.combine(date.date(), slot_start)
     slot_end_dt = datetime.combine(date.date(), slot_end)
 
-    busy_techs: set[str] = set()
+    unavailable_techs: set[str] = set()
+    working_techs: set[str] = set()
     unattributed = 0
 
     for appt in appointments:
-        if not appt.get("orderId"):
-            continue
-
         times = parse_appointment_times(appt)
         if times is None:
             continue
@@ -234,12 +241,16 @@ def get_overlap_info_for_slot(
             continue
 
         appt_tech_ids = appt.get("_busyTechIds") or []
+        has_order = bool(appt.get("orderId"))
+
         if appt_tech_ids:
-            busy_techs.update(appt_tech_ids)
-        else:
+            unavailable_techs.update(appt_tech_ids)
+            if has_order:
+                working_techs.update(appt_tech_ids)
+        elif has_order:
             unattributed += 1
 
-    return busy_techs, unattributed
+    return unavailable_techs, working_techs, unattributed
 
 
 def count_overlapping_appointments(
@@ -350,29 +361,31 @@ def calculate_days_needed(
 
 def cap_by_concurrency(
     capacity: int,
-    free_count: int,
-    qualified_count: int,
+    occupied_count: int,
     max_concurrency: int | None,
 ) -> int:
     """Clamp tech-based capacity by a department's max service concurrency.
 
     The occupancy ceiling models a physical resource (bays / equipment): a
-    department may run at most `max_concurrency` services at once. The
-    department services already overlapping the slot are exactly the qualified
-    techs currently busy (`qualified_count - free_count`), so the remaining
-    concurrency is `max_concurrency - busy_in_dept`. We never offer more than
-    that, nor more than the free-tech `capacity`.
+    department may run at most `max_concurrency` services at once, so the
+    remaining concurrency is `max_concurrency - occupied_count`. We never
+    offer more than that, nor more than the free-tech `capacity`.
 
-    Unattributed overlaps (orderId-bearing appointments whose labors carry no
-    technicianId) are intentionally NOT counted toward department occupancy:
-    they already reduce the free-tech `capacity`, and we can't attribute them
-    to a specific department. `max_concurrency is None` means no cap (the
+    `occupied_count` is how many qualified techs are working a ticket that
+    overlaps the slot - passed in rather than inferred from the free-tech
+    count, because "not free" and "occupying a bay" are different things: a
+    tech on PTO is unavailable but holds no bay, and inferring occupancy
+    from absence would wrongly shrink the department's concurrency.
+
+    Unattributed overlaps (orderId-bearing appointments naming no tech) are
+    intentionally NOT counted toward department occupancy: they already
+    reduce the free-tech `capacity`, and we can't attribute them to a
+    specific department. `max_concurrency is None` means no cap (the
     original tech-only behavior).
     """
     if max_concurrency is None:
         return capacity
-    busy_in_dept = qualified_count - free_count
-    return max(min(capacity, max_concurrency - busy_in_dept), 0)
+    return max(min(capacity, max_concurrency - occupied_count), 0)
 
 
 def slot_capacity(
@@ -386,26 +399,30 @@ def slot_capacity(
 ) -> tuple[int, list[str]]:
     """Compute `(remaining_capacity, free_tech_ids)` for a slot.
 
-    Uses per-tech busy info from `_busyTechIds` (resolved upstream by
-    walking labor.technicianId) to drop only the specifically-busy techs
-    from the qualified pool, then subtracts the unattributed overlap
-    count (orderId-bearing appointments where labors carry no tech) as a
-    conservative shop-level reduction.
+    Drops from the qualified pool every tech assigned to an overlapping
+    calendar entry - work order, vacation, lunch, anything (see
+    `get_overlap_info_for_slot`) - then subtracts the unattributed overlap
+    count (orderId-bearing appointments naming no tech) as a conservative
+    shop-level reduction.
 
-    `free_tech_ids` are techs we KNOW are not busy. When unattributed > 0,
-    the caller still treats overall capacity as `len(free_tech_ids) -
-    unattributed`, because we can't tell which of the "free" techs might
-    actually be the unattributed-busy one.
+    `free_tech_ids` are techs we KNOW hold no overlapping assignment. When
+    unattributed > 0, the caller still treats overall capacity as
+    `len(free_tech_ids) - unattributed`, because we can't tell which of the
+    "free" techs might actually be the unattributed-busy one.
 
     `max_concurrency`, when set, further clamps the result to the department's
-    maximum simultaneous services (see `cap_by_concurrency`). The returned
+    maximum simultaneous services (see `cap_by_concurrency`), counting only
+    qualified techs on a ticket - time-off doesn't consume a bay. The returned
     `free_tech_ids` list is unchanged - the cap only limits how many of those
     free techs may be offered/booked, and assignment still picks from the list.
     """
-    busy, unattributed = get_overlap_info_for_slot(slot_start, slot_end, date, appointments, tz=tz)
-    free = [t for t in tech_ids if t not in busy]
+    unavailable, working, unattributed = get_overlap_info_for_slot(
+        slot_start, slot_end, date, appointments, tz=tz
+    )
+    free = [t for t in tech_ids if t not in unavailable]
     capacity = max(len(free) - unattributed, 0)
-    capacity = cap_by_concurrency(capacity, len(free), len(tech_ids), max_concurrency)
+    occupied = len([t for t in tech_ids if t in working])
+    capacity = cap_by_concurrency(capacity, occupied, max_concurrency)
     return capacity, free
 
 

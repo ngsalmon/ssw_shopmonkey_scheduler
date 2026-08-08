@@ -195,9 +195,12 @@ class ShopmonkeyClient:
 
         Args:
             date_str: Date in YYYY-MM-DD format
-            tech_ids: Ignored. Appointments in Shopmonkey don't carry a
-                technicianId/userId field, so caller-side filtering by tech
-                wouldn't work anyway. Kept for backward compatibility.
+            tech_ids: Ignored. The GET `where` param supports no tech/relation
+                filter (11 syntaxes tried in probe_filter_appts_by_tech.py -
+                all silently ignored), so we fetch the day and join to techs
+                caller-side. Kept for backward compatibility.
+                (`POST /v3/appointment/search` DOES support a `technicians`
+                filter if per-tech fetching is ever needed.)
 
         Important Shopmonkey API quirks (verified 2026-05-20 against the live
         API in this shop's account):
@@ -239,20 +242,41 @@ class ShopmonkeyClient:
     async def get_busy_techs_for_appointments(
         self, appointments: list[dict[str, Any]]
     ) -> dict[str, set[str]]:
-        """Walk Appointment → Order → Service.labors → technicianId.
+        """Resolve which technicians each appointment occupies.
 
-        Shopmonkey appointments don't carry a technicianId field, but the
-        labor lines on the appointment's order do (verified against the
-        live API on 2026-05-20: 96% of upcoming appointments have at least
-        one labor-tech assignment). Returns {appointment_id: {tech_id, ...}}.
+        A tech is occupied by ANY calendar entry they're assigned to - a
+        work order, a vacation block, a "shop cleaning" entry. The entry's
+        title and whether it has a ticket behind it are irrelevant; only
+        the assignment matters.
 
-        Order fetches run in parallel. Appointments without an orderId or
-        whose order fetch fails are omitted from the result (caller treats
-        them as "tech unknown" → reduces shop capacity by one).
+        Two independent sources, unioned:
+
+        1. `appointment.technicians[]` - the assignment staff make on the
+           calendar. The list endpoint returns it on every row (verified
+           2026-08-07: 100/100), including time-off blocks and untickted
+           work, which carry no `orderId` at all.
+        2. Appointment → Order → Service.labors → technicianId, for
+           `orderId`-bearing rows.
+
+        Neither source subsumes the other (2026-08-07, 60-appointment
+        sample: 19 disagreed - 11 where only the labor walk found a tech,
+        3 where only `technicians[]` did), so we union them. Dropping
+        either silently loses assignments and over-books.
+
+        Returns {appointment_id: {tech_id, ...}}. Order fetches run in
+        parallel; a failed fetch degrades to whatever `technicians[]`
+        supplied rather than losing the appointment's techs entirely.
         """
+        busy: dict[str, set[str]] = {}
+        for appt in appointments:
+            appt_id = appt.get("id")
+            if not appt_id:
+                continue
+            busy[appt_id] = {t["id"] for t in (appt.get("technicians") or []) if t.get("id")}
+
         targets = [a for a in appointments if a.get("orderId") and a.get("id")]
         if not targets:
-            return {}
+            return busy
 
         async def fetch(appt: dict[str, Any]) -> tuple[str, set[str]]:
             appt_id = appt["id"]
@@ -277,7 +301,9 @@ class ShopmonkeyClient:
             return appt_id, tech_ids
 
         results = await asyncio.gather(*[fetch(a) for a in targets])
-        return {aid: techs for aid, techs in results}
+        for appt_id, tech_ids in results:
+            busy[appt_id] |= tech_ids
+        return busy
 
     @staticmethod
     def _normalize_phone(phone: str | None) -> str | None:

@@ -240,12 +240,14 @@ def canned_service_subcontracts_for_attach(
 async def _fetch_appointments_with_busy_techs(date_str: str) -> list[dict[str, Any]]:
     """Fetch appointments for the date and tag each with `_busyTechIds`.
 
-    Walks Appointment → Order → Service.labors → technicianId so the
-    availability check can drop only specifically-busy techs from the
-    qualified pool instead of treating every overlap as a shop-wide
-    capacity hit. Verified on 2026-05-20 that ~96% of upcoming bookings
-    have at least one labor with technicianId set; the remaining ones
-    fall through as "unattributed" and reduce shop capacity by one.
+    `_busyTechIds` unions `appointment.technicians[]` with the
+    Appointment → Order → Service.labors → technicianId walk, so the
+    availability check can drop exactly the techs holding an overlapping
+    assignment instead of treating every overlap as a shop-wide capacity
+    hit. This covers entries with no work order behind them - vacation,
+    "Mina out", untickted shop work - which are ~25% of the calendar and
+    were previously invisible to the scheduler. Entries naming no tech at
+    all fall through as "unattributed" and reduce shop capacity by one.
     """
     if not shopmonkey_client:
         return []
@@ -971,9 +973,11 @@ async def book_appointment(_: ApiKeyDep, request: BookingRequest):
                     ] = await _fetch_appointments_with_busy_techs(future_date_str)
 
             # Re-check availability (inside lock to prevent race conditions).
-            # Enriched appointments carry _busyTechIds from labor.technicianId
-            # so we filter out specifically-busy techs and only fail when no
-            # qualified tech is actually free - on every day the service spans.
+            # Enriched appointments carry _busyTechIds unioned from
+            # appointment.technicians[] and labor.technicianId, so we filter
+            # out techs holding any overlapping assignment (including time
+            # off) and only fail when no qualified tech is actually free -
+            # on every day the service spans.
             appointments = await _fetch_appointments_with_busy_techs(date_str)
             is_available, available_tech_ids, days_needed = check_slot_availability_for_duration(
                 date=slot_start_dt,
