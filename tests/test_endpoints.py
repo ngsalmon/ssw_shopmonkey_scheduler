@@ -2,9 +2,11 @@
 
 import os
 import sys
-from datetime import datetime
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
@@ -140,6 +142,49 @@ def test_client_with_api_key(mock_shopmonkey_client, mock_sheets_client, mock_co
 
             with TestClient(app) as client:
                 yield client
+
+
+@pytest.fixture
+def main_module():
+    """The imported `main` module, for testing its pure helpers directly."""
+    import main
+
+    return main
+
+
+@pytest.fixture
+def clean_round_robin(main_module):
+    """Isolate the process-global round-robin state between tests."""
+    main_module.round_robin_tracker.clear()
+    yield main_module.round_robin_tracker
+    main_module.round_robin_tracker.clear()
+
+
+@pytest.fixture
+def client_factory(mock_shopmonkey_client, mock_sheets_client):
+    """Build a TestClient over an arbitrary config, reusing the client mocks.
+
+    Same wiring as `test_client`, but the config is a parameter so tests can
+    exercise config-driven behavior (disabled departments, order creation)
+    without duplicating the patch stack.
+    """
+
+    @contextmanager
+    def _make(config):
+        with patch.dict(os.environ, {"API_KEY": "", "ALLOWED_ORIGINS": ""}, clear=False):
+            with (
+                patch("main.ShopmonkeyClient", return_value=mock_shopmonkey_client),
+                patch("main.SheetsClient", return_value=mock_sheets_client),
+                patch("main.load_config", return_value=config),
+                patch("main.validate_config"),
+                patch("main._now_local", return_value=datetime(2026, 1, 1, 0, 0, 0)),
+            ):
+                from main import app
+
+                with TestClient(app) as client:
+                    yield client
+
+    return _make
 
 
 class TestHealthEndpoint:
@@ -1143,3 +1188,925 @@ class TestMultidayBooking:
         assert kwargs["end_date"] == "2026-01-19T10:00:00.000-06:00"
         # Single-day bookings keep the plain OOTB title - no day suffix.
         assert "(Day" not in kwargs["title"]
+
+
+class TestSelectTechByPriority:
+    """Tests for select_tech_by_priority - it decides who actually gets booked.
+
+    Pure logic, but it is the only thing standing between "the senior tech
+    gets every single job" and a fair rotation, and a wrong pick here shows
+    up as a real person double-booked on the shop calendar.
+    """
+
+    TECHS = [
+        {"tech_id": "t1", "tech_name": "Ann", "priority": 1},
+        {"tech_id": "t2", "tech_name": "Bob", "priority": 1},
+        {"tech_id": "t3", "tech_name": "Cid", "priority": 2},
+    ]
+
+    def test_returns_none_when_no_qualified_tech_is_free(self, main_module, clean_round_robin):
+        """A free tech from another department must never be selected."""
+        assert main_module.select_tech_by_priority(self.TECHS, ["someone-else"], "Tint") is None
+        assert main_module.select_tech_by_priority(self.TECHS, [], "Tint") is None
+        # No rotation state is created for a selection that never happened.
+        assert "Tint" not in clean_round_robin
+
+    def test_priority_beats_the_order_of_the_available_list(self, main_module, clean_round_robin):
+        """Availability order is incidental; priority decides."""
+        # t3 (priority 2) is listed first but t2 (priority 1) must win.
+        assert main_module.select_tech_by_priority(self.TECHS, ["t3", "t2"], "Tint") == "t2"
+
+    def test_sole_tech_at_top_priority_skips_round_robin(self, main_module, clean_round_robin):
+        """With one tech at the top priority there is nothing to rotate, and
+        no rotation state should be recorded for it."""
+        assert main_module.select_tech_by_priority(self.TECHS, ["t1", "t3"], "Tint") == "t1"
+        assert "Tint" not in clean_round_robin
+
+    def test_rotates_between_techs_of_equal_priority(self, main_module, clean_round_robin):
+        """Equal-priority techs alternate instead of the first one taking
+        every booking."""
+        picks = [
+            main_module.select_tech_by_priority(self.TECHS, ["t1", "t2", "t3"], "Tint")
+            for _ in range(4)
+        ]
+        assert picks == ["t1", "t2", "t1", "t2"]
+
+    def test_rotation_is_tracked_per_department(self, main_module, clean_round_robin):
+        """A booking in Vinyl must not advance the Window Tint rotation -
+        otherwise a busy department starves techs in a quiet one."""
+        assert main_module.select_tech_by_priority(self.TECHS, ["t1", "t2"], "Tint") == "t1"
+        assert main_module.select_tech_by_priority(self.TECHS, ["t1", "t2"], "Vinyl") == "t1"
+        assert main_module.select_tech_by_priority(self.TECHS, ["t1", "t2"], "Tint") == "t2"
+
+    def test_rotation_is_tracked_per_priority_level(self, main_module, clean_round_robin):
+        """Each priority tier keeps its own cursor, so falling back to the
+        second tier doesn't scramble the first tier's rotation."""
+        techs = [
+            {"tech_id": "a1", "tech_name": "A1", "priority": 1},
+            {"tech_id": "a2", "tech_name": "A2", "priority": 1},
+            {"tech_id": "b1", "tech_name": "B1", "priority": 2},
+            {"tech_id": "b2", "tech_name": "B2", "priority": 2},
+        ]
+        assert main_module.select_tech_by_priority(techs, ["a1", "a2"], "Tint") == "a1"
+        # Only the second tier is free this time - it starts its own rotation.
+        assert main_module.select_tech_by_priority(techs, ["b1", "b2"], "Tint") == "b1"
+        # Back to the first tier: it resumes where it left off, at a2.
+        assert main_module.select_tech_by_priority(techs, ["a1", "a2"], "Tint") == "a2"
+
+
+class TestCannedServiceLineItemBuilders:
+    """Tests for the canned_service_*_for_attach payload builders.
+
+    These shape the real Shopmonkey ticket. A dropped or mis-scaled field
+    means the customer is quoted one price on the widget and the shop's
+    ticket shows another - the 2026-05-20 $130/hr-vs-$100/hr incident.
+    """
+
+    def test_labor_forwards_rate_references_only_when_present(self, main_module):
+        """rateId must survive (without it Shopmonkey substitutes the shop
+        default rate), but null/blank references must be omitted rather than
+        sent as unset pointers."""
+        labors = main_module.canned_service_labors_for_attach(
+            {
+                "name": "Window Tint",
+                "labors": [
+                    {
+                        "hours": 1.0,
+                        "rateCents": 10000,
+                        "rateId": "lr_1",
+                        "laborMatrixId": None,
+                        "categoryId": "",
+                    }
+                ],
+            }
+        )
+        assert labors[0]["rateId"] == "lr_1"
+        assert "laborMatrixId" not in labors[0]
+        assert "categoryId" not in labors[0]
+        # A labor line with no name of its own inherits the service name so
+        # the ticket line isn't blank.
+        assert labors[0]["name"] == "Window Tint"
+
+    def test_labor_cents_are_rounded_not_truncated(self, main_module):
+        """Shopmonkey returns floats in cents fields; truncating loses a cent
+        per line and the ticket total stops matching the quote."""
+        labors = main_module.canned_service_labors_for_attach(
+            {
+                "labors": [
+                    {
+                        "name": "L",
+                        "hours": 2,
+                        "rateCents": 5649.5,
+                        "discountCents": 1010.6,
+                        "discountPercent": 12.5,
+                    }
+                ]
+            }
+        )
+        assert labors[0]["rateCents"] == 5650
+        assert labors[0]["discountCents"] == 1011
+        # Percent is not a cents field - forwarded as-is.
+        assert labors[0]["discountPercent"] == 12.5
+
+    def test_labor_taxable_false_is_forwarded_and_absent_stays_absent(self, main_module):
+        """taxable=False is meaningful data; dropping it would silently tax a
+        non-taxable labor line."""
+        taxed = main_module.canned_service_labors_for_attach(
+            {"labors": [{"name": "L", "hours": 1, "rateCents": 1, "taxable": False}]}
+        )
+        assert taxed[0]["taxable"] is False
+        bare = main_module.canned_service_labors_for_attach(
+            {"labors": [{"name": "L", "hours": 1, "rateCents": 1}]}
+        )
+        assert "taxable" not in bare[0]
+
+    def test_labor_missing_and_malformed_values_degrade_to_zero(self, main_module):
+        """Garbage in a cents field must not take down the whole booking."""
+        labors = main_module.canned_service_labors_for_attach(
+            {"labors": [{"name": "L"}, {"name": "M", "hours": None, "rateCents": "n/a"}]}
+        )
+        assert labors[0]["hours"] == 0
+        assert labors[0]["rateCents"] == 0
+        assert labors[1]["hours"] == 0
+        assert labors[1]["rateCents"] == 0
+
+    def test_absent_or_null_collections_yield_empty_lists(self, main_module):
+        """Shopmonkey omits these keys entirely on simple services."""
+        assert main_module.canned_service_labors_for_attach({"labors": None}) == []
+        assert main_module.canned_service_parts_for_attach({}) == []
+        assert main_module.canned_service_fees_for_attach({"fees": None}) == []
+        assert main_module.canned_service_subcontracts_for_attach({}) == []
+
+    def test_part_forwards_inventory_references_note_and_discounts(self, main_module):
+        parts = main_module.canned_service_parts_for_attach(
+            {
+                "parts": [
+                    {
+                        "name": "Ceramic IR",
+                        "quantity": 3.5,
+                        "retailCostCents": 1543.6,
+                        "wholesaleCostCents": 0,
+                        "partNumber": "CIR",
+                        "taxable": True,
+                        "discountCents": 100.6,
+                        "discountPercent": 10,
+                        "vendorId": "v1",
+                        "inventoryPartId": "ip1",
+                        "categoryId": None,
+                        "pricingMatrixId": "pm1",
+                        "note": "3.5 yards",
+                    }
+                ]
+            }
+        )
+        part = parts[0]
+        assert part["quantity"] == 3.5
+        assert part["retailCostCents"] == 1544
+        # A zero wholesale cost is real data ("we got it free"), not missing -
+        # a truthiness check here would drop it and inflate reported margin.
+        assert part["wholesaleCostCents"] == 0
+        assert part["partNumber"] == "CIR"
+        assert part["taxable"] is True
+        assert part["discountCents"] == 101
+        assert part["discountPercent"] == 10
+        assert part["vendorId"] == "v1"
+        assert part["inventoryPartId"] == "ip1"
+        assert part["pricingMatrixId"] == "pm1"
+        assert "categoryId" not in part
+        assert part["note"] == "3.5 yards"
+
+    def test_part_with_only_a_name_sends_nothing_extra(self, main_module):
+        """Optional keys must be omitted, not sent as nulls."""
+        parts = main_module.canned_service_parts_for_attach({"parts": [{"name": "Film"}]})
+        assert parts[0] == {"name": "Film", "quantity": 0, "retailCostCents": 0}
+
+    def test_fee_payload_shape(self, main_module):
+        fees = main_module.canned_service_fees_for_attach(
+            {
+                "fees": [
+                    {
+                        "name": "Shop Supplies",
+                        "amountCents": 1250.6,
+                        "taxable": False,
+                        "categoryId": "cat1",
+                        "inventoryFeeId": "if1",
+                    },
+                    {},
+                ]
+            }
+        )
+        assert fees[0] == {
+            "name": "Shop Supplies",
+            "amountCents": 1251,
+            "taxable": False,
+            "categoryId": "cat1",
+            "inventoryFeeId": "if1",
+        }
+        # A completely empty fee still produces a well-formed line.
+        assert fees[1] == {"name": "", "amountCents": 0}
+
+    def test_subcontract_reads_both_legacy_and_current_cost_fields(self, main_module):
+        """The REST API moved wholesaleCostCents -> costCents; during the
+        transition either one may be the only field present, and dropping the
+        cost turns a subcontract into pure profit on the ticket."""
+        subs = main_module.canned_service_subcontracts_for_attach(
+            {
+                "subcontracts": [
+                    {
+                        "name": "Dent removal",
+                        "retailCostCents": 20000.4,
+                        "wholesaleCostCents": 12000,
+                        "costCents": 999,
+                        "taxable": True,
+                        "vendorId": "v9",
+                    },
+                    {"name": "Glass", "retailCostCents": 5000, "costCents": 3000.6},
+                    {"name": "Bare"},
+                ]
+            }
+        )
+        # Legacy field wins when both are present.
+        assert subs[0]["wholesaleCostCents"] == 12000
+        assert subs[0]["retailCostCents"] == 20000
+        assert subs[0]["taxable"] is True
+        assert subs[0]["vendorId"] == "v9"
+        # Falls back to the current field.
+        assert subs[1]["wholesaleCostCents"] == 3001
+        # Neither present: no cost key at all rather than a bogus zero.
+        assert subs[2] == {"name": "Bare", "retailCostCents": 0}
+
+    def test_attach_payload_stamps_assigned_tech_on_every_labor(self, main_module):
+        """Every labor must carry technicianId, otherwise the next
+        /availability check walks order.services.labors.technicianId, finds
+        nothing, and treats this booking as unattributed - over-allowing the
+        tech we just booked."""
+        payload = main_module.build_attach_service_payload(
+            {
+                "name": "Tint",
+                "labors": [
+                    {"name": "A", "hours": 1, "rateCents": 1},
+                    {"name": "B", "hours": 2, "rateCents": 2},
+                ],
+            },
+            "svc-1",
+            "tech-7",
+        )
+        assert [lab["technicianId"] for lab in payload["labors"]] == ["tech-7", "tech-7"]
+        assert payload["cannedServiceId"] == "svc-1"
+        assert payload["name"] == "Tint"
+        # Every collection key is always present so the API sees an explicit
+        # empty list rather than a missing field.
+        assert payload["parts"] == []
+        assert payload["fees"] == []
+        assert payload["subcontracts"] == []
+
+    def test_attach_payload_omits_tech_when_none_assigned(self, main_module):
+        payload = main_module.build_attach_service_payload(
+            {"name": "Tint", "labors": [{"name": "A", "hours": 1, "rateCents": 1}]},
+            "svc-1",
+            None,
+        )
+        assert "technicianId" not in payload["labors"][0]
+
+
+MULTIDAY_SERVICE = {
+    "id": "svc-1",
+    "name": "Window Tint",
+    "totalCents": 15000,
+    "labels": [{"name": "Window Tint"}],
+    "labors": [{"hours": 2.0}],
+}
+
+# 16:00 Monday against a 17:00 close: 60 min day 1 + 60 min Tuesday.
+MULTIDAY_BOOKING = {
+    "service_id": "svc-1",
+    "slot_start": "2026-01-19T16:00:00",
+    "slot_end": "2026-01-19T17:00:00",
+    "customer": {"firstName": "Javion", "lastName": "Cotton"},
+    "vehicle": {"year": 2026, "make": "Honda", "model": "Accord"},
+}
+
+SINGLE_DAY_BOOKING = {
+    "service_id": "svc-1",
+    "slot_start": "2026-01-19T09:00:00",
+    "slot_end": "2026-01-19T10:00:00",
+    "customer": {"firstName": "Test", "lastName": "Customer"},
+    "vehicle": {"year": 2022, "make": "Toyota", "model": "Camry"},
+}
+
+
+def _config_with(mock_config, **extra):
+    """A copy of the standard test config plus the given top-level keys."""
+    return {**mock_config, **extra}
+
+
+class TestBookingFailureModes:
+    """Tests for the /book error and fallback branches.
+
+    Every branch here is a way a booking can go wrong halfway through. The
+    thing that must never happen is a customer getting a confirmation number
+    for an appointment that isn't really on the calendar (or vice versa).
+    """
+
+    def test_returns_500_when_clients_are_not_initialized(
+        self, test_client, mock_shopmonkey_client
+    ):
+        """A boot-time client failure must refuse bookings, not half-book.
+
+        The status alone proves nothing - an uncaught AttributeError on the
+        missing client lands on the same 500. The DISTINCT detail is what
+        separates "we deliberately declined" from "we crashed", and
+        create_appointment must never have been reached.
+        """
+        with patch("main.shopmonkey_client", None):
+            response = test_client.post("/book", json=SINGLE_DAY_BOOKING)
+        assert response.status_code == 500
+        assert response.json()["detail"] == "Service temporarily unavailable"
+        mock_shopmonkey_client.create_appointment.assert_not_called()
+
+    def test_customer_without_id_aborts_before_any_calendar_write(
+        self, test_client, mock_shopmonkey_client
+    ):
+        """If Shopmonkey hands back a customer with no id we cannot link an
+        appointment to anyone - stop before creating a vehicle or a booking."""
+        mock_shopmonkey_client.find_or_create_customer = AsyncMock(return_value={})
+        response = test_client.post("/book", json=SINGLE_DAY_BOOKING)
+        assert response.status_code == 500
+        assert response.json()["detail"] == "Unable to process booking"
+        mock_shopmonkey_client.find_or_create_vehicle.assert_not_called()
+        mock_shopmonkey_client.create_appointment.assert_not_called()
+
+    def test_vehicle_without_id_aborts_before_any_calendar_write(
+        self, test_client, mock_shopmonkey_client
+    ):
+        """An appointment with no vehicle is useless to the shop."""
+        mock_shopmonkey_client.find_or_create_vehicle = AsyncMock(return_value={})
+        response = test_client.post("/book", json=SINGLE_DAY_BOOKING)
+        assert response.status_code == 500
+        assert response.json()["detail"] == "Unable to process booking"
+        mock_shopmonkey_client.create_appointment.assert_not_called()
+
+    def test_unexpected_error_returns_generic_500(self, test_client, mock_shopmonkey_client):
+        """Internal failures return 500 without leaking the exception text to
+        the public widget."""
+        mock_shopmonkey_client.find_or_create_customer = AsyncMock(
+            side_effect=ValueError("postgres password is hunter2")
+        )
+        response = test_client.post("/book", json=SINGLE_DAY_BOOKING)
+        assert response.status_code == 500
+        assert response.json()["detail"] == "An unexpected error occurred"
+
+    def test_shopmonkey_error_during_booking_returns_502(self, test_client, mock_shopmonkey_client):
+        """An upstream outage is a 502, distinct from our own 500s."""
+        from shopmonkey_client import ShopmonkeyAPIError
+
+        mock_shopmonkey_client.find_or_create_customer = AsyncMock(
+            side_effect=ShopmonkeyAPIError("upstream down", status_code=503)
+        )
+        response = test_client.post("/book", json=SINGLE_DAY_BOOKING)
+        assert response.status_code == 502
+        assert response.json()["detail"] == "Unable to complete booking"
+
+    def _order_config(self, mock_config):
+        return _config_with(
+            mock_config,
+            online_booking={
+                "create_order": True,
+                "workflow_status_name": "Scheduled",
+                "order_status": "Estimate",
+                "order_color": "blue",
+            },
+        )
+
+    def test_workflow_status_lookup_failure_still_books_the_appointment(
+        self, client_factory, mock_config, mock_shopmonkey_client
+    ):
+        """The ticket is a nice-to-have; the calendar entry is not. A failed
+        workflow-status lookup must degrade to appointment-only, not 500."""
+        mock_shopmonkey_client.get_workflow_status_id = AsyncMock(side_effect=Exception("boom"))
+        mock_shopmonkey_client.create_order = AsyncMock()
+        with client_factory(self._order_config(mock_config)) as client:
+            response = client.post("/book", json=SINGLE_DAY_BOOKING)
+        assert response.status_code == 200
+        mock_shopmonkey_client.create_order.assert_not_awaited()
+        assert mock_shopmonkey_client.create_appointment.call_args.kwargs["order_id"] is None
+
+    def test_unknown_workflow_status_skips_order_creation(
+        self, client_factory, mock_config, mock_shopmonkey_client
+    ):
+        """A renamed workflow column in Shopmonkey must not break booking."""
+        mock_shopmonkey_client.get_workflow_status_id = AsyncMock(return_value=None)
+        mock_shopmonkey_client.create_order = AsyncMock()
+        with client_factory(self._order_config(mock_config)) as client:
+            response = client.post("/book", json=SINGLE_DAY_BOOKING)
+        assert response.status_code == 200
+        mock_shopmonkey_client.create_order.assert_not_awaited()
+        assert mock_shopmonkey_client.create_appointment.call_args.kwargs["order_id"] is None
+
+    def test_order_creation_failure_falls_back_to_appointment_only(
+        self, client_factory, mock_config, mock_shopmonkey_client
+    ):
+        """Order creation failing must not lose the customer's slot."""
+        from shopmonkey_client import ShopmonkeyAPIError
+
+        mock_shopmonkey_client.get_workflow_status_id = AsyncMock(return_value="ws_1")
+        mock_shopmonkey_client.create_order = AsyncMock(
+            side_effect=ShopmonkeyAPIError("order rejected", status_code=422)
+        )
+        with client_factory(self._order_config(mock_config)) as client:
+            response = client.post("/book", json=SINGLE_DAY_BOOKING)
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        # The appointment is created unlinked rather than pointing at an order
+        # that does not exist.
+        assert mock_shopmonkey_client.create_appointment.call_args.kwargs["order_id"] is None
+
+    def test_rollback_failure_does_not_mask_the_original_error(
+        self, test_client, mock_shopmonkey_client
+    ):
+        """If deleting the orphaned day-1 appointment also fails we still
+        report the booking as failed - never a success on a half-reserved
+        calendar."""
+        from shopmonkey_client import ShopmonkeyAPIError
+
+        mock_shopmonkey_client.get_canned_service = AsyncMock(return_value=MULTIDAY_SERVICE)
+        mock_shopmonkey_client.create_appointment = AsyncMock(
+            side_effect=[{"id": "appt-day1"}, ShopmonkeyAPIError("day 2 failed", status_code=500)]
+        )
+        mock_shopmonkey_client.delete_appointment = AsyncMock(
+            side_effect=RuntimeError("delete also failed")
+        )
+        response = test_client.post("/book", json=MULTIDAY_BOOKING)
+        assert response.status_code == 502
+        mock_shopmonkey_client.delete_appointment.assert_awaited_once_with("appt-day1")
+
+    def test_assigns_the_only_free_tech_and_names_them_in_the_notes(
+        self, test_client, mock_shopmonkey_client
+    ):
+        """When the priority-1 tech is booked solid, the priority-2 tech must
+        get both the assignment and the note staff read off the ticket."""
+        mock_shopmonkey_client.get_appointments_for_date = AsyncMock(
+            return_value=[
+                {
+                    "id": "appt-busy",
+                    "orderId": "ord-1",
+                    "startDate": "2026-01-19T09:00:00-06:00",
+                    "endDate": "2026-01-19T10:00:00-06:00",
+                }
+            ]
+        )
+        mock_shopmonkey_client.get_busy_techs_for_appointments = AsyncMock(
+            return_value={"appt-busy": {"tech-1"}}
+        )
+        response = test_client.post("/book", json=SINGLE_DAY_BOOKING)
+        assert response.status_code == 200
+        kwargs = mock_shopmonkey_client.create_appointment.call_args.kwargs
+        assert kwargs["technician_id"] == "tech-2"
+        assert "Assign to: Jane Smith" in kwargs["notes"]
+
+    def test_null_phone_is_accepted(self, test_client):
+        """The widget sends phone: null when the field is left blank."""
+        request = {
+            **SINGLE_DAY_BOOKING,
+            "customer": {"firstName": "A", "lastName": "B", "phone": None},
+        }
+        response = test_client.post("/book", json=request)
+        assert response.status_code == 200
+
+
+class TestBookingEmailNotification:
+    """Tests for the fire-and-forget booking notification."""
+
+    def _email_client(self):
+        email = MagicMock()
+        email.enabled = True
+        email.send_booking_notification = AsyncMock(return_value=True)
+        return email
+
+    def test_notification_spans_the_full_multiday_booking(
+        self, test_client, mock_shopmonkey_client
+    ):
+        """The email renders its date range and overnight note off
+        start_time/end_time. Taking these from the client-submitted slot
+        would tell the customer to pick their car up the same evening when
+        it is actually staying overnight."""
+        mock_shopmonkey_client.get_canned_service = AsyncMock(return_value=MULTIDAY_SERVICE)
+        mock_shopmonkey_client.create_appointment = AsyncMock(
+            side_effect=[{"id": "appt-day1"}, {"id": "appt-day2"}]
+        )
+        email = self._email_client()
+        with patch("main.get_email_client", return_value=email):
+            response = test_client.post("/book", json=MULTIDAY_BOOKING)
+
+        assert response.status_code == 200
+        email.send_booking_notification.assert_called_once()
+        details = email.send_booking_notification.call_args.args[0]
+        assert details.confirmation_number == response.json()["confirmation_number"]
+        assert details.start_time == datetime(2026, 1, 19, 16, 0)
+        # Last segment's end, on the FOLLOWING day.
+        assert details.end_time == datetime(2026, 1, 20, 10, 0)
+        assert details.technician_name == "John Doe"
+        assert details.service_name == "Window Tint"
+        assert details.customer_first_name == "Javion"
+        assert details.vehicle_make == "Honda"
+
+    def test_no_notification_when_email_is_disabled(self, test_client):
+        """A shop with no SMTP configured must not have send attempted."""
+        email = self._email_client()
+        email.enabled = False
+        with patch("main.get_email_client", return_value=email):
+            response = test_client.post("/book", json=SINGLE_DAY_BOOKING)
+        assert response.status_code == 200
+        email.send_booking_notification.assert_not_called()
+
+
+class TestServicesEndpointErrors:
+    """Tests for /services failure paths and optional-field derivation."""
+
+    def test_returns_500_when_client_not_initialized(self, test_client):
+        """The guard's distinct detail is the only thing separating a
+        deliberate refusal from an AttributeError on the missing client -
+        both of which surface as a bare 500."""
+        with patch("main.shopmonkey_client", None):
+            response = test_client.get("/services")
+        assert response.status_code == 500
+        assert response.json()["detail"] == "Service temporarily unavailable"
+
+    def test_upstream_outage_returns_502(self, test_client, mock_shopmonkey_client):
+        """Distinguish "Shopmonkey is down" from "we are broken" so the widget
+        can tell the customer to try again later."""
+        from shopmonkey_client import ShopmonkeyAPIError
+
+        mock_shopmonkey_client.get_bookable_canned_services = AsyncMock(
+            side_effect=ShopmonkeyAPIError("gateway", status_code=502)
+        )
+        response = test_client.get("/services")
+        assert response.status_code == 502
+
+    def test_unexpected_error_returns_generic_500(self, test_client, mock_shopmonkey_client):
+        mock_shopmonkey_client.get_bookable_canned_services = AsyncMock(
+            side_effect=RuntimeError("api token leaked here")
+        )
+        response = test_client.get("/services")
+        assert response.status_code == 500
+        assert response.json()["detail"] == "An unexpected error occurred"
+
+    def test_service_without_labels_or_labors_reports_nulls(
+        self, test_client, mock_shopmonkey_client
+    ):
+        """Missing optional data must come back as null rather than crashing
+        the list - one malformed service must not hide the whole catalog.
+
+        Pinned alongside the POSITIVE branch: when a label IS present its
+        name becomes `category`, which is what the widget builds its service
+        tabs from. Without that assertion a hard-coded `category=None` looks
+        identical to correct null handling.
+        """
+        labeled = test_client.get("/services")
+        assert labeled.status_code == 200
+        # svc-1 in the default fixture carries labels[0].name == "Window Tint".
+        assert labeled.json()["services"][0]["category"] == "Window Tint"
+
+        mock_shopmonkey_client.get_bookable_canned_services = AsyncMock(
+            return_value=[
+                {"id": "svc-bare", "name": "Bare", "priceCents": 999},
+                {"id": "svc-zero", "name": "Zero", "labels": [{}], "labors": [{"hours": 0}]},
+            ]
+        )
+        response = test_client.get("/services")
+        assert response.status_code == 200
+        bare, zero = response.json()["services"]
+        assert bare["category"] is None
+        assert bare["laborHours"] is None
+        # priceCents is the fallback when totalCents is absent.
+        assert bare["totalCents"] == 999
+        # A label with no name, and labors summing to zero, are both "unknown".
+        assert zero["category"] is None
+        assert zero["laborHours"] is None
+
+
+class TestDisabledDepartments:
+    """Tests for the disabled_departments config gate.
+
+    Turning a department off in config must remove it from the catalog AND
+    refuse direct booking attempts - a service hidden from the widget that
+    can still be booked by URL is worse than not hiding it at all.
+    """
+
+    def _config(self, mock_config, disabled):
+        return _config_with(mock_config, disabled_departments=disabled)
+
+    def test_disabled_department_is_filtered_from_the_catalog(self, client_factory, mock_config):
+        with client_factory(self._config(mock_config, {"Vinyl": {"except": ["ppf"]}})) as client:
+            response = client.get("/services")
+        ids = [s["id"] for s in response.json()["services"]]
+        # svc-2 ("Paint Protection Film", label Vinyl) is gone; svc-1 stays.
+        assert ids == ["svc-1"]
+
+    def test_exception_list_keeps_matching_services_bookable(
+        self, client_factory, mock_config, mock_shopmonkey_client
+    ):
+        """The `except` list is a substring escape hatch on the service name."""
+        mock_shopmonkey_client.get_bookable_canned_services = AsyncMock(
+            return_value=[
+                {"id": "svc-ppf", "name": "PPF Partial Front", "labels": [{"name": "Vinyl"}]},
+                {"id": "svc-wrap", "name": "Full Vinyl Wrap", "labels": [{"name": "Vinyl"}]},
+            ]
+        )
+        with client_factory(self._config(mock_config, {"Vinyl": {"except": ["ppf"]}})) as client:
+            response = client.get("/services")
+        assert [s["id"] for s in response.json()["services"]] == ["svc-ppf"]
+
+    def test_department_disabled_with_no_exceptions_block(self, client_factory, mock_config):
+        """`Vinyl:` with an empty body in YAML parses as None - it must still
+        disable the whole department instead of raising."""
+        with client_factory(self._config(mock_config, {"Vinyl": None})) as client:
+            response = client.get("/services")
+        assert [s["id"] for s in response.json()["services"]] == ["svc-1"]
+
+    def test_disabled_service_cannot_be_booked_directly(
+        self, client_factory, mock_config, mock_shopmonkey_client
+    ):
+        """Hidden from the catalog must also mean 404 on /availability and
+        /book, and indistinguishable from a service that does not exist."""
+        with client_factory(
+            self._config(mock_config, {"Window Tint": {"except": ["ceramic"]}})
+        ) as client:
+            availability = client.get("/availability?service_id=svc-1&date=2026-01-19")
+            booking = client.post("/book", json=SINGLE_DAY_BOOKING)
+        assert availability.status_code == 404
+        assert booking.status_code == 404
+        assert booking.json()["detail"] == "Service not found"
+        mock_shopmonkey_client.create_appointment.assert_not_called()
+
+    def test_service_matching_the_exception_stays_bookable(
+        self, client_factory, mock_config, mock_shopmonkey_client
+    ):
+        mock_shopmonkey_client.get_canned_service = AsyncMock(
+            return_value={
+                "id": "svc-1",
+                "name": "Window Tint - Ceramic",
+                "labels": [{"name": "Window Tint"}],
+                "estimatedDuration": 60,
+            }
+        )
+        with client_factory(
+            self._config(mock_config, {"Window Tint": {"except": ["ceramic"]}})
+        ) as client:
+            response = client.get("/availability?service_id=svc-1&date=2026-01-19")
+        assert response.status_code == 200
+
+
+class TestAvailabilityFailureModes:
+    """Tests for /availability failure paths shared with the booking flow."""
+
+    def test_returns_500_when_clients_are_not_initialized(self, test_client):
+        with patch("main.sheets_client", None):
+            response = test_client.get("/availability?service_id=svc-1&date=2026-01-19")
+        assert response.status_code == 500
+
+    def test_shopmonkey_outage_returns_502_not_404(self, test_client, mock_shopmonkey_client):
+        """An outage must not be reported as "service not found" - that would
+        make the widget permanently hide a service that still exists."""
+        from shopmonkey_client import ShopmonkeyAPIError
+
+        mock_shopmonkey_client.get_canned_service = AsyncMock(
+            side_effect=ShopmonkeyAPIError("gateway", status_code=502)
+        )
+        response = test_client.get("/availability?service_id=svc-1&date=2026-01-19")
+        assert response.status_code == 502
+
+    def test_sheets_outage_returns_502_not_404(self, test_client, mock_sheets_client):
+        """Same for the tech matrix: an unreachable sheet is not "no techs"."""
+        mock_sheets_client.get_techs_for_department = AsyncMock(
+            side_effect=Exception("sheets quota exceeded")
+        )
+        response = test_client.get("/availability?service_id=svc-1&date=2026-01-19")
+        assert response.status_code == 502
+
+    def test_label_with_blank_name_returns_404(self, test_client, mock_shopmonkey_client):
+        """A label present but unnamed maps to no department."""
+        mock_shopmonkey_client.get_canned_service = AsyncMock(
+            return_value={"id": "svc-x", "name": "Mystery", "labels": [{"name": ""}]}
+        )
+        response = test_client.get("/availability?service_id=svc-x&date=2026-01-19")
+        assert response.status_code == 404
+
+    def test_future_day_fetch_failure_does_not_break_the_day(
+        self, test_client, mock_shopmonkey_client
+    ):
+        """A multi-day service needs tomorrow's calendar to judge late slots.
+        If that fetch fails we still serve today's slots rather than 500."""
+        from shopmonkey_client import ShopmonkeyAPIError
+
+        mock_shopmonkey_client.get_canned_service = AsyncMock(return_value=MULTIDAY_SERVICE)
+
+        async def appointments_for(date_str, tech_ids=None):
+            if date_str != "2026-01-19":
+                raise ShopmonkeyAPIError("tomorrow unavailable", status_code=500)
+            return []
+
+        mock_shopmonkey_client.get_appointments_for_date = AsyncMock(side_effect=appointments_for)
+        response = test_client.get("/availability?service_id=svc-1&date=2026-01-19")
+        assert response.status_code == 200
+        assert response.json()["slots"], "today's slots should still be offered"
+
+    def test_unexpected_error_returns_generic_500(self, test_client):
+        with patch("main.calculate_available_slots", side_effect=RuntimeError("internal detail")):
+            response = test_client.get("/availability?service_id=svc-1&date=2026-01-19")
+        assert response.status_code == 500
+        assert response.json()["detail"] == "An unexpected error occurred"
+
+    def test_duration_includes_the_configured_buffer(
+        self, client_factory, mock_config, mock_shopmonkey_client
+    ):
+        """Cure/buffer time is part of the advertised slot length, otherwise
+        the next customer is booked on top of a curing vehicle."""
+        mock_shopmonkey_client.get_canned_service = AsyncMock(
+            return_value={
+                "id": "svc-1",
+                "name": "Window Tint",
+                "labels": [{"name": "Window Tint"}],
+                "labors": [{"hours": 1.0}],
+            }
+        )
+        config = _config_with(mock_config, service_buffers={"Window Tint": 30})
+        with client_factory(config) as client:
+            response = client.get("/availability?service_id=svc-1&date=2026-01-19")
+        # 60 min of labor + 30 min of cure time.
+        assert response.json()["duration_minutes"] == 90
+
+
+class TestReadinessProbe:
+    """Tests for /health/ready - it gates traffic in Cloud Run."""
+
+    def test_healthy_dependencies_return_200_with_cache_status(
+        self, test_client, mock_sheets_client
+    ):
+        """Field-by-field rather than whole-payload equality: adding a new
+        field to ReadinessResponse is not a regression, but a dropped or
+        wrong status - or a cache block that stops reflecting the sheets
+        client - is."""
+        response = test_client.get("/health/ready")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "healthy"
+        assert data["shopmonkey"] == "healthy"
+        assert data["sheets"] == "healthy"
+        # The probe must surface the live cache block, not a static stub.
+        assert data["sheets_cache"] == mock_sheets_client.get_cache_status.return_value
+
+    def test_shopmonkey_reporting_unhealthy_degrades_to_503(
+        self, test_client, mock_shopmonkey_client
+    ):
+        mock_shopmonkey_client.health_check = AsyncMock(return_value=False)
+        response = test_client.get("/health/ready")
+        assert response.status_code == 503
+        assert response.json()["shopmonkey"] == "unhealthy"
+
+    def test_shopmonkey_raising_is_treated_as_unhealthy(self, test_client, mock_shopmonkey_client):
+        """A raising health check must not 500 the probe itself."""
+        mock_shopmonkey_client.health_check = AsyncMock(side_effect=RuntimeError("connect fail"))
+        response = test_client.get("/health/ready")
+        assert response.status_code == 503
+        assert response.json()["shopmonkey"] == "unhealthy"
+
+    def test_sheets_raising_is_treated_as_unhealthy(self, test_client, mock_sheets_client):
+        mock_sheets_client.health_check = AsyncMock(side_effect=RuntimeError("no creds"))
+        response = test_client.get("/health/ready")
+        assert response.status_code == 503
+        data = response.json()
+        assert data["sheets"] == "unhealthy"
+        assert data["status"] == "degraded"
+
+
+class TestCorsOrigins:
+    """Tests for get_cors_origins - it decides who may call the API."""
+
+    def test_unset_means_no_origins(self, main_module):
+        with patch.dict(os.environ, {"ALLOWED_ORIGINS": ""}, clear=False):
+            assert main_module.get_cors_origins() == []
+
+    def test_wildcard_is_passed_through_intact(self, main_module):
+        """ "*" must stay a wildcard, not become a literal origin named "*"."""
+        with patch.dict(os.environ, {"ALLOWED_ORIGINS": "*"}, clear=False):
+            assert main_module.get_cors_origins() == ["*"]
+
+    def test_comma_list_is_split_and_trimmed(self, main_module):
+        with patch.dict(
+            os.environ,
+            {"ALLOWED_ORIGINS": " https://a.example , https://b.example ,, "},
+            clear=False,
+        ):
+            assert main_module.get_cors_origins() == ["https://a.example", "https://b.example"]
+
+
+class TestStartupFailures:
+    """Tests for lifespan - a misconfigured deploy must refuse to serve.
+
+    Booting "successfully" with no config or no credentials would let Cloud
+    Run route live traffic at an app that 500s every request.
+    """
+
+    def _boot(self, match, **patches):
+        """Boot the app expecting a RuntimeError whose message matches.
+
+        `match` is required: a bare pytest.raises(RuntimeError) is satisfied
+        by ANY startup RuntimeError, so all three cases below would pass on
+        a single unrelated failure and the distinct abort reasons - which
+        are what an operator reads out of the Cloud Run logs - would go
+        unverified.
+        """
+        from main import app
+
+        with patch.dict(os.environ, {"API_KEY": "", "ALLOWED_ORIGINS": ""}, clear=False):
+            with patch.multiple("main", **patches):
+                with pytest.raises(RuntimeError, match=match):
+                    with TestClient(app):
+                        pass
+
+    def test_missing_config_file_aborts_startup(self, mock_shopmonkey_client, mock_sheets_client):
+        self._boot(
+            match=r"^Configuration file not found: config\.yaml$",
+            load_config=MagicMock(side_effect=FileNotFoundError("config.yaml")),
+            ShopmonkeyClient=MagicMock(return_value=mock_shopmonkey_client),
+            SheetsClient=MagicMock(return_value=mock_sheets_client),
+        )
+
+    def test_invalid_config_aborts_startup(self, mock_shopmonkey_client, mock_sheets_client):
+        self._boot(
+            match=r"^Invalid configuration: business_hours missing$",
+            load_config=MagicMock(return_value={}),
+            validate_config=MagicMock(side_effect=ValueError("business_hours missing")),
+            ShopmonkeyClient=MagicMock(return_value=mock_shopmonkey_client),
+            SheetsClient=MagicMock(return_value=mock_sheets_client),
+        )
+
+    def test_missing_credentials_abort_startup(self, mock_config):
+        self._boot(
+            match=r"^Failed to initialize clients: SHOPMONKEY_API_TOKEN not set$",
+            load_config=MagicMock(return_value=mock_config),
+            validate_config=MagicMock(),
+            ShopmonkeyClient=MagicMock(side_effect=ValueError("SHOPMONKEY_API_TOKEN not set")),
+        )
+
+
+class TestModuleHelpers:
+    """Tests for small helpers the endpoints lean on."""
+
+    def test_now_local_reads_the_clock_of_the_given_zone_and_is_naive(self, main_module):
+        """Two contracts, both load-bearing for the elapsed-slot guards.
+
+        Naiveness: the comparisons in /availability and /book are against
+        naive datetimes, so a tz-aware return would raise on every request.
+
+        The clock itself: _now_local must report wall time IN THE PASSED
+        ZONE. Reading UTC instead would move "now" ~6 hours forward, which
+        silently deletes the whole morning from /availability and lets the
+        /book past-slot 409 fire on slots that have not happened yet.
+        """
+        from availability import get_timezone
+
+        now = main_module._now_local(get_timezone({}))
+        assert now.tzinfo is None
+
+        central = ZoneInfo("America/Chicago")
+        central_now = main_module._now_local(central)
+        utc_now = main_module._now_local(ZoneInfo("UTC"))
+        assert central_now.tzinfo is None
+        assert utc_now.tzinfo is None
+
+        # Central trails UTC by its current offset: 6h in CST, 5h in CDT.
+        expected = -datetime.now(central).utcoffset()
+        assert expected in (timedelta(hours=5), timedelta(hours=6))
+        assert abs((utc_now - central_now) - expected) < timedelta(seconds=5)
+
+    async def test_fetch_appointments_tags_busy_tech_ids(self, main_module):
+        """Each appointment is annotated with the union of directly assigned
+        technicians and the ones reached through its order's labors - that
+        annotation is what lets availability drop only the busy techs."""
+        client = AsyncMock()
+        client.get_appointments_for_date = AsyncMock(
+            return_value=[{"id": "a1"}, {"id": "a2"}, {"id": "a3"}]
+        )
+        client.get_busy_techs_for_appointments = AsyncMock(
+            return_value={"a1": {"tech-2", "tech-1"}, "a2": set()}
+        )
+        with patch("main.shopmonkey_client", client):
+            appointments = await main_module._fetch_appointments_with_busy_techs("2026-01-19")
+
+        by_id = {a["id"]: a["_busyTechIds"] for a in appointments}
+        assert by_id["a1"] == ["tech-1", "tech-2"]
+        assert by_id["a2"] == []
+        # An appointment absent from the map is unattributed, not busy.
+        assert by_id["a3"] == []
+
+    async def test_fetch_appointments_without_a_client_returns_empty(self, main_module):
+        with patch("main.shopmonkey_client", None):
+            assert await main_module._fetch_appointments_with_busy_techs("2026-01-19") == []
+
+    def test_schedule_page_404s_when_the_widget_is_missing(self, test_client):
+        """A broken image build must surface as 404, not a stack trace."""
+        with patch("main.static_dir", "/nonexistent-static-dir"):
+            response = test_client.get("/schedule")
+        assert response.status_code == 404

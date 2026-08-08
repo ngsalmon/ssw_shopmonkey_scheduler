@@ -18,14 +18,19 @@ from availability import (
     cap_by_concurrency,
     check_slot_availability_for_duration,
     collect_multiday_future_dates,
+    count_multiday_overlap_capacity,
     count_overlapping_appointments,
     drop_elapsed_slots,
+    generate_slot_start_times,
     generate_time_slots,
     get_buffer_minutes,
+    get_buffer_minutes_from_labels,
     get_business_hours,
+    get_next_business_day,
     get_overlap_info_for_slot,
     get_service_duration_minutes,
     is_slot_available,
+    load_config,
     parse_appointment_times,
     slot_capacity,
     validate_config,
@@ -260,6 +265,31 @@ class TestCountOverlappingAppointments:
                 appointments=appointments,
             )
             == 0
+        )
+
+    def test_skips_booking_with_unparseable_dates(self):
+        """A malformed date on a real order must be skipped quietly rather than
+        crashing the availability check, and must not inflate the count."""
+        appointments = [
+            {
+                "orderId": "ord_bad",
+                "startDate": "not-a-date",
+                "endDate": "2026-01-19T10:00:00-06:00",
+            },
+            {
+                "orderId": "ord_ok",
+                "startDate": "2026-01-19T09:30:00-06:00",
+                "endDate": "2026-01-19T10:30:00-06:00",
+            },
+        ]
+        assert (
+            count_overlapping_appointments(
+                slot_start=time(9, 0),
+                slot_end=time(10, 0),
+                date=datetime(2026, 1, 19),
+                appointments=appointments,
+            )
+            == 1
         )
 
     def test_counts_multiple_overlapping_appointments(self):
@@ -545,6 +575,35 @@ class TestGetServiceDurationMinutes:
         service = {"estimatedDuration": "invalid"}
         assert get_service_duration_minutes(service, default_duration=60) == 60
 
+    def test_sums_labor_hours_into_minutes(self):
+        """labors[] is the primary duration source in Shopmonkey. A 1.5h + 0.5h
+        service must book a 2-hour window; getting this wrong sizes every slot
+        and every created appointment wrongly."""
+        service = {"labors": [{"hours": 1.5}, {"hours": 0.5}]}
+        assert get_service_duration_minutes(service) == 120
+
+    def test_labor_hours_win_over_duration_fields(self):
+        """Shopmonkey's own labor time is authoritative over any stale
+        estimatedDuration field left on the record."""
+        service = {"labors": [{"hours": 3}], "estimatedDuration": 45}
+        assert get_service_duration_minutes(service) == 180
+
+    def test_labor_with_unparseable_hours_is_skipped(self):
+        """One junk hours value must not crash the booking path nor discard
+        the sibling labor's time."""
+        service = {"labors": [{"hours": "abc"}, {"hours": 2}]}
+        assert get_service_duration_minutes(service) == 120
+
+    def test_labors_carrying_no_hours_fall_through_to_duration_field(self):
+        """Services often carry labors with hours unset. Those must not book a
+        zero-length appointment - the duration fields still apply."""
+        service = {"labors": [{"hours": None}, {"hours": 0}], "estimatedDuration": 90}
+        assert get_service_duration_minutes(service) == 90
+
+    def test_labors_carrying_no_hours_and_no_duration_use_default(self):
+        service = {"labors": [{}]}
+        assert get_service_duration_minutes(service, default_duration=45) == 45
+
 
 class TestGetBufferMinutes:
     """Tests for get_buffer_minutes function."""
@@ -636,6 +695,44 @@ class TestGetBufferMinutes:
         }
         assert get_buffer_minutes(service, config) == 0
 
+    def test_unparseable_config_buffer_is_skipped_and_search_continues(self):
+        """A typo'd buffer value in config.yaml must not crash the availability
+        path, and must not shadow a later label whose buffer is valid."""
+        service = {
+            "labels": [{"name": "Bedliner"}, {"name": "Window Tint"}],
+        }
+        config = {
+            "service_buffers": {"Bedliner": "three hours", "Window Tint": 45},
+        }
+        assert get_buffer_minutes(service, config) == 45
+
+    def test_sole_label_with_unparseable_config_buffer_silently_loses_it(self):
+        """HAZARD, not a desired behaviour: the production shape is a service
+        carrying only its department label. A typo'd value in config.yaml is
+        swallowed and the service schedules with NO cure buffer at all - a
+        bedliner books back-to-back instead of getting 3 hours of cure time.
+        Nothing surfaces the typo; this pins the silent-fallback cost."""
+        service = {"labels": [{"name": "Bedliner"}]}
+        config = {"service_buffers": {"Bedliner": "three hours"}}
+        assert get_buffer_minutes(service, config) == 0
+
+
+class TestGetBufferMinutesFromLabels:
+    """The deprecated alias still has callers' semantics to honour: labels
+    only, never config."""
+
+    def test_reads_the_buffer_label(self):
+        service = {"labels": [{"name": "Bedliner"}, {"name": "buffer:90"}]}
+        assert get_buffer_minutes_from_labels(service) == 90
+
+    def test_never_consults_config_buffers(self):
+        """The alias hard-wires config=None, so a department buffer that
+        get_buffer_minutes would apply is invisible through this path. Callers
+        still on the alias silently lose configured buffers."""
+        service = {"labels": [{"name": "Bedliner"}]}
+        assert get_buffer_minutes(service, {"service_buffers": {"Bedliner": 180}}) == 180
+        assert get_buffer_minutes_from_labels(service) == 0
+
 
 class TestValidateConfig:
     """Tests for validate_config function."""
@@ -723,6 +820,94 @@ class TestValidateConfig:
         }
         with pytest.raises(ValueError, match="positive number"):
             validate_config(config)
+
+    def test_business_hours_as_list_raises(self):
+        """A YAML list under business_hours (a common indentation slip) must be
+        rejected with a config error, not blow up later with an AttributeError
+        deep inside slot generation."""
+        config = {
+            "business_hours": ["monday", "tuesday"],
+            "default_slot_duration_minutes": 60,
+        }
+        with pytest.raises(ValueError, match="must be a dictionary"):
+            validate_config(config)
+
+    def test_null_day_is_accepted_as_closed(self):
+        """config.yaml expresses a closed day as a bare `sunday:` (null). That
+        is the documented way to close a day and must validate."""
+        config = {
+            "business_hours": {
+                "monday": {"open": "09:00", "close": "17:00"},
+                "sunday": None,
+            },
+            "default_slot_duration_minutes": 60,
+        }
+        validate_config(config)  # Should not raise
+
+    def test_scalar_day_hours_raises(self):
+        """A day written as a string instead of open/close keys is malformed;
+        reject it up front rather than treating the day as closed."""
+        config = {
+            "business_hours": {"monday": "09:00-17:00"},
+            "default_slot_duration_minutes": 60,
+        }
+        with pytest.raises(ValueError, match="dictionary or null"):
+            validate_config(config)
+
+
+class TestLoadConfig:
+    """load_config is the single path that reads config.yaml at startup."""
+
+    def test_parses_yaml_into_a_validatable_config(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            "business_hours:\n"
+            "  monday:\n"
+            "    open: '09:00'\n"
+            "    close: '17:00'\n"
+            "  sunday:\n"
+            "default_slot_duration_minutes: 60\n"
+        )
+        config = load_config(str(path))
+        assert config["default_slot_duration_minutes"] == 60
+        assert config["business_hours"]["monday"] == {"open": "09:00", "close": "17:00"}
+        assert config["business_hours"]["sunday"] is None
+
+    def test_missing_file_raises(self, tmp_path):
+        """A missing config must fail loudly at startup; silently returning an
+        empty config would report every day closed."""
+        with pytest.raises(FileNotFoundError):
+            load_config(str(tmp_path / "does-not-exist.yaml"))
+
+
+class TestGetNextBusinessDay:
+    """Multi-day services roll forward through this helper; returning a closed
+    day would schedule work on a day nobody is in the shop."""
+
+    WEEKDAYS = {
+        "business_hours": {
+            "monday": {"open": "09:00", "close": "17:00"},
+            "tuesday": {"open": "09:00", "close": "17:00"},
+            "wednesday": {"open": "09:00", "close": "17:00"},
+            "thursday": {"open": "09:00", "close": "17:00"},
+            "friday": {"open": "09:00", "close": "17:00"},
+        }
+    }
+
+    def test_skips_the_weekend(self):
+        # Friday 2026-01-23 -> Monday 2026-01-26.
+        assert get_next_business_day(datetime(2026, 1, 23), self.WEEKDAYS) == datetime(2026, 1, 26)
+
+    def test_reaches_a_day_a_full_week_out(self):
+        """With only Mondays open the answer sits at the far edge of the
+        7-day lookahead; a shorter search would wrongly report None."""
+        config = {"business_hours": {"monday": {"open": "09:00", "close": "17:00"}}}
+        assert get_next_business_day(datetime(2026, 1, 19), config) == datetime(2026, 1, 26)
+
+    def test_returns_none_when_never_open(self):
+        """No open day in range -> None, so callers refuse the booking instead
+        of picking an arbitrary closed date."""
+        assert get_next_business_day(datetime(2026, 1, 19), {"business_hours": {}}) is None
 
 
 class TestCalculateDaysNeeded:
@@ -1313,6 +1498,69 @@ class TestCollectMultidayFutureDates:
             self.CONFIG,  # Saturday
         )
         assert result == []
+
+
+class TestGenerateSlotStartTimes:
+    """Start times drive which slots are offered at all."""
+
+    def test_returns_empty_when_closed(self):
+        """A closed day must yield no start times; without the guard the loop
+        would build slots out of None open/close times."""
+        assert generate_slot_start_times(BusinessHours(None, None), 60) == []
+
+    def test_starts_are_interval_spaced_and_stop_before_close(self):
+        """The last start must be strictly before close - a start AT close
+        would advertise a slot with no time left in the day."""
+        starts = generate_slot_start_times(BusinessHours(time(9, 0), time(11, 0)), 30)
+        assert starts == [time(9, 0), time(9, 30), time(10, 0), time(10, 30)]
+
+
+class TestCountMultidayOverlapCapacity:
+    """Direct tests for the multi-day capacity helper's degenerate inputs,
+    which silently zero out capacity rather than raising."""
+
+    CONFIG = {
+        "business_hours": {
+            "monday": {"open": "09:00", "close": "17:00"},
+            "tuesday": {"open": "09:00", "close": "17:00"},
+        },
+        "default_slot_duration_minutes": 60,
+    }
+
+    def test_empty_days_needed_has_no_capacity(self):
+        """An empty segmentation describes no bookable time at all; it must not
+        fall through and report the first day's free techs as available."""
+        capacity, free = count_multiday_overlap_capacity(
+            days_needed=[],
+            first_day_appointments=[],
+            first_day_start_time=time(9, 0),
+            first_day_close_time=time(17, 0),
+            future_appointments={},
+            config=self.CONFIG,
+            tech_ids=["tech1", "tech2"],
+        )
+        assert capacity == 0
+        assert free == []
+
+    def test_continuation_day_that_is_closed_has_no_capacity(self):
+        """If a spanned day is closed there are no working hours to finish in,
+        so the slot must report zero capacity - never treat a closed day as
+        wide open and let the booking through."""
+        days_needed = [
+            (datetime(2026, 1, 19), 480),  # Monday, open
+            (datetime(2026, 1, 24), 60),  # Saturday, closed
+        ]
+        capacity, free = count_multiday_overlap_capacity(
+            days_needed=days_needed,
+            first_day_appointments=[],
+            first_day_start_time=time(9, 0),
+            first_day_close_time=time(17, 0),
+            future_appointments={},
+            config=self.CONFIG,
+            tech_ids=["tech1", "tech2"],
+        )
+        assert capacity == 0
+        assert free == []
 
 
 class TestCheckSlotAvailabilityForDuration:
