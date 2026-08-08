@@ -1405,35 +1405,78 @@ class TestCannedServiceLineItemBuilders:
         # A completely empty fee still produces a well-formed line.
         assert fees[1] == {"name": "", "amountCents": 0}
 
-    def test_subcontract_reads_both_legacy_and_current_cost_fields(self, main_module):
-        """The REST API moved wholesaleCostCents -> costCents; during the
-        transition either one may be the only field present, and dropping the
-        cost turns a subcontract into pure profit on the ticket."""
+    def test_subcontract_cost_is_sent_as_cost_cents(self, main_module):
+        """A subcontract's cost field is `costCents`, not `wholesaleCostCents`
+        (that one belongs to parts - different entity schemas, verified against
+        prod 2026-08-07). Sending the value under the parts key would use a
+        field the subcontract has no slot for, dropping the cost and putting
+        the line on the ticket as pure profit."""
         subs = main_module.canned_service_subcontracts_for_attach(
             {
                 "subcontracts": [
                     {
                         "name": "Dent removal",
                         "retailCostCents": 20000.4,
-                        "wholesaleCostCents": 12000,
-                        "costCents": 999,
+                        "costCents": 12000,
                         "taxable": True,
                         "vendorId": "v9",
-                    },
-                    {"name": "Glass", "retailCostCents": 5000, "costCents": 3000.6},
-                    {"name": "Bare"},
+                    }
                 ]
             }
         )
-        # Legacy field wins when both are present.
-        assert subs[0]["wholesaleCostCents"] == 12000
-        assert subs[0]["retailCostCents"] == 20000
+        assert subs[0]["costCents"] == 12000
+        assert "wholesaleCostCents" not in subs[0], "that key is for parts, not subcontracts"
+        assert subs[0]["retailCostCents"] == 20000  # cents are coerced to int
         assert subs[0]["taxable"] is True
         assert subs[0]["vendorId"] == "v9"
-        # Falls back to the current field.
-        assert subs[1]["wholesaleCostCents"] == 3001
-        # Neither present: no cost key at all rather than a bogus zero.
-        assert subs[2] == {"name": "Bare", "retailCostCents": 0}
+
+    def test_subcontract_falls_back_to_the_parts_key_if_it_ever_appears(self, main_module):
+        """Defensive only: no live payload carries wholesaleCostCents on a
+        subcontract, but reading it costs nothing and covers a schema change.
+        It must still be EMITTED as costCents."""
+        subs = main_module.canned_service_subcontracts_for_attach(
+            {
+                "subcontracts": [
+                    {"name": "Glass", "retailCostCents": 5000, "wholesaleCostCents": 3000.6}
+                ]
+            }
+        )
+        assert subs[0]["costCents"] == 3001
+        assert "wholesaleCostCents" not in subs[0]
+
+    def test_subcontract_prefers_cost_cents_when_both_are_present(self, main_module):
+        """Can't happen against today's API, but if it ever did, the
+        subcontract's own field must win over the parts key."""
+        subs = main_module.canned_service_subcontracts_for_attach(
+            {"subcontracts": [{"name": "Both", "costCents": 999, "wholesaleCostCents": 12000}]}
+        )
+        assert subs[0]["costCents"] == 999
+
+    def test_subcontract_without_any_cost_omits_the_key(self, main_module):
+        """No cost key at all rather than a bogus zero, which would understate
+        the shop's cost instead of leaving it visibly unset."""
+        subs = main_module.canned_service_subcontracts_for_attach(
+            {"subcontracts": [{"name": "Bare"}]}
+        )
+        assert subs[0] == {"name": "Bare", "retailCostCents": 0}
+
+    def test_parts_keep_the_wholesale_key(self, main_module):
+        """The asymmetry is the point: parts really do use wholesaleCostCents,
+        so a well-meaning "consistency" fix across both builders is wrong."""
+        parts = main_module.canned_service_parts_for_attach(
+            {
+                "parts": [
+                    {
+                        "name": "Ceramic IR",
+                        "quantity": 1.5,
+                        "retailCostCents": 1667,
+                        "wholesaleCostCents": 1189,
+                    }
+                ]
+            }
+        )
+        assert parts[0]["wholesaleCostCents"] == 1189
+        assert "costCents" not in parts[0], "that key is for subcontracts, not parts"
 
     def test_attach_payload_stamps_assigned_tech_on_every_labor(self, main_module):
         """Every labor must carry technicianId, otherwise the next

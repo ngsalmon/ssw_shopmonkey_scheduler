@@ -638,17 +638,49 @@ def _to_local(iso_str: str) -> datetime:
     )
 
 
-def _make_service(service_id: str, name: str, department: str, hours: float) -> dict[str, Any]:
+def _make_service(
+    service_id: str,
+    name: str,
+    department: str,
+    hours: float,
+    parts: list[dict[str, Any]] | None = None,
+    subcontracts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     return {
         "id": service_id,
         "name": name,
         "labels": [{"name": department}],
         "labors": [{"name": name, "hours": hours, "rateCents": 12000}],
-        "parts": [],
+        "parts": parts or [],
         "fees": [],
-        "subcontracts": [],
+        "subcontracts": subcontracts or [],
         "totalCents": int(hours * 12000),
     }
+
+
+# Shaped like the real canned-service payloads (values taken from prod
+# 2026-08-07). The cost keys differ BY ENTITY and that asymmetry is the point:
+# a part carries wholesaleCostCents and no costCents; a subcontract carries
+# costCents and no wholesaleCostCents. Sending either under the other's key
+# drops the cost and the line lands on the ticket as pure profit.
+BEDLINER_PARTS = [
+    {
+        "name": "Bedliner",
+        "quantity": 1.5,
+        "wholesaleCostCents": 21200,
+        "retailCostCents": 31500,
+        "partNumber": "BL-REG",
+        "taxable": True,
+    }
+]
+BEDLINER_SUBCONTRACTS = [
+    {
+        "name": "Spray-in application",
+        "costCents": 32500,
+        "retailCostCents": 55000,
+        "taxable": False,
+    }
+]
 
 
 class FakeWorld:
@@ -672,7 +704,16 @@ class FakeWorld:
             # 3 techs but a MAX CONCURRENCY of 2 bays.
             "svc_bay": _make_service("svc_bay", "Bay Service", "Bay", 1.0),
             # 2h labor + 180 min config buffer = 300 min of calendar.
-            "svc_bedliner": _make_service("svc_bedliner", "Bedliner - Short Bed", "Bedliner", 2.0),
+            # Also the only service carrying parts AND subcontracts, so the
+            # attach payload's cost keys are exercised end to end.
+            "svc_bedliner": _make_service(
+                "svc_bedliner",
+                "Bedliner - Short Bed",
+                "Bedliner",
+                2.0,
+                parts=BEDLINER_PARTS,
+                subcontracts=BEDLINER_SUBCONTRACTS,
+            ),
         }
         self.techs: list[dict[str, Any]] = [
             {
@@ -1573,3 +1614,54 @@ def test_offline_attached_service_stamps_the_assigned_tech_on_every_labor(client
     assert labors, "expected the canned service's labor lines to be attached"
     assigned = {labor.get("technicianId") for labor in labors}
     assert assigned == {"tech_alex"}, assigned
+
+
+def test_offline_attached_line_items_carry_their_own_cost_field(client, world):
+    """Booking a service with parts AND a subcontract must land BOTH costs on
+    the ticket, each under the key its own entity uses.
+
+    Parts and subcontracts are separate schemas: a part's cost is
+    `wholesaleCostCents`, a subcontract's is `costCents`, and no live payload
+    carries both (verified against prod 2026-08-07). Emitting a subcontract's
+    cost under the parts key sends a field the entity has no slot for, so the
+    cost silently vanishes and the shop bills the job as pure profit - the
+    money is only wrong on the shop's side, so nothing user-facing complains.
+    """
+    # Bedliner is 2h labor + a 180-minute config buffer.
+    assert _post_book(client, "svc_bedliner", WED, "09:00", "11:00").status_code == 200
+
+    order = next(iter(world.orders.values()))
+    attached = order["services"]
+    assert attached, "expected the canned service to be attached to the order"
+
+    parts = [p for svc in attached for p in svc.get("parts", [])]
+    subs = [s for svc in attached for s in svc.get("subcontracts", [])]
+    assert len(parts) == 1, parts
+    assert len(subs) == 1, subs
+
+    # The part keeps the parts key, with its wholesale cost intact.
+    assert parts[0]["wholesaleCostCents"] == 21200
+    assert parts[0]["retailCostCents"] == 31500
+    assert "costCents" not in parts[0], "costCents belongs to subcontracts, not parts"
+
+    # The subcontract keeps the subcontract key - this is the regression.
+    assert subs[0]["costCents"] == 32500, "subcontract cost must survive the attach"
+    assert subs[0]["retailCostCents"] == 55000
+    assert "wholesaleCostCents" not in subs[0], (
+        "wholesaleCostCents is the parts key; a subcontract has no such field, "
+        "so the cost would be dropped and the line billed as pure profit"
+    )
+
+
+def test_offline_booking_still_succeeds_for_services_without_line_items(client, world):
+    """The line-item builders must stay tolerant of the common shape: most
+    bookable services carry no parts, fees, or subcontracts at all (0 of 21 in
+    prod have a subcontract), so an empty list must not become a bogus zero-cost
+    line or break the attach."""
+    assert _post_book(client, "svc_tint", WED, "09:00", "10:30").status_code == 200
+
+    order = next(iter(world.orders.values()))
+    for svc in order["services"]:
+        assert svc.get("parts") == []
+        assert svc.get("subcontracts") == []
+        assert svc.get("fees") == []

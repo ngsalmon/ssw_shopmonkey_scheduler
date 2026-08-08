@@ -163,6 +163,10 @@ def canned_service_parts_for_attach(service: dict[str, Any]) -> list[dict[str, A
     Parts were missing entirely pre-fix because we only forwarded labors,
     which is why tickets showed labor only and no parts (e.g. the Window
     Tint Ceramic ticket missing its 3.5 yards of "Ceramic IR" film).
+
+    A part's cost field is `wholesaleCostCents`; a SUBCONTRACT's is `costCents`.
+    The asymmetry is deliberate and matches the API - see
+    `canned_service_subcontracts_for_attach` before "fixing" it to match.
     """
     parts: list[dict[str, Any]] = []
     for part in service.get("parts", []) or []:
@@ -213,22 +217,37 @@ def canned_service_subcontracts_for_attach(
 ) -> list[dict[str, Any]]:
     """Extract subcontract lines from a canned service for line-item attach.
 
-    The REST API now returns `costCents`; older payloads used
-    `wholesaleCostCents`. Read both so we cover the transition window.
+    Parts and subcontracts name their cost field differently, and that is NOT a
+    versioning artifact - they are separate entity schemas (verified read-only
+    against prod 2026-08-07):
+
+        parts        -> wholesaleCostCents  (+ retailCostCents)
+        subcontracts -> costCents           (+ retailCostCents)
+
+    No payload carries both. `wholesaleCostCents` appeared on zero subcontracts
+    across the canned-service list, the canned-service detail endpoint, and live
+    order subcontracts; `costCents` appeared on zero part lines. An earlier
+    comment here described a `wholesaleCostCents` -> `costCents` migration and a
+    "transition window" - no such migration happened.
+
+    That matters on the WRITE side: sending a subcontract's cost under
+    `wholesaleCostCents` uses a key the entity has no field for, so the cost is
+    dropped and the subcontract lands on the ticket as pure profit. We read
+    `costCents` and send `costCents`. The `wholesaleCostCents` read is kept only
+    as a defensive fallback - it costs nothing and would cover a future schema
+    change - but it never fires against today's API.
     """
     subs: list[dict[str, Any]] = []
     for sub in service.get("subcontracts", []) or []:
-        cost = (
-            sub.get("wholesaleCostCents")
-            if sub.get("wholesaleCostCents") is not None
-            else sub.get("costCents")
-        )
+        cost = sub.get("costCents")
+        if cost is None:
+            cost = sub.get("wholesaleCostCents")
         item: dict[str, Any] = {
             "name": sub.get("name") or "",
             "retailCostCents": _safe_cents(sub.get("retailCostCents")),
         }
         if cost is not None:
-            item["wholesaleCostCents"] = _safe_cents(cost)
+            item["costCents"] = _safe_cents(cost)
         if "taxable" in sub:
             item["taxable"] = bool(sub["taxable"])
         if sub.get("vendorId"):
