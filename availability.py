@@ -111,8 +111,86 @@ def validate_config(config: dict[str, Any]) -> None:
         )
 
 
+CLOSED = BusinessHours(open_time=None, close_time=None)
+
+
+def is_closed_by_config(config: dict[str, Any] | None, date: datetime) -> bool:
+    """True when `closures.dates` in config.yaml names this date.
+
+    The config half of closure handling. It needs no calendar data, so it is
+    applied inside `get_business_hours` - that makes a configured holiday
+    close the day for EVERY caller at once, including `get_next_business_day`,
+    so a multi-day service rolls over a holiday instead of scheduling work on
+    it. The calendar half (`closures.title_patterns`) can only be evaluated
+    where a day's appointments are in hand; see `is_closed_by_calendar`.
+    """
+    if not config:
+        return False
+    dates = (config.get("closures") or {}).get("dates") or []
+    target = date.strftime("%Y-%m-%d")
+    return any(str(d).strip() == target for d in dates)
+
+
+def is_closed_by_calendar(
+    appointments: list[dict[str, Any]],
+    config: dict[str, Any] | None,
+) -> bool:
+    """True when the day's calendar carries a shop-wide closure entry.
+
+    A closure entry is one that names NO technician and carries NO `orderId` -
+    i.e. nobody's work - whose `name` contains one of `closures.title_patterns`
+    (case-insensitive substring). "Labor Day - Closed" qualifies; "Cars &
+    Coffee", "HVAC Guy" and "Lunch" do not, and neither does anything assigned
+    to a tech or backed by a ticket, because those are somebody's job rather
+    than a shutdown.
+
+    A match closes the WHOLE day regardless of the entry's own window. Staff
+    stamp these approximately - "Labor Day - Closed" runs 09:00-16:30 against
+    09:00-17:30 shop hours - and honoring the literal window would leave a
+    17:00 slot bookable on a day the shop is shut.
+
+    `appointments` must already carry `_busyTechIds` (see
+    `_fetch_appointments_with_busy_techs`); an entry that names a tech only via
+    its order's labors still counts as somebody's work.
+    """
+    if not config:
+        return False
+    patterns = [
+        str(p).strip().lower() for p in (config.get("closures") or {}).get("title_patterns") or []
+    ]
+    patterns = [p for p in patterns if p]
+    if not patterns:
+        return False
+
+    for appt in appointments:
+        if appt.get("orderId") or (appt.get("_busyTechIds") or []):
+            continue
+        name = (appt.get("name") or "").lower()
+        if any(p in name for p in patterns):
+            return True
+    return False
+
+
+def is_shop_closed(
+    date: datetime,
+    appointments: list[dict[str, Any]],
+    config: dict[str, Any] | None,
+) -> bool:
+    """True when the shop is closed all day, from either closure source."""
+    return is_closed_by_config(config, date) or is_closed_by_calendar(appointments, config)
+
+
 def get_business_hours(config: dict[str, Any], date: datetime) -> BusinessHours:
-    """Get business hours for a specific date."""
+    """Get business hours for a specific date.
+
+    Returns closed hours for dates listed in `closures.dates`, so a configured
+    holiday is invisible to slot generation and to `get_next_business_day`.
+    Calendar-driven closures are handled separately (`is_closed_by_calendar`)
+    because they need the day's appointments, which this function never sees.
+    """
+    if is_closed_by_config(config, date):
+        return CLOSED
+
     day_name = date.strftime("%A").lower()
     day_config = config.get("business_hours", {}).get(day_name)
 
@@ -489,6 +567,13 @@ def count_multiday_overlap_capacity(
         date_str = date.strftime("%Y-%m-%d")
         day_appointments = future_appointments.get(date_str, [])
 
+        # A continuation day carrying a shop-wide closure entry has no capacity
+        # at all, so the whole multi-day slot is off. (Config-listed holidays
+        # never reach here - get_business_hours already reports them closed,
+        # which is caught by the is_open guard above.)
+        if is_closed_by_calendar(day_appointments, config):
+            return 0, []
+
         cap, free = slot_capacity(
             day_hours.open_time,
             needed_end,
@@ -569,6 +654,12 @@ def check_slot_availability_for_duration(
     days_needed = calculate_days_needed(duration_minutes, date, slot_start, config)
     if not days_needed:
         return (False, [], [])
+
+    # Mirror of the /availability closure filter, inside the booking lock. A
+    # stale widget still holding yesterday's slot list must not be able to book
+    # a day that has since been marked closed.
+    if is_closed_by_calendar(appointments, config):
+        return (False, [], days_needed)
 
     tz = get_timezone(config)
 
@@ -682,6 +773,12 @@ def calculate_available_slots(
     business_hours = get_business_hours(config, date)
 
     if not business_hours.is_open:
+        return []
+
+    # A shop-wide closure entry on the calendar ("Labor Day - Closed") takes the
+    # whole day off the board. Checked here rather than in get_business_hours
+    # because only this layer has the day's appointments.
+    if is_closed_by_calendar(appointments, config):
         return []
 
     if slot_duration_minutes is None:

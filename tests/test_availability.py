@@ -29,6 +29,9 @@ from availability import (
     get_next_business_day,
     get_overlap_info_for_slot,
     get_service_duration_minutes,
+    is_closed_by_calendar,
+    is_closed_by_config,
+    is_shop_closed,
     is_slot_available,
     load_config,
     parse_appointment_times,
@@ -2143,3 +2146,200 @@ class TestDurationRounding:
     def test_whole_hours_are_unchanged(self):
         assert get_service_duration_minutes({"labors": [{"hours": 2}]}) == 120
         assert get_service_duration_minutes({"labors": [{"hours": 2.5}]}) == 150
+
+
+class TestShopClosures:
+    """Tests for shop-wide closure handling.
+
+    The bug these cover: the shop had "Labor Day - Closed" sitting on
+    2026-09-07 and prod still offered nine bookable slots that day. Closure
+    entries name no technician and carry no work order, so the per-tech
+    overlap logic - which only ever subtracts *assigned* people from the pool -
+    saw nothing to subtract and reported a full crew.
+    """
+
+    HOURS = {
+        "business_hours": {
+            "monday": {"open": "09:00", "close": "17:30"},
+            "tuesday": {"open": "09:00", "close": "17:30"},
+            "wednesday": {"open": "09:00", "close": "17:30"},
+            "thursday": {"open": "09:00", "close": "17:30"},
+            "friday": {"open": "09:00", "close": "17:30"},
+            "saturday": None,
+            "sunday": None,
+        },
+        "default_slot_duration_minutes": 60,
+    }
+
+    def _config(self, **closures):
+        return {**self.HOURS, "closures": closures} if closures else dict(self.HOURS)
+
+    @staticmethod
+    def _entry(name, start="2026-09-07T14:00:00Z", end="2026-09-07T21:30:00Z", **extra):
+        return {
+            "id": "c1",
+            "name": name,
+            "startDate": start,
+            "endDate": end,
+            "orderId": None,
+            "_busyTechIds": [],
+            **extra,
+        }
+
+    # -- config-listed dates -------------------------------------------------
+
+    def test_configured_date_closes_the_day(self):
+        config = self._config(dates=["2026-09-07"])
+        assert is_closed_by_config(config, datetime(2026, 9, 7)) is True
+        assert get_business_hours(config, datetime(2026, 9, 7)).is_open is False
+
+    def test_configured_date_leaves_other_days_open(self):
+        config = self._config(dates=["2026-09-07"])
+        assert is_closed_by_config(config, datetime(2026, 9, 8)) is False
+        assert get_business_hours(config, datetime(2026, 9, 8)).is_open is True
+
+    def test_configured_holiday_is_skipped_by_next_business_day(self):
+        """The reason config dates are enforced inside get_business_hours: a
+        multi-day service must roll OVER a holiday, not schedule work on it."""
+        config = self._config(dates=["2026-09-08"])
+        # Monday the 7th -> the 8th is closed, so the next open day is the 9th.
+        assert get_next_business_day(datetime(2026, 9, 7), config) == datetime(2026, 9, 9)
+
+    def test_configured_date_yields_no_slots(self):
+        config = self._config(dates=["2026-09-07"])
+        slots = calculate_available_slots(
+            date=datetime(2026, 9, 7),
+            tech_ids=["t1", "t2"],
+            appointments=[],
+            config=config,
+            slot_duration_minutes=24,
+        )
+        assert slots == []
+
+    # -- calendar-driven closures -------------------------------------------
+
+    def test_closure_entry_on_the_calendar_yields_no_slots(self):
+        config = self._config(title_patterns=["closed"])
+        slots = calculate_available_slots(
+            date=datetime(2026, 9, 7),
+            tech_ids=["t1", "t2"],
+            appointments=[self._entry("Labor Day - Closed")],
+            config=config,
+            slot_duration_minutes=24,
+        )
+        assert slots == []
+
+    def test_closure_closes_the_whole_day_not_just_its_window(self):
+        """ "Labor Day - Closed" is stamped 09:00-16:30 against 09:00-17:30
+        hours. Honoring the literal window would leave 17:00 bookable on a day
+        the shop is shut."""
+        config = self._config(title_patterns=["closed"])
+        entry = self._entry(
+            "Labor Day - Closed",
+            start="2026-09-07T14:00:00Z",  # 09:00 CDT
+            end="2026-09-07T21:30:00Z",  # 16:30 CDT, well before the 17:30 close
+        )
+        slots = calculate_available_slots(
+            date=datetime(2026, 9, 7),
+            tech_ids=["t1"],
+            appointments=[entry],
+            config=config,
+            slot_duration_minutes=24,
+        )
+        assert slots == []
+
+    def test_matching_is_case_insensitive_and_substring(self):
+        config = self._config(title_patterns=["closed"])
+        for name in ("4th of July - Closed", "CLOSED", "closed for inventory"):
+            assert is_closed_by_calendar([self._entry(name)], config) is True
+
+    def test_entry_assigned_to_a_tech_is_not_a_closure(self):
+        """Someone's own time off can mention "closed" without shutting the
+        shop. Only an unowned entry is a shutdown."""
+        config = self._config(title_patterns=["closed"])
+        entry = self._entry("Chandler - road closed, running late", _busyTechIds=["t1"])
+        assert is_closed_by_calendar([entry], config) is False
+
+    def test_entry_backed_by_a_work_order_is_not_a_closure(self):
+        config = self._config(title_patterns=["closed"])
+        entry = self._entry("Closed deck lid respray", orderId="ord_1")
+        assert is_closed_by_calendar([entry], config) is False
+
+    def test_ordinary_shop_events_do_not_close_the_day(self):
+        """These all sit on the real calendar with no tech and no order. They
+        must stay bookable - blocking on every unowned entry was the naive fix
+        and it would have deleted real capacity."""
+        config = self._config(title_patterns=["closed"])
+        for name in (
+            "Cars & Coffee",
+            "HVAC Guy",
+            "Lunch - All employees",
+            "Transit windshield- KC Glass guys",
+            "Detail bay unavailable",
+        ):
+            assert is_closed_by_calendar([self._entry(name)], config) is False
+
+    def test_no_closures_config_never_closes(self):
+        config = dict(self.HOURS)
+        assert (
+            is_shop_closed(datetime(2026, 9, 7), [self._entry("Labor Day - Closed")], config)
+            is False
+        )
+
+    def test_empty_pattern_list_never_closes(self):
+        config = self._config(title_patterns=[])
+        assert is_closed_by_calendar([self._entry("Labor Day - Closed")], config) is False
+
+    def test_missing_config_is_tolerated(self):
+        assert is_closed_by_config(None, datetime(2026, 9, 7)) is False
+        assert is_closed_by_calendar([], None) is False
+
+    # -- booking path --------------------------------------------------------
+
+    def test_book_recheck_refuses_a_closed_day(self):
+        """Defense in depth: a widget still holding a slot list from before the
+        closure was added must not be able to book it."""
+        config = self._config(title_patterns=["closed"])
+        ok, techs, _ = check_slot_availability_for_duration(
+            date=datetime(2026, 9, 7),
+            slot_start=time(12, 0),
+            duration_minutes=24,
+            tech_ids=["t1", "t2"],
+            appointments=[self._entry("Labor Day - Closed")],
+            future_appointments={},
+            config=config,
+        )
+        assert ok is False
+        assert techs == []
+
+    def test_book_recheck_allows_an_open_day(self):
+        config = self._config(title_patterns=["closed"])
+        ok, techs, _ = check_slot_availability_for_duration(
+            date=datetime(2026, 9, 7),
+            slot_start=time(12, 0),
+            duration_minutes=24,
+            tech_ids=["t1", "t2"],
+            appointments=[self._entry("Cars & Coffee")],
+            future_appointments={},
+            config=config,
+        )
+        assert ok is True
+        assert techs == ["t1", "t2"]
+
+    # -- multi-day -----------------------------------------------------------
+
+    def test_closure_on_a_continuation_day_kills_the_multiday_slot(self):
+        """A two-day job starting the day before a closure has nowhere to put
+        day two, so the slot must not be offered at all."""
+        config = self._config(title_patterns=["closed"])
+        ok, techs, _ = check_slot_availability_for_duration(
+            date=datetime(2026, 9, 4),  # Friday
+            slot_start=time(16, 0),
+            duration_minutes=600,  # overflows into the next business day
+            tech_ids=["t1"],
+            appointments=[],
+            future_appointments={"2026-09-07": [self._entry("Labor Day - Closed")]},
+            config=config,
+        )
+        assert ok is False
+        assert techs == []

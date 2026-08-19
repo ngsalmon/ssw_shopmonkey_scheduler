@@ -32,6 +32,24 @@ default_slot_duration_minutes: 60
 service_buffers:
   Bedliner: 180  # 3 hours cure time
 
+# Shop-wide closures (holidays, all-hands events). Two independent sources,
+# either of which closes the WHOLE day - a day marked "Closed" means closed,
+# even when the calendar entry only spans part of it.
+#
+#   title_patterns - read live off the Shopmonkey calendar. A calendar entry
+#     with NO technician and NO work order whose name contains one of these
+#     (case-insensitive substring) closes the day. Lets staff close a day from
+#     Shopmonkey with no deploy. Entries that name a tech or carry an order are
+#     never treated as closures - those are somebody's work, not a shutdown.
+#   dates - explicit YYYY-MM-DD backstop, independent of calendar hygiene.
+closures:
+  title_patterns:
+    - "closed"
+  dates:
+    - "2026-09-07"  # Labor Day
+    - "2026-11-26"  # Thanksgiving
+    - "2026-12-25"  # Christmas
+
 # Temporarily disabled departments (case-insensitive substring match for exceptions)
 disabled_departments:
   Detail:
