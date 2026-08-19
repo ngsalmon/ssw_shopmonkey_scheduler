@@ -1253,6 +1253,59 @@ class TestSelectTechByPriority:
         # Back to the first tier: it resumes where it left off, at a2.
         assert main_module.select_tech_by_priority(techs, ["a1", "a2"], "Tint") == "a2"
 
+    def test_cursor_survives_a_round_where_the_last_pick_is_busy(
+        self, main_module, clean_round_robin
+    ):
+        """The regression this class exists for.
+
+        The cursor used to be an INDEX into the available list, whose
+        membership changes every slot as techs get booked. After picking t1 at
+        index 0, a round where t1 was busy left the list as [t2, t3] - and
+        index 1 pointed at t3, silently skipping t2 entirely. Anchoring on the
+        tech ID and walking the full roster resumes at the right person."""
+        techs = [
+            {"tech_id": "t1", "tech_name": "Ann", "priority": 1},
+            {"tech_id": "t2", "tech_name": "Bob", "priority": 1},
+            {"tech_id": "t3", "tech_name": "Cid", "priority": 1},
+        ]
+        assert main_module.select_tech_by_priority(techs, ["t1", "t2", "t3"], "Tint") == "t1"
+        # t1 is now busy. Next in the roster after t1 is t2 - not t3.
+        assert main_module.select_tech_by_priority(techs, ["t2", "t3"], "Tint") == "t2"
+        assert main_module.select_tech_by_priority(techs, ["t1", "t2", "t3"], "Tint") == "t3"
+
+    def test_rotation_skips_techs_who_are_busy_and_wraps(self, main_module, clean_round_robin):
+        """With the roster cursor sitting on t3, the next pick wraps to t1 -
+        and skips anyone unavailable on the way."""
+        techs = [
+            {"tech_id": "t1", "tech_name": "Ann", "priority": 1},
+            {"tech_id": "t2", "tech_name": "Bob", "priority": 1},
+            {"tech_id": "t3", "tech_name": "Cid", "priority": 1},
+        ]
+        clean_round_robin["Tint"] = {1: "t3"}
+        assert main_module.select_tech_by_priority(techs, ["t1", "t2"], "Tint") == "t1"
+
+    def test_only_free_techs_are_ever_selected(self, main_module, clean_round_robin):
+        """However the cursor lands, the result must come from the available
+        list - this is the last gate before someone is booked over their own
+        time off, which is exactly what Anne reported on 2026-08-17."""
+        techs = [{"tech_id": f"t{i}", "tech_name": f"T{i}", "priority": 1} for i in range(1, 6)]
+        for _ in range(20):
+            picked = main_module.select_tech_by_priority(techs, ["t2", "t4"], "Tint")
+            assert picked in ("t2", "t4")
+
+    def test_a_stale_cursor_pointing_at_a_departed_tech_restarts_cleanly(
+        self, main_module, clean_round_robin
+    ):
+        """A tech removed from the sheet leaves the cursor naming somebody who
+        is no longer on the roster. That must fall back to the top of the
+        roster, not crash the booking."""
+        techs = [
+            {"tech_id": "t1", "tech_name": "Ann", "priority": 1},
+            {"tech_id": "t2", "tech_name": "Bob", "priority": 1},
+        ]
+        clean_round_robin["Tint"] = {1: "gone-tech"}
+        assert main_module.select_tech_by_priority(techs, ["t1", "t2"], "Tint") == "t1"
+
 
 class TestCannedServiceLineItemBuilders:
     """Tests for the canned_service_*_for_attach payload builders.

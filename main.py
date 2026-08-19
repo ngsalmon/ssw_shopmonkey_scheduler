@@ -340,29 +340,57 @@ def select_tech_by_priority(
         # Only one tech at this priority, no round-robin needed
         return same_priority_techs[0]["tech_id"]
 
-    # Round-robin among techs with same priority
+    # Round-robin among techs with same priority.
+    #
+    # The cursor is the last tech ID handed out, NOT an index. It used to be an
+    # index into `same_priority_techs`, whose membership changes slot to slot
+    # as techs become busy - so "position 2 last time" pointed at a different
+    # person this time, and the rotation skipped and repeated arbitrarily.
+    # Anchoring on the ID and walking the stable roster fixes that: we resume
+    # immediately after whoever went last and take the first tech who is
+    # actually free, wrapping around.
+    #
+    # Still process-local, so a Cloud Run cold start restarts the rotation at
+    # the top of the roster. That biases the first booking of a cold instance
+    # toward the first-listed tech but never books an unavailable one, so it is
+    # a fairness wart rather than a correctness bug; fixing it properly needs
+    # shared state (the same constraint noted on `booking_lock`).
     if department not in round_robin_tracker:
         round_robin_tracker[department] = {}
 
     dept_tracker = round_robin_tracker[department]
-    last_index = dept_tracker.get(highest_priority, -1)
 
-    # Find next tech in rotation
-    next_index = (last_index + 1) % len(same_priority_techs)
-    selected_tech = same_priority_techs[next_index]
+    roster = [t["tech_id"] for t in qualified_techs if t["priority"] == highest_priority]
+    available_ids = {t["tech_id"] for t in same_priority_techs}
 
-    # Update tracker
-    dept_tracker[highest_priority] = next_index
+    last_id = dept_tracker.get(highest_priority)
+    start = roster.index(last_id) + 1 if last_id in roster else 0
+
+    selected_id = next(
+        (
+            roster[(start + offset) % len(roster)]
+            for offset in range(len(roster))
+            if roster[(start + offset) % len(roster)] in available_ids
+        ),
+        # Unreachable: available_ids is non-empty and is a subset of roster.
+        same_priority_techs[0]["tech_id"],
+    )
+
+    dept_tracker[highest_priority] = selected_id
 
     logger.debug(
         "tech_selected_by_priority",
         department=department,
         priority=highest_priority,
-        selected_tech=selected_tech["tech_name"],
-        round_robin_index=next_index,
+        selected_tech=next(
+            (t["tech_name"] for t in same_priority_techs if t["tech_id"] == selected_id),
+            selected_id,
+        ),
+        roster_size=len(roster),
+        available_count=len(available_ids),
     )
 
-    return selected_tech["tech_id"]
+    return selected_id
 
 
 # API Key authentication
