@@ -1,5 +1,6 @@
 """Unit tests for Shopmonkey client with retry logic and error handling."""
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -16,6 +17,7 @@ from shopmonkey_client import (
     ShopmonkeyAPIError,
     ShopmonkeyClient,
     ShopmonkeyNetworkError,
+    ShopmonkeyRateLimitError,
     ShopmonkeyTimeoutError,
 )
 
@@ -184,8 +186,9 @@ class TestShopmonkeyClientRetry:
             with pytest.raises(ShopmonkeyTimeoutError):
                 await client._request("GET", "/test")
 
-            # Should have tried 3 times (max retries)
-            assert mock_client.request.call_count == 3
+            # 5 attempts: raised from 3 when 429 joined the retryable set, so a
+            # burst of rate limiting has room to drain before we give up.
+            assert mock_client.request.call_count == 5
 
         await client.close()
 
@@ -466,15 +469,15 @@ class TestGetAppointmentsForDate:
         assert "where" in params
         where = json.loads(params["where"])
         assert "startDate" in where
-        # The key assertion: no $-prefixed operators leak through.
-        operators = where["startDate"]
-        assert "$gte" not in operators, "remove $ prefix; server ignores it"
-        assert "$lt" not in operators
-        assert "gte" in operators
-        assert "lt" in operators
-        # Bounds cover the requested local day in UTC.
-        assert operators["gte"].startswith("2026-05-27T")
-        assert operators["lt"].startswith("2026-05-27T")
+        assert "endDate" in where
+        # The key assertion: no $-prefixed operators leak through, on either key.
+        for key in ("startDate", "endDate"):
+            operators = where[key]
+            assert not any(op.startswith("$") for op in operators), (
+                f"remove $ prefix on {key}; server ignores it"
+            )
+        assert set(where["startDate"]) == {"lt"}
+        assert set(where["endDate"]) == {"gt"}
         await client.close()
 
     @pytest.mark.asyncio
@@ -569,24 +572,30 @@ class TestGetBusyTechsForAppointments:
         await client.close()
 
     @pytest.mark.asyncio
-    async def test_failed_order_fetch_falls_back_to_technicians_field(self):
-        """When the order fetch dies we must still keep the assignment the
-        appointment row already gave us - degrading to "nobody is busy" here
-        would hand out a slot to a tech who is demonstrably occupied."""
+    async def test_failed_order_fetch_fails_closed(self):
+        """A dead order fetch must abort the whole availability check, not
+        quietly return a smaller busy set.
+
+        Swallowing it looked conservative because the appointment row's own
+        `technicians[]` survived, but roughly a fifth of appointments name
+        their tech ONLY through the order's labors. For those, "fetch failed"
+        and "nobody is assigned" became indistinguishable, and the scheduler
+        handed a busy tech out as free. Surfacing the error turns that into a
+        502 the customer retries."""
         client = ShopmonkeyClient(api_token="test-token")
         mock_client = AsyncMock()
         mock_client.request = AsyncMock(side_effect=ShopmonkeyAPIError("boom", status_code=500))
         with patch.object(client, "_get_client", return_value=mock_client):
-            result = await client.get_busy_techs_for_appointments(
-                [
-                    {
-                        "id": "appt_1",
-                        "orderId": "ord_a",
-                        "technicians": [{"id": "tech_row"}],
-                    }
-                ]
-            )
-        assert result == {"appt_1": {"tech_row"}}
+            with pytest.raises(ShopmonkeyAPIError):
+                await client.get_busy_techs_for_appointments(
+                    [
+                        {
+                            "id": "appt_1",
+                            "orderId": "ord_a",
+                            "technicians": [{"id": "tech_row"}],
+                        }
+                    ]
+                )
         await client.close()
 
     @pytest.mark.asyncio
@@ -1363,10 +1372,15 @@ class TestGetAppointmentsForDateExtras:
         await client.close()
 
     @pytest.mark.asyncio
-    async def test_window_spans_the_whole_requested_day(self):
+    async def test_window_covers_the_whole_local_day_in_utc(self):
         """The window IS this function's job. A short end bound (e.g. noon)
         hides every afternoon appointment, and the availability engine then
-        double-books the afternoon."""
+        double-books the afternoon.
+
+        Bounds are the real America/Chicago day converted to UTC. The old
+        naive `2026-05-27T00:00:00Z`..`23:59:59Z` pair was actually the local
+        window 19:00 on the 26th to 18:59 on the 27th during CDT - it pulled in
+        the previous evening and truncated anything starting after 19:00."""
         client = ShopmonkeyClient(api_token="test-token")
         mock_client = AsyncMock()
         mock_client.request = AsyncMock(return_value=_ok([], meta={"hasMore": False}))
@@ -1374,10 +1388,45 @@ class TestGetAppointmentsForDateExtras:
             await client.get_appointments_for_date("2026-05-27")
         params = mock_client.request.call_args.kwargs["params"]
         where = json.loads(params["where"])
-        assert where["startDate"] == {
-            "gte": "2026-05-27T00:00:00Z",
-            "lt": "2026-05-27T23:59:59Z",
+        # CDT is UTC-5 in May: local midnight-to-midnight is 05:00Z to 05:00Z.
+        assert where == {
+            "startDate": {"lt": "2026-05-28T05:00:00.000Z"},
+            "endDate": {"gt": "2026-05-27T05:00:00.000Z"},
         }
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_window_is_an_overlap_test_not_a_start_time_test(self):
+        """An entry that STARTS before the requested day but runs into it must
+        still come back. Filtering on startDate alone made a multi-day time-off
+        block invisible on every day after its first, so the scheduler read
+        that technician as free and would book over their leave."""
+        client = ShopmonkeyClient(api_token="test-token")
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(return_value=_ok([], meta={"hasMore": False}))
+        with patch.object(client, "_get_client", return_value=mock_client):
+            await client.get_appointments_for_date("2026-05-27")
+        where = json.loads(mock_client.request.call_args.kwargs["params"]["where"])
+        # No lower bound on startDate: a block that began last week still matches.
+        assert "gte" not in where["startDate"]
+        assert "gt" not in where["startDate"]
+        # ...and no upper bound on endDate, so one running into next week matches too.
+        assert "lt" not in where["endDate"]
+        assert "lte" not in where["endDate"]
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_winter_date_uses_the_cst_offset(self):
+        """zoneinfo, not a hardcoded offset: January is CST (UTC-6), so the
+        same calendar day maps to a different UTC window than May."""
+        client = ShopmonkeyClient(api_token="test-token")
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(return_value=_ok([], meta={"hasMore": False}))
+        with patch.object(client, "_get_client", return_value=mock_client):
+            await client.get_appointments_for_date("2027-01-13")
+        where = json.loads(mock_client.request.call_args.kwargs["params"]["where"])
+        assert where["endDate"]["gt"] == "2027-01-13T06:00:00.000Z"
+        assert where["startDate"]["lt"] == "2027-01-14T06:00:00.000Z"
         await client.close()
 
     @pytest.mark.asyncio
@@ -1466,3 +1515,155 @@ class TestCustomerPhoneMatchingRequiresAFullNumber:
             ShopmonkeyClient._customer_matches(self._customer("+18165551234"), None, "816-555-9999")
             is False
         )
+
+
+def _http_error(status_code: int) -> httpx.HTTPStatusError:
+    """A real HTTPStatusError, so _request's own status handling runs."""
+    request = httpx.Request("GET", "https://api.shopmonkey.cloud/test")
+    response = httpx.Response(status_code, text="{}", request=request)
+    return httpx.HTTPStatusError("boom", request=request, response=response)
+
+
+class TestRateLimitHandling:
+    """Tests for HTTP 429.
+
+    429 used to land in the generic 4xx bucket, which tenacity was told not to
+    retry. Two things fell out of that: /availability returned 502 whenever the
+    shop's calendar was busy enough to fan out a lot of order reads, and the
+    per-appointment handler in get_busy_techs_for_appointments turned the error
+    into an empty tech set - reporting a booked technician as free.
+    """
+
+    @pytest.mark.asyncio
+    async def test_429_is_raised_as_a_rate_limit_error(self):
+        client = ShopmonkeyClient(api_token="test-token")
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(side_effect=_http_error(429))
+        with patch.object(client, "_get_client", return_value=mock_client):
+            with pytest.raises(ShopmonkeyRateLimitError) as exc:
+                await client._request("GET", "/test")
+        assert exc.value.status_code == 429
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_429_is_retried_and_recovers(self):
+        """The whole point: a transient limit must not surface to the customer."""
+        client = ShopmonkeyClient(api_token="test-token")
+        ok = httpx.Response(200, json={"data": []}, request=httpx.Request("GET", "https://x/test"))
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(side_effect=[_http_error(429), _http_error(429), ok])
+        with patch.object(client, "_get_client", return_value=mock_client):
+            with patch("tenacity.nap.time.sleep"):
+                result = await client._request("GET", "/test")
+        assert result == {"data": []}
+        assert mock_client.request.call_count == 3
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_a_rate_limit_error_is_still_a_shopmonkey_api_error(self):
+        """Callers catch ShopmonkeyAPIError; the new subclass must not slip
+        past their handlers and surface as an unhandled 500."""
+        assert issubclass(ShopmonkeyRateLimitError, ShopmonkeyAPIError)
+
+    @pytest.mark.asyncio
+    async def test_other_4xx_are_not_retried(self):
+        """A 400 is our bug. Retrying it only burns quota against the same
+        limiter that caused the problem."""
+        client = ShopmonkeyClient(api_token="test-token")
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(side_effect=_http_error(400))
+        with patch.object(client, "_get_client", return_value=mock_client):
+            with pytest.raises(ShopmonkeyAPIError):
+                await client._request("GET", "/test")
+        assert mock_client.request.call_count == 1
+        await client.close()
+
+
+class TestOrderFetchConcurrency:
+    """The labor walk fans out one order read per ticketed appointment. Left
+    unbounded it fired ~20 at once on a busy day and tripped the limiter - the
+    thing that made 429 handling matter in the first place."""
+
+    @pytest.mark.asyncio
+    async def test_order_fetches_are_capped(self):
+        client = ShopmonkeyClient(api_token="test-token")
+        in_flight = 0
+        peak = 0
+
+        async def slow_request(*args: Any, **kwargs: Any) -> httpx.Response:
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            try:
+                await asyncio.sleep(0)
+                return httpx.Response(
+                    200, json={"data": []}, request=httpx.Request("GET", "https://x/o")
+                )
+            finally:
+                in_flight -= 1
+
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(side_effect=slow_request)
+        appts = [{"id": f"a{i}", "orderId": f"o{i}", "technicians": []} for i in range(30)]
+        with patch.object(client, "_get_client", return_value=mock_client):
+            await client.get_busy_techs_for_appointments(appts)
+        assert peak <= ShopmonkeyClient.ORDER_FETCH_CONCURRENCY
+        assert mock_client.request.call_count == 30
+        await client.close()
+
+
+class TestCreateAppointmentTechnicianLink:
+    """Tests for the field name that actually assigns a technician.
+
+    Verified against prod on 2026-08-18 by creating five appointments on
+    2026-09-02: `technicianId` (singular) returned 200 and produced NO link -
+    the appointment sat in the calendar's Unassigned column - both with and
+    without customer/vehicle, as did `technicians: [{id}]`. Only
+    `technicianIds: [id]` created the link. Every online booking since the
+    field was introduced landed unassigned and was reassigned by hand.
+    """
+
+    @staticmethod
+    def _client_and_mock():
+        client = ShopmonkeyClient(api_token="test-token")
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(
+            return_value=httpx.Response(
+                200,
+                json={"data": {"id": "appt_new"}},
+                request=httpx.Request("POST", "https://x/v3/appointment"),
+            )
+        )
+        return client, mock_client
+
+    @pytest.mark.asyncio
+    async def test_sends_technician_ids_as_a_list(self):
+        client, mock_client = self._client_and_mock()
+        with patch.object(client, "_get_client", return_value=mock_client):
+            await client.create_appointment(
+                customer_id="c1",
+                vehicle_id="v1",
+                start_date="2026-09-02T11:00:00.000-05:00",
+                end_date="2026-09-02T11:30:00.000-05:00",
+                technician_id="tech_1",
+            )
+        body = mock_client.request.call_args.kwargs["json"]
+        assert body["technicianIds"] == ["tech_1"], (
+            "singular technicianId is silently discarded; the link needs the plural array"
+        )
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_omits_the_field_entirely_when_no_tech_is_given(self):
+        client, mock_client = self._client_and_mock()
+        with patch.object(client, "_get_client", return_value=mock_client):
+            await client.create_appointment(
+                customer_id="c1",
+                vehicle_id="v1",
+                start_date="2026-09-02T11:00:00.000-05:00",
+                end_date="2026-09-02T11:30:00.000-05:00",
+            )
+        body = mock_client.request.call_args.kwargs["json"]
+        assert "technicianIds" not in body
+        assert "technicianId" not in body
+        await client.close()

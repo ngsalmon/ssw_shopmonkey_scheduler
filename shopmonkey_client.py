@@ -4,7 +4,9 @@ import asyncio
 import json
 import os
 import time
+from datetime import UTC, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 import structlog
@@ -43,8 +45,27 @@ class ShopmonkeyNetworkError(ShopmonkeyAPIError):
         super().__init__(message)
 
 
+class ShopmonkeyRateLimitError(ShopmonkeyAPIError):
+    """Raised on HTTP 429.
+
+    Split out of the generic 4xx path because a rate limit is transient and
+    must be retried, while every other 4xx is a request we got wrong and
+    retrying only burns quota. Treating 429 as fatal is how a busy day turned
+    into 502s on /availability, and - worse - how the per-appointment error
+    handling in `get_busy_techs_for_appointments` used to drop a technician's
+    assignments and report them as free.
+    """
+
+    def __init__(self, message: str = "Shopmonkey API rate limit exceeded", **kwargs: Any):
+        super().__init__(message, **kwargs)
+
+
 class ShopmonkeyClient:
     """Async client for interacting with Shopmonkey API v3."""
+
+    # Max concurrent order reads during the availability labor walk. Shopmonkey
+    # rate-limits aggressively; an unbounded fan-out over a full day trips it.
+    ORDER_FETCH_CONCURRENCY = 5
 
     def __init__(
         self,
@@ -52,7 +73,12 @@ class ShopmonkeyClient:
         base_url: str | None = None,
         location_id: str | None = None,
         timeout: float = 30.0,
+        timezone: str | None = None,
     ):
+        # Business timezone, used only to turn a YYYY-MM-DD into real local day
+        # bounds for the appointment query. Mirrors config.yaml's `timezone`;
+        # kept as a plain arg so the client stays config-file independent.
+        self.timezone = timezone or os.getenv("BUSINESS_TIMEZONE") or "America/Chicago"
         self.api_token = api_token or os.getenv("SHOPMONKEY_API_TOKEN")
         self.base_url = (
             base_url or os.getenv("SHOPMONKEY_API_BASE_URL", "https://api.shopmonkey.cloud")
@@ -86,9 +112,11 @@ class ShopmonkeyClient:
             self._client = None
 
     @retry(
-        retry=retry_if_exception_type((ShopmonkeyTimeoutError, ShopmonkeyNetworkError)),
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=4),
+        retry=retry_if_exception_type(
+            (ShopmonkeyTimeoutError, ShopmonkeyNetworkError, ShopmonkeyRateLimitError)
+        ),
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=1, max=16),
         reraise=True,
     )
     async def _request(
@@ -101,8 +129,9 @@ class ShopmonkeyClient:
         """
         Make an HTTP request to the Shopmonkey API with retry logic.
 
-        Retries on timeout and network errors with exponential backoff.
-        Does not retry on 4xx client errors.
+        Retries on timeout, network errors and HTTP 429 with exponential
+        backoff. Does not retry any other 4xx - those are our bug, not a
+        transient condition.
         """
         client = await self._get_client()
         start_time = time.monotonic()
@@ -154,6 +183,17 @@ class ShopmonkeyClient:
 
         except httpx.HTTPStatusError as e:
             elapsed_ms = (time.monotonic() - start_time) * 1000
+            if e.response.status_code == 429:
+                log.warning(
+                    "shopmonkey_api_rate_limited",
+                    elapsed_ms=round(elapsed_ms, 2),
+                )
+                raise ShopmonkeyRateLimitError(
+                    f"Shopmonkey API rate limit hit on {endpoint}",
+                    status_code=429,
+                    response_body=e.response.text,
+                ) from e
+
             log.error(
                 "shopmonkey_api_error",
                 status_code=e.response.status_code,
@@ -210,13 +250,35 @@ class ShopmonkeyClient:
               works and returns only matching rows.
             * Page size is hard-capped at 100. For a single day's slice this
               is fine (a busy day has well under 100 appointments).
-        """
-        # Build date range for the full day. The widget submits naive local
-        # dates and we use UTC bounds wide enough to catch any local TZ.
-        start_date = f"{date_str}T00:00:00Z"
-        end_date = f"{date_str}T23:59:59Z"
+            * `endDate` IS filterable alongside `startDate` (verified
+              2026-08-18): a `{startDate: {lt: X}, endDate: {gt: Y}}` pair is
+              honored as a conjunction, not silently dropped.
 
-        where_clause: dict[str, Any] = {"startDate": {"gte": start_date, "lt": end_date}}
+        The filter is a true OVERLAP test - `startDate < end_of_day AND
+        endDate > start_of_day` - not `startDate` inside the day. Filtering on
+        `startDate` alone made any entry that began before the queried date
+        invisible on every later day it covered, so a single multi-day time-off
+        block would have read as that technician being free. No such entry
+        exists today (0 of 554 across Jun-Sep 2026; staff hand-build per-day
+        "... cont." entries instead), which is exactly why this stayed latent.
+
+        Bounds are the real LOCAL day converted to UTC, rather than the
+        date's naive `Z` bounds. The old bounds were the local window
+        19:00 yesterday - 18:59 today during CDT, which both pulled in the
+        previous evening and cut off anything starting after 19:00 local.
+        """
+        tz = ZoneInfo(self.timezone)
+        day = datetime.strptime(date_str, "%Y-%m-%d")
+        day_start = datetime(day.year, day.month, day.day, tzinfo=tz)
+        day_end = day_start + timedelta(days=1)
+
+        start_date = day_start.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        end_date = day_end.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+        where_clause: dict[str, Any] = {
+            "startDate": {"lt": end_date},
+            "endDate": {"gt": start_date},
+        }
 
         params: dict[str, Any] = {"where": json.dumps(where_clause), "limit": "100"}
 
@@ -263,9 +325,20 @@ class ShopmonkeyClient:
         3 where only `technicians[]` did), so we union them. Dropping
         either silently loses assignments and over-books.
 
-        Returns {appointment_id: {tech_id, ...}}. Order fetches run in
-        parallel; a failed fetch degrades to whatever `technicians[]`
-        supplied rather than losing the appointment's techs entirely.
+        Returns {appointment_id: {tech_id, ...}}.
+
+        Order fetches run in parallel behind a small semaphore. The cap is the
+        point: an unbounded `gather` over a full day fired ~15-20 concurrent
+        order reads and reliably tripped Shopmonkey's rate limiter.
+
+        A failed order fetch is FATAL, not degraded. It used to be swallowed
+        per-appointment and turned into an empty tech set, which reads exactly
+        like "nobody is assigned to this ticket" - and roughly a fifth of
+        appointments are known ONLY through the labor walk, so a single 429
+        could hand a busy technician back to the scheduler as free and
+        double-book them. Failing the whole availability request instead makes
+        the caller return 502; the customer retries and sees correct times,
+        which is strictly better than a confident wrong answer.
         """
         busy: dict[str, set[str]] = {}
         for appt in appointments:
@@ -278,19 +351,22 @@ class ShopmonkeyClient:
         if not targets:
             return busy
 
+        semaphore = asyncio.Semaphore(self.ORDER_FETCH_CONCURRENCY)
+
         async def fetch(appt: dict[str, Any]) -> tuple[str, set[str]]:
             appt_id = appt["id"]
             order_id = appt["orderId"]
             try:
-                result = await self._request("GET", f"/v3/order/{order_id}/service")
+                async with semaphore:
+                    result = await self._request("GET", f"/v3/order/{order_id}/service")
             except ShopmonkeyAPIError as e:
-                logger.warning(
+                logger.error(
                     "fetch_order_services_failed",
                     order_id=order_id,
                     appointment_id=appt_id,
                     status_code=getattr(e, "status_code", None),
                 )
-                return appt_id, set()
+                raise
             services = result.get("data") or []
             tech_ids: set[str] = set()
             for svc in services:
@@ -513,7 +589,18 @@ class ShopmonkeyClient:
         if notes:
             appointment_data["note"] = notes
         if technician_id:
+            # PLURAL, and an array. `technicianId` (singular) is accepted with
+            # a 200 and silently discarded - the appointment lands in the
+            # calendar's "Unassigned" column and staff reassign it by hand.
+            # Verified against prod 2026-08-18 with five payload shapes on
+            # 2026-09-02: technicianId -> no link (with and without
+            # customer/vehicle), technicians:[{id}] -> no link,
+            # technicianIds:[id] -> link created, and PUT technicianIds on an
+            # existing appointment -> link created (the repair path).
+            # Sending both together also works, so the singular key is kept as
+            # a hedge in case the API flips back.
             appointment_data["technicianId"] = technician_id
+            appointment_data["technicianIds"] = [technician_id]
         if order_id:
             appointment_data["orderId"] = order_id
         if self.location_id:

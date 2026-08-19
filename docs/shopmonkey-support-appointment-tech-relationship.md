@@ -1,5 +1,32 @@
 # Appointment → technician relationship over REST
 
+**Status: CORRECTED 2026-08-18** — the WRITE field name was wrong all along.
+Assignment requires **`technicianIds: ["<uuid>"]`** (plural, array). The
+singular `technicianId` this document credited below is accepted with a 200 and
+silently discarded, so every online booking we created landed in the calendar's
+"Unassigned" column and staff reassigned it by hand.
+
+Payload matrix, run against prod on an empty 2026-09-02 and read back through
+the list endpoint (confirmed visually on the Shopmonkey calendar):
+
+| POST body | `technicians[]` after |
+|---|---|
+| `technicianId: <id>` | empty — lands in Unassigned |
+| `technicianId: <id>` + `customerId`/`vehicleId` | empty |
+| `technicians: [{id}]` | empty |
+| `technicianIds: [<id>]` | **assigned** |
+| `technicianId` + `technicianIds` together | assigned (both together is safe) |
+| `PUT /v3/appointment/{id}` `{"technicianIds": [<id>]}` | **assigned** — repairs an existing row |
+
+The 2026-06-05 conclusion below ("proving the `technicianId` we send on
+`POST /v3/appointment` does create the AppointmentUserConnection") was wrong: it
+sampled appointments staff had already touched. The single online booking in
+Jun–Sep 2026 whose `createdDate == updatedDate` — the only one demonstrably
+never hand-edited — has `technicians: []`. Everything the document says about
+the READ side (list ⊃ detail, search-endpoint filtering) still holds.
+
+---
+
 **Status: RESOLVED 2026-06-05** — the data exists and we can read it. The
 original email below (2026-05-20) framed this as a missing feature; it is
 actually a discoverability/consistency issue in the API surface. Keep this
