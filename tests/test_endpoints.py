@@ -14,6 +14,8 @@ from fastapi.testclient import TestClient
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from shopmonkey_client import ShopmonkeyAPIError, ShopmonkeyRateLimitError  # noqa: E402
+
 
 @pytest.fixture
 def mock_shopmonkey_client():
@@ -263,6 +265,37 @@ class TestAvailabilityEndpoint:
         assert starts, "expected some afternoon slots to remain"
         assert "09:00" not in starts
         assert all(s > "12:00" for s in starts)
+
+    def test_rate_limit_surfaces_as_a_retryable_503(self, test_client, mock_shopmonkey_client):
+        """Now that the labor walk fails closed instead of reporting a
+        rate-limited technician as free, an exhausted retry reaches the
+        handler. /availability had no ShopmonkeyAPIError clause, so it landed
+        in the catch-all and came back as an opaque 500 - a status nothing
+        retries, for a condition that is purely transient."""
+        mock_shopmonkey_client.get_busy_techs_for_appointments = AsyncMock(
+            side_effect=ShopmonkeyRateLimitError("rate limited", status_code=429)
+        )
+        response = test_client.get("/availability?service_id=svc-1&date=2026-01-19")
+        assert response.status_code == 503
+        assert "try again" in response.json()["detail"].lower()
+
+    def test_upstream_failure_surfaces_as_502_not_500(self, test_client, mock_shopmonkey_client):
+        """A non-rate-limit upstream error is the scheduling service's fault,
+        not ours - /book has always said 502 and /availability now agrees."""
+        mock_shopmonkey_client.get_busy_techs_for_appointments = AsyncMock(
+            side_effect=ShopmonkeyAPIError("upstream exploded", status_code=500)
+        )
+        response = test_client.get("/availability?service_id=svc-1&date=2026-01-19")
+        assert response.status_code == 502
+
+    def test_genuine_bugs_still_report_500(self, test_client, mock_shopmonkey_client):
+        """The catch-all must keep catching. Widening the upstream clauses
+        must not swallow our own errors into a misleading 502/503."""
+        mock_shopmonkey_client.get_busy_techs_for_appointments = AsyncMock(
+            side_effect=TypeError("our bug")
+        )
+        response = test_client.get("/availability?service_id=svc-1&date=2026-01-19")
+        assert response.status_code == 500
 
     def _ooo_block(self, appt_id, name):
         return {
@@ -1151,8 +1184,6 @@ class TestMultidayBooking:
     ):
         """If day 2 creation fails, day 1 must be deleted - a half-created
         multi-day booking silently under-reserves the calendar."""
-        from shopmonkey_client import ShopmonkeyAPIError
-
         mock_shopmonkey_client.get_canned_service = AsyncMock(return_value=self._multiday_service())
         mock_shopmonkey_client.create_appointment = AsyncMock(
             side_effect=[

@@ -34,7 +34,7 @@ from availability import (
 )
 from email_client import BookingDetails, get_email_client
 from sheets_client import SheetsClient
-from shopmonkey_client import ShopmonkeyAPIError, ShopmonkeyClient
+from shopmonkey_client import ShopmonkeyAPIError, ShopmonkeyClient, ShopmonkeyRateLimitError
 
 # Load environment variables
 load_dotenv()
@@ -930,6 +930,22 @@ async def get_availability(
 
     except HTTPException:
         raise
+    except ShopmonkeyRateLimitError:
+        # Retryable, and worth saying so. The labor walk now fails closed rather
+        # than reporting a rate-limited technician as free, so exhausting the
+        # retries surfaces here instead of silently producing a wrong answer.
+        # 503 tells the widget (and any proxy) this is transient; the old
+        # catch-all turned it into an opaque 500 nobody would retry.
+        logger.warning("availability_rate_limited", service_id=service_id, date=date)
+        raise HTTPException(
+            status_code=503,
+            detail="The scheduling service is busy right now. Please try again in a moment.",
+        )
+    except ShopmonkeyAPIError as e:
+        # /book has always mapped upstream failures to 502; /availability fell
+        # through to the generic handler and reported them as 500.
+        logger.error("shopmonkey_api_error_checking_availability", error=str(e))
+        raise HTTPException(status_code=502, detail="Unable to reach scheduling service")
     except Exception:
         logger.exception("unexpected_error_checking_availability", service_id=service_id)
         raise HTTPException(status_code=500, detail="An unexpected error occurred")
@@ -1362,6 +1378,12 @@ Booked online via scheduling API."""
 
         except HTTPException:
             raise
+        except ShopmonkeyRateLimitError:
+            logger.warning("booking_rate_limited", service_id=request.service_id)
+            raise HTTPException(
+                status_code=503,
+                detail="The scheduling service is busy right now. Please try again in a moment.",
+            )
         except ShopmonkeyAPIError as e:
             logger.error("shopmonkey_api_error_during_booking", error=str(e))
             raise HTTPException(status_code=502, detail="Unable to complete booking")
