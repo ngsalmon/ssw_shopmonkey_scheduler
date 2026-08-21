@@ -1421,7 +1421,11 @@ class TestGetAppointmentsForDateExtras:
     @staticmethod
     def _mock(client, rows_or_side, meta=None):
         mc = AsyncMock()
-        if isinstance(rows_or_side, list) and rows_or_side and isinstance(rows_or_side[0], MagicMock):
+        if (
+            isinstance(rows_or_side, list)
+            and rows_or_side
+            and isinstance(rows_or_side[0], MagicMock)
+        ):
             mc.request = AsyncMock(side_effect=rows_or_side)
         else:
             mc.request = AsyncMock(return_value=_ok(rows_or_side, meta=meta))
@@ -1695,7 +1699,9 @@ class TestOrderFetchConcurrency:
         # bulk response resolves no assignments.
         bulk = [c for c in mock_client.request.await_args_list if c.kwargs["url"] == "/v3/order"]
         walks = [
-            c for c in mock_client.request.await_args_list if c.kwargs["url"].startswith("/v3/order/")
+            c
+            for c in mock_client.request.await_args_list
+            if c.kwargs["url"].startswith("/v3/order/")
         ]
         assert len(bulk) == 2
         assert len(walks) == 30
