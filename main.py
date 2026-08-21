@@ -267,6 +267,10 @@ async def _fetch_appointments_with_busy_techs(date_str: str) -> list[dict[str, A
     "Mina out", untickted shop work - which are ~25% of the calendar and
     were previously invisible to the scheduler. Entries naming no tech at
     all fall through as "unattributed" and reduce shop capacity by one.
+
+    Recurring entries are included: the client fetches via
+    `search_replacement`, which expands them - see
+    `ShopmonkeyClient.get_appointments_for_date`.
     """
     if not shopmonkey_client:
         return []

@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -65,7 +65,22 @@ class ShopmonkeyClient:
 
     # Max concurrent order reads during the availability labor walk. Shopmonkey
     # rate-limits aggressively; an unbounded fan-out over a full day trips it.
+    # Only the empty-result fallback still walks orders one at a time, so this
+    # now caps a handful of reads rather than one per booked appointment.
     ORDER_FETCH_CONCURRENCY = 5
+
+    # Server-side page cap. `limit` above this is silently clamped.
+    PAGE_SIZE = 100
+
+    # Max `ids` values per request. 20 works, 21 returns HTTP 400 (measured
+    # 2026-08-20), so this is a hard server limit rather than a URL-length one.
+    ID_BATCH_SIZE = 20
+
+    # Hard stop on the appointment pager. A single day has well under 100
+    # entries, so this is pure runaway protection: `hasMore` is the server's
+    # word, and a stuck or looping response must not spin forever inside a
+    # customer-facing availability request.
+    MAX_PAGES = 25
 
     def __init__(
         self,
@@ -91,6 +106,8 @@ class ShopmonkeyClient:
 
         self._client: httpx.AsyncClient | None = None
         self._active_user_ids_cache: set[str] | None = None
+        self._all_user_ids_cache: list[str] | None = None
+        self._all_user_ids_cache_expiry: float = 0.0
         self._active_user_ids_cache_expiry: float = 0.0
         self._active_user_ids_cache_ttl: float = 300.0
 
@@ -123,7 +140,7 @@ class ShopmonkeyClient:
         self,
         method: str,
         endpoint: str,
-        params: dict[str, Any] | None = None,
+        params: dict[str, Any] | list[tuple[str, Any]] | None = None,
         json_data: dict[str, Any] | list[Any] | None = None,
     ) -> dict[str, Any]:
         """
@@ -227,77 +244,121 @@ class ShopmonkeyClient:
                 return None
             raise
 
+    async def get_all_user_ids(self) -> list[str]:
+        """Every Shopmonkey user ID, active or not (cached for 5 minutes).
+
+        `search_replacement` only returns appointments belonging to the
+        technicians you name, so this list decides what the scheduler can see.
+        It deliberately includes INACTIVE users: a deactivated tech can't take
+        a booking, but a ticketed job still assigned to them occupies a bay and
+        has to keep counting against department concurrency.
+        """
+        now = time.monotonic()
+        if self._all_user_ids_cache is not None and now < self._all_user_ids_cache_expiry:
+            return self._all_user_ids_cache
+
+        users = await self.get_users()
+        ids = sorted({u["id"] for u in users if u.get("id")})
+        self._all_user_ids_cache = ids
+        self._all_user_ids_cache_expiry = now + self._active_user_ids_cache_ttl
+        return ids
+
     async def get_appointments_for_date(
         self, date_str: str, tech_ids: list[str] | None = None
     ) -> list[dict[str, Any]]:
         """
-        Fetch appointments for a specific date.
+        Fetch every calendar entry overlapping a local day, recurring included.
 
         Args:
             date_str: Date in YYYY-MM-DD format
-            tech_ids: Ignored. The GET `where` param supports no tech/relation
-                filter (11 syntaxes tried in probe_filter_appts_by_tech.py -
-                all silently ignored), so we fetch the day and join to techs
-                caller-side. Kept for backward compatibility.
-                (`POST /v3/appointment/search` DOES support a `technicians`
-                filter if per-tech fetching is ever needed.)
+            tech_ids: Technician IDs to fetch for. Defaults to every user in the
+                shop, which is what availability needs. Unassigned entries come
+                back regardless via `includeUnassigned`.
 
-        Important Shopmonkey API quirks (verified 2026-05-20 against the live
-        API in this shop's account):
-            * The `where` filter uses MongoDB-like operators WITHOUT the `$`
-              prefix. `{"startDate": {"$gte": ...}}` is silently ignored and
-              returns ~100 unfiltered rows. `{"startDate": {"gte": ...}}`
-              works and returns only matching rows.
-            * Page size is hard-capped at 100. For a single day's slice this
-              is fine (a busy day has well under 100 appointments).
-            * `endDate` IS filterable alongside `startDate` (verified
-              2026-08-18): a `{startDate: {lt: X}, endDate: {gt: Y}}` pair is
-              honored as a conjunction, not silently dropped.
+        Uses `POST /v3/appointment/search_replacement`, NOT `GET /v3/appointment`.
+        This matters enormously and is not documented anywhere:
 
-        The filter is a true OVERLAP test - `startDate < end_of_day AND
-        endDate > start_of_day` - not `startDate` inside the day. Filtering on
-        `startDate` alone made any entry that began before the queried date
-        invisible on every later day it covered, so a single multi-day time-off
-        block would have read as that technician being free. No such entry
-        exists today (0 of 554 across Jun-Sep 2026; staff hand-build per-day
-        "... cont." entries instead), which is exactly why this stayed latent.
+            **`GET /v3/appointment` silently omits every recurring appointment.**
 
-        Bounds are the real LOCAL day converted to UTC, rather than the
-        date's naive `Z` bounds. The old bounds were the local window
-        19:00 yesterday - 18:59 today during CDT, which both pulled in the
-        previous evening and cut off anything starting after 19:00 local.
+        Anything created with the web app's "Repeat" checkbox - a tech's standing
+        office-time block, the daily all-hands lunch - is absent from the list
+        endpoint, from `POST /v3/appointment/search`, and from the `total` those
+        report. A stable full walk of all 4768 rows it does return found ZERO with
+        any recurrence field set. On 2026-08-21 that made 5 of 21 entries invisible
+        and the widget booked a customer on top of a technician's block.
+
+        `search_replacement` is what the Shopmonkey web calendar itself calls. It
+        returns recurring occurrences already expanded to concrete start/end times,
+        each carrying its `rruleset` and `recurringAppointmentId`, with
+        `technicians[]` hydrated - so callers need no rrule handling of their own.
+
+        Request shape differs from the rest of the API: dates are top-level
+        `dateMin`/`dateMax` (local ISO with offset, not a `where` clause), and
+        `technicians` is required - omit it and only unassigned entries come back.
+
+        `meta.total` over-counts (23 reported for a day holding 21 distinct rows),
+        and the tail page repeats rows already seen, so results are deduped by id
+        rather than trusted by count.
         """
         tz = ZoneInfo(self.timezone)
         day = datetime.strptime(date_str, "%Y-%m-%d")
         day_start = datetime(day.year, day.month, day.day, tzinfo=tz)
-        day_end = day_start + timedelta(days=1)
+        day_end = day_start + timedelta(days=1) - timedelta(milliseconds=1)
 
-        start_date = day_start.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        end_date = day_end.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        technicians = list(tech_ids) if tech_ids else await self.get_all_user_ids()
 
-        where_clause: dict[str, Any] = {
-            "startDate": {"lt": end_date},
-            "endDate": {"gt": start_date},
-        }
+        appointments: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        skip = 0
+        pages = 0
 
-        params: dict[str, Any] = {"where": json.dumps(where_clause), "limit": "100"}
+        while True:
+            body: dict[str, Any] = {
+                "dateMin": day_start.isoformat(timespec="milliseconds"),
+                "dateMax": day_end.isoformat(timespec="milliseconds"),
+                "includeUnassigned": True,
+                "limit": self.PAGE_SIZE,
+                "orderBy": {"startDate": "asc"},
+                "skip": skip,
+                "technicians": technicians,
+            }
 
-        if self.location_id:
-            params["locationId"] = self.location_id
-
-        result = await self._request("GET", "/v3/appointment", params=params)
-        appointments = result.get("data", [])
-        meta = result.get("meta") or {}
-
-        if meta.get("hasMore"):
-            # A single day exceeding 100 appointments would be extraordinary,
-            # but log it so we know to add pagination if it ever happens.
-            logger.warning(
-                "appointment_list_has_more",
-                date=date_str,
-                returned=len(appointments),
-                total=meta.get("total"),
+            result = await self._request(
+                "POST", "/v3/appointment/search_replacement", json_data=body
             )
+            page = result.get("data") or []
+
+            fresh = 0
+            for appt in page:
+                appt_id = appt.get("id")
+                if appt_id and appt_id in seen:
+                    continue
+                if appt_id:
+                    seen.add(appt_id)
+                appointments.append(appt)
+                fresh += 1
+
+            pages += 1
+
+            if not page or not (result.get("meta") or {}).get("hasMore"):
+                break
+
+            # The last page repeats rows we already have, so "nothing new"
+            # is the real end-of-results signal here, not just a safety net.
+            if fresh == 0:
+                break
+
+            if pages >= self.MAX_PAGES:
+                logger.warning(
+                    "appointment_paging_capped",
+                    date=date_str,
+                    pages=pages,
+                    collected=len(appointments),
+                    total=(result.get("meta") or {}).get("total"),
+                )
+                break
+
+            skip += len(page)
 
         return appointments
 
@@ -327,9 +388,20 @@ class ShopmonkeyClient:
 
         Returns {appointment_id: {tech_id, ...}}.
 
-        Order fetches run in parallel behind a small semaphore. The cap is the
-        point: an unbounded `gather` over a full day fired ~15-20 concurrent
-        order reads and reliably tripped Shopmonkey's rate limiter.
+        The labor walk is resolved in BULK. `GET /v3/order?ids=a&ids=b&...`
+        returns up to 20 orders per call, and each carries
+        `assignedTechnicianIds`, which was verified equal to the per-order
+        labor walk on 120 randomly sampled orders spanning the full history
+        (120/120 exact, 0 mismatches) plus every order on four sampled days
+        (37/37). A typical day therefore costs ONE order request instead of
+        12-20, which is what kept tripping the rate limiter.
+
+        Orders whose `assignedTechnicianIds` comes back EMPTY still fall back
+        to the per-order labor walk, behind a small semaphore. Empty is the
+        one reading we can't take at face value: it is indistinguishable from
+        "nobody is assigned", and under-blocking is the failure direction that
+        double-books. A non-empty list can only over-block, which is safe.
+        Empty was 4 of 120 in the sample, so the fallback is rare.
 
         A failed order fetch is FATAL, not degraded. It used to be swallowed
         per-appointment and turned into an empty tech set, which reads exactly
@@ -376,9 +448,47 @@ class ShopmonkeyClient:
                         tech_ids.add(tid)
             return appt_id, tech_ids
 
-        results = await asyncio.gather(*[fetch(a) for a in targets])
-        for appt_id, tech_ids in results:
-            busy[appt_id] |= tech_ids
+        # Bulk pass: one request per 20 distinct orders. Deduped in first-seen
+        # order rather than via a set, so the request URL is stable run to run.
+        order_ids = list(dict.fromkeys(a["orderId"] for a in targets))
+        assigned: dict[str, set[str]] = {}
+
+        for start in range(0, len(order_ids), self.ID_BATCH_SIZE):
+            batch = order_ids[start : start + self.ID_BATCH_SIZE]
+            params: list[tuple[str, Any]] = [("ids", oid) for oid in batch]
+            params.append(("limit", str(self.PAGE_SIZE)))
+            if self.location_id:
+                params.append(("locationId", self.location_id))
+            try:
+                result = await self._request("GET", "/v3/order", params=params)
+            except ShopmonkeyAPIError as e:
+                logger.error(
+                    "bulk_fetch_orders_failed",
+                    order_count=len(batch),
+                    status_code=getattr(e, "status_code", None),
+                )
+                raise
+            for order in result.get("data") or []:
+                oid = order.get("id")
+                if oid:
+                    assigned[oid] = {t for t in (order.get("assignedTechnicianIds") or []) if t}
+
+        # Fall back to the labor walk only where bulk gave us nothing - an
+        # order the batch didn't return at all, or one with no assignment.
+        needs_walk = [a for a in targets if not assigned.get(a["orderId"])]
+        if needs_walk:
+            logger.debug(
+                "order_labor_walk_fallback",
+                orders=len(needs_walk),
+                bulk_resolved=len(targets) - len(needs_walk),
+            )
+            results = await asyncio.gather(*[fetch(a) for a in needs_walk])
+            for appt_id, tech_ids in results:
+                busy[appt_id] |= tech_ids
+
+        for appt in targets:
+            busy[appt["id"]] |= assigned.get(appt["orderId"], set())
+
         return busy
 
     @staticmethod
