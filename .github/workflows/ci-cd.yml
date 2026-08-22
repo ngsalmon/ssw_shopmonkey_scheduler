@@ -162,6 +162,7 @@ jobs:
 
       - name: Notify Slack
         if: success()
+        continue-on-error: true
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           PREV_SHA: ${{ steps.current.outputs.prev_sha }}
@@ -227,12 +228,13 @@ jobs:
                   ]
                 }
               ]
-            }' | curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            }' | curl -sS --fail-with-body -X POST "$SLACK_WEBHOOK_URL" \
               -H 'Content-Type: application/json' \
               -d @-
 
       - name: Notify Slack (failure)
         if: failure()
+        continue-on-error: true
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           GITHUB_SHA: ${{ github.sha }}
@@ -262,6 +264,6 @@ jobs:
                   }
                 }
               ]
-            }' | curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            }' | curl -sS --fail-with-body -X POST "$SLACK_WEBHOOK_URL" \
               -H 'Content-Type: application/json' \
               -d @-
