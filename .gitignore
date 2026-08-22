@@ -55,3 +55,7 @@ htmlcov/
 # Google Cloud SDK (installed locally)
 google-cloud-sdk/
 google-cloud-cli-*.tar.gz
+
+# Agent/tool working state, not project source
+.omc/
+.playwright-mcp/

@@ -8,6 +8,7 @@ extend-exclude = [
     ".venv",
     "e2e/node_modules",
     "tests/e2e_mocks",  # mock module shapes mirror an external API surface
+    "*.md",  # prose: code fences are illustrative excerpts, not source
 ]
 
 [lint]
