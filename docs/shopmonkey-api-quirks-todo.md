@@ -19,6 +19,10 @@ reproduced by a test in the harness repo, against this account's real data.
 
 ## P0 — `find_or_create_vehicle` attaches bookings to the wrong customer's vehicle
 
+> **Executable task:** [`vehicle-misattribution-todo.md`](vehicle-misattribution-todo.md)
+> has the patch, the tests to change and the verification steps, written to be
+> run cold. In Claude Code: `/fix-vehicle-misattribution`.
+
 **Where:** `shopmonkey_client.py:621` `find_or_create_vehicle`, reached from
 `main.py:1152`; the resulting `vehicle_id` flows into order and appointment
 creation at `main.py:1204` and `main.py:1305`.
