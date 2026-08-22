@@ -1,6 +1,7 @@
-# TODO: `find_or_create_vehicle` attaches bookings to the wrong customer's vehicle
+# FIXED: `find_or_create_vehicle` attached bookings to the wrong customer's vehicle
 
-**Status:** Open, live in production
+**Status:** Fixed 2026-08-21. Kept as the record of why the code looks the way
+it does — the `owners[]` in-memory match below is deliberate, not an oversight.
 **Severity:** P0 — data integrity, customer-visible
 **Date:** 2026-08-21
 **Evidence:** `../shopmonkey-api-quirks` test `11-vehicle-owner-filter-dropped`
@@ -245,3 +246,25 @@ creation at `main.py:1205` and `main.py:1306`.
   `shopmonkey-api-quirks-todo.md`. **In particular, do not "fix"
   `find_or_create_customer`** — its bare-scalar `where` filter is honored and
   that code is correct.
+
+---
+
+## Resolution
+
+Fixed as specified above. `customerId` no longer appears in the vehicle `where`
+clause; ownership is matched in memory against the hydrated `owners[]`.
+
+Two things differed from this document when it was executed:
+
+- The patch also adds `"limit": str(self.PAGE_SIZE)` to the query params, which
+  the prose above never mentions. The old code sent no `limit`. It is required
+  for the `vehicle_lookup_page_full` check to mean anything, and evidence test
+  `03-limit-clamp` shows the endpoint clamps at 100 regardless, so asking for
+  100 only widens the window the in-memory match sees.
+- `caplog` does not observe these logs — structlog does not route through the
+  stdlib logging module here. The saturation test uses
+  `structlog.testing.capture_logs`, matching `tests/test_email_client.py`.
+
+`TestFindOrCreateVehicle` covers it with 9 tests. Mutation-checked: restoring
+the P0 (`return vehicles[0]`) fails 4 of them, and the saturation warning's
+guard, level and fields are each pinned by a dying mutant.

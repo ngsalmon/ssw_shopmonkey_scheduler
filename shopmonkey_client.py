@@ -639,23 +639,39 @@ class ShopmonkeyClient:
             if vehicles:
                 return vehicles[0]
 
-        # Try to find by customer + year/make/model
-        where_clause = json.dumps(
-            {
-                "customerId": customer_id,
-                "year": year,
-                "make": make,
-                "model": model,
-            }
-        )
-        params = {"where": where_clause}
+        # Try to find by year/make/model, then match the owner in memory.
+        #
+        # `customerId` is deliberately NOT in this where clause: it is not a
+        # column on Vehicle (the relation lives in VehicleOwner, which has no
+        # REST route), and Shopmonkey drops unknown filter fields silently
+        # rather than erroring. Including it does not narrow the query - it
+        # returns every matching vehicle in the shop, and taking [0] attaches
+        # the booking to whichever stranger's car sorts first.
+        where_clause = json.dumps({"year": year, "make": make, "model": model})
+        params = {"where": where_clause, "limit": str(self.PAGE_SIZE)}
         if self.location_id:
             params["locationId"] = self.location_id
 
         result = await self._request("GET", "/v3/vehicle", params=params)
         vehicles = result.get("data", [])
-        if vehicles:
-            return vehicles[0]
+
+        # `owners` is a list of customer ids hydrated onto the response. It is
+        # the only ownership signal the API exposes for a vehicle.
+        owned = [v for v in vehicles if customer_id in (v.get("owners") or [])]
+        if owned:
+            return owned[0]
+
+        if len(vehicles) >= self.PAGE_SIZE:
+            # The page cap is 100 and there is no way to filter by owner
+            # server-side, so a very common year/make/model could page this
+            # customer's own vehicle out of reach and cause a spurious create.
+            logger.warning(
+                "vehicle_lookup_page_full",
+                year=year,
+                make=make,
+                model=model,
+                returned=len(vehicles),
+            )
 
         # Create new vehicle
         # Size is required by Shopmonkey API. Valid values: LightDuty, MediumDuty, HeavyDuty, Other

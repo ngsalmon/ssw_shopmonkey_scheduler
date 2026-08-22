@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from structlog.testing import capture_logs
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -962,12 +963,9 @@ class TestFindOrCreateVehicle:
         assert mock_client.request.call_count == 2
         where = json.loads(mock_client.request.call_args_list[0].kwargs["params"]["where"])
         assert "vin" not in where
-        assert where == {
-            "customerId": "cust-1",
-            "year": 2020,
-            "make": "Subaru",
-            "model": "WRX",
-        }
+        # No `customerId`: it is not a column on Vehicle and Shopmonkey drops
+        # it silently, so sending it only creates the illusion of scoping.
+        assert where == {"year": 2020, "make": "Subaru", "model": "WRX"}
         await client.close()
 
     @pytest.mark.asyncio
@@ -976,7 +974,7 @@ class TestFindOrCreateVehicle:
         client = ShopmonkeyClient(api_token="test-token")
         existing = {
             "id": "veh-1",
-            "customerId": "cust-1",
+            "owners": ["cust-1"],
             "year": 2020,
             "make": "Subaru",
             "model": "WRX",
@@ -991,9 +989,11 @@ class TestFindOrCreateVehicle:
         # VIN search then year/make/model search - and no create.
         assert mock_client.request.call_count == 2
         assert all(c.kwargs["method"] == "GET" for c in mock_client.request.call_args_list)
-        # The fallback search is scoped to this customer, not the whole shop.
+        # The fallback search cannot be scoped to the customer server-side, so
+        # what matters is that the vehicle handed back is actually theirs.
+        assert "cust-1" in result["owners"]
         where = json.loads(mock_client.request.call_args_list[1].kwargs["params"]["where"])
-        assert where["customerId"] == "cust-1"
+        assert "customerId" not in where
         await client.close()
 
     @pytest.mark.asyncio
@@ -1037,6 +1037,117 @@ class TestFindOrCreateVehicle:
                 customer_id="cust-1", year=2020, make="Subaru", model="WRX"
             )
         assert "vin" not in mock_client.request.call_args_list[-1].kwargs["json"]
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_returns_this_customers_vehicle_not_a_strangers(self):
+        """Shopmonkey drops `customerId` from a vehicle `where` - it is not a
+        column on Vehicle - so the year/make/model search returns every matching
+        vehicle in the shop. Taking data[0] hands the booking to whoever sorts
+        first, which on live data was a different customer 3 times out of 4."""
+        client = ShopmonkeyClient(api_token="test-token")
+        stranger = {
+            "id": "veh-stranger",
+            "year": 2020,
+            "make": "Subaru",
+            "model": "WRX",
+            "owners": ["cust-other"],
+        }
+        ours = {
+            "id": "veh-ours",
+            "year": 2020,
+            "make": "Subaru",
+            "model": "WRX",
+            "owners": ["cust-1"],
+        }
+        mock_client = AsyncMock()
+        # The stranger's vehicle sorts first, as it did against live data.
+        mock_client.request = AsyncMock(return_value=_ok([stranger, ours]))
+        with patch.object(client, "_get_client", return_value=mock_client):
+            result = await client.find_or_create_vehicle(
+                customer_id="cust-1", year=2020, make="Subaru", model="WRX"
+            )
+        assert result == ours
+        assert mock_client.request.call_count == 1  # matched, so no create
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_creates_when_no_returned_vehicle_belongs_to_the_customer(self):
+        """A shop full of 2020 WRXs owned by other people must still produce a
+        new vehicle for this customer, not reuse one of theirs."""
+        client = ShopmonkeyClient(api_token="test-token")
+        stranger = {
+            "id": "veh-stranger",
+            "year": 2020,
+            "make": "Subaru",
+            "model": "WRX",
+            "owners": ["cust-other"],
+        }
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(side_effect=[_ok([stranger]), _ok({"id": "veh-new"})])
+        with capture_logs() as logs, patch.object(client, "_get_client", return_value=mock_client):
+            result = await client.find_or_create_vehicle(
+                customer_id="cust-1", year=2020, make="Subaru", model="WRX"
+            )
+        assert result == {"id": "veh-new"}
+        assert mock_client.request.call_args_list[-1].kwargs["method"] == "POST"
+        # A one-row page is nowhere near the cap. The saturation warning is only
+        # worth anything as a rare signal; one that fires on every lookup is noise.
+        assert not any(e["event"] == "vehicle_lookup_page_full" for e in logs)
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_vehicle_with_no_owners_is_never_claimed(self):
+        """~3% of vehicles on this account come back with an empty `owners[]`.
+        They carry no ownership signal, so they must NOT be assumed to be this
+        customer's. Creating a duplicate splits one customer's service history;
+        claiming an unowned record can hand them somebody else's car. The
+        duplicate is the deliberate trade - keep it that way."""
+        client = ShopmonkeyClient(api_token="test-token")
+        unowned = {"id": "veh-unowned", "year": 2020, "make": "Subaru", "model": "WRX"}
+        empty_owners = {
+            "id": "veh-empty",
+            "year": 2020,
+            "make": "Subaru",
+            "model": "WRX",
+            "owners": [],
+        }
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(
+            side_effect=[_ok([unowned, empty_owners]), _ok({"id": "veh-new"})]
+        )
+        with patch.object(client, "_get_client", return_value=mock_client):
+            result = await client.find_or_create_vehicle(
+                customer_id="cust-1", year=2020, make="Subaru", model="WRX"
+            )
+        assert result == {"id": "veh-new"}
+        assert mock_client.request.call_args_list[-1].kwargs["method"] == "POST"
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_warns_when_the_lookup_page_is_saturated(self):
+        """At the 100-row page cap the customer's own vehicle may have been
+        paged out, so the create below is possibly spurious - say so in the log."""
+        client = ShopmonkeyClient(api_token="test-token")
+        others = [
+            {"id": f"veh-{i}", "year": 2020, "make": "Subaru", "model": "WRX", "owners": ["x"]}
+            for i in range(client.PAGE_SIZE)
+        ]
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(side_effect=[_ok(others), _ok({"id": "veh-new"})])
+        with capture_logs() as logs, patch.object(client, "_get_client", return_value=mock_client):
+            await client.find_or_create_vehicle(
+                customer_id="cust-1", year=2020, make="Subaru", model="WRX"
+            )
+        record = next(e for e in logs if e["event"] == "vehicle_lookup_page_full")
+        # The level is what decides whether this surfaces at all, and the fields
+        # are the only way to tell which vehicle may have been duplicated.
+        assert record["log_level"] == "warning"
+        assert record["returned"] == client.PAGE_SIZE
+        assert (record["year"], record["make"], record["model"]) == (2020, "Subaru", "WRX")
+        # The page cap is what makes the warning meaningful; assert we ask for it.
+        params = mock_client.request.call_args_list[0].kwargs["params"]
+        assert params["limit"] == str(client.PAGE_SIZE)
         await client.close()
 
 
