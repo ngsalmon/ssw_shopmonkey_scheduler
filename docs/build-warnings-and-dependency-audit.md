@@ -44,7 +44,7 @@ of writing. Moving the client that books real appointments onto a package that
 new, to silence one warning, is a bad trade. Revisit when it has some mileage,
 and treat it as its own change with its own test pass — not a drive-by bump.
 
-### 1.2 Container installs dependencies as root
+### 1.2 Container installs dependencies as root — HELD, not shipped
 
 ```
 WARNING: Running pip as the 'root' user can result in broken permissions ...
@@ -53,8 +53,60 @@ WARNING: Running pip as the 'root' user can result in broken permissions ...
 `Dockerfile` is `FROM python:3.12-slim` with `RUN pip install --no-cache-dir -r
 requirements.txt` and no `USER` directive, so both the build and the running
 container are root. Cloud Run sandboxes the container, so this is hardening
-rather than an active vulnerability — but a non-root `USER` is cheap and also
-silences the warning.
+rather than an active vulnerability.
+
+**Deliberately not shipped.** Two things make this unverifiable right now:
+
+1. `docker` is not installed on the dev machine, so the image cannot be built
+   or run locally.
+2. **CI's deploy gate is blind to how this fails.** `/health` (main.py:1410)
+   returns an unconditional 200 with no Sheets or Shopmonkey call, and
+   `sheets_client._get_service()` reads `/secrets/google-credentials.json`
+   *lazily* on the first sheet read. A container that boots but cannot traverse
+   `/secrets` as a non-root uid would pass the health check, never trigger the
+   auto-rollback, and post success to Slack — while every real booking fails.
+
+The verified edit, for when it can be built and canaried:
+
+```dockerfile
+RUN pip install --no-cache-dir --root-user-action=ignore -r requirements.txt
+
+# After the pip layer so the dependency cache survives this edit. Deps stay
+# root-owned: the serving process can import them but cannot rewrite them.
+RUN useradd --create-home --uid 10001 appuser
+ENV HOME=/home/appuser
+
+COPY . .
+EXPOSE 8080
+
+# /app stays root-owned and world-readable. The app only reads config.yaml and
+# static/, never writes to disk. PORT is 8080, bindable unprivileged.
+USER appuser
+CMD ["python", "main.py"]
+```
+
+No `COPY --chown` — that would make the app's own source writable by the uid
+that parses untrusted HTTP bodies. Prerequisite worth doing first: make
+`/health/ready` actually touch the credentials file, so the deploy gate can
+detect this class of failure at all.
+
+### 1.2b No `.dockerignore` — FIXED
+
+Found while scoping 1.2. The Dockerfile does `COPY . .` with no `.dockerignore`,
+so the entire repo root entered the image:
+
+- **`.env` and `credential.json`.** Both gitignored, so CI's clean checkout never
+  had them — but `CLAUDE.md:28` documents `docker build -t shopmonkey-scheduler .`
+  for local use, and a local build baked the live Shopmonkey API token and Google
+  service-account key into an image layer.
+- **The full git history.** The deploy job checks out with `fetch-depth: 0`, so
+  3.9M of `.git` shipped in every production image.
+- Locally also `.venv` (232M), `e2e/node_modules` (44M), `.omc` (1.6M).
+
+Fixed by adding `.dockerignore`. `tests/` is excluded too: it is imported only
+under `E2E_MODE` (main.py:459, 493), and the Cloud Run service does not set that
+variable — confirmed against the live service, which carries 12 env vars, none of
+them `E2E_MODE`.
 
 ### 1.3 Not actionable (noise)
 
@@ -130,17 +182,21 @@ what matters most — but a local venv on 3.12 would close the loop.
 
 ## 5. Suggested order
 
-1. **Rebuild the local venv on Python 3.12** — removes a whole class of
-   "passes locally, fails in CI" surprises. Cheap, no production risk.
-2. **`npm update @playwright/test`** in `e2e/` — already in range, no manifest
-   change needed.
-3. **`fastapi` and `uvicorn` ceilings** — raise and let the test suite judge.
-   Both are patch/minor moves within 0.x, so read the changelogs, but the blast
-   radius is contained and covered by 556 tests plus the E2E suite.
-4. **Non-root `USER` in the Dockerfile** — hardening, silences 1.2.
-5. **`structlog` 26** — its own change, changelog read first.
-6. **`@types/node` and `typescript` majors** — own change, `e2e/` only.
-7. **`httpx` → `httpx2`** — deliberately last. Wait for the package to mature.
+| # | item | status |
+| --- | --- | --- |
+| 1 | Local venv on Python 3.12 | **done** — rebuilt on 3.12.13 |
+| 2 | `@playwright/test` 1.62 | **done** — `7442d92`, lockfile only, e2e 37 passed |
+| 3 | `fastapi` + `uvicorn` ceilings | **done** — `fac6d53`, `1475ddc` |
+| 4 | Non-root `USER` | **held** — see 1.2; unverifiable here |
+| 4b | `.dockerignore` | **done** — see 1.2b |
+| 5 | `structlog` 26 | **done** — `fac6d53` |
+| 6 | `@types/node` / `typescript` majors | **declined** — see below |
+| 7 | `httpx` → `httpx2` | **held** — see 1.1 |
 
-Items 1–4 are low risk. 5–7 each deserve to be their own commit with their own
-verification.
+**Why 6 is a decline rather than a deferral.** TypeScript 7 removed
+`moduleResolution=node10`, which `e2e/tsconfig.json` sets, so `tsc` fails
+outright; and 7.0.2 ships `bin/tsc` with no `tsserver`, trading the workspace
+language service for a compiler no CI step invokes. Since nothing in CI runs
+`tsc`, a broken one would sit there green and unnoticed. `@types/node` 26 is
+mechanically clean but is the non-LTS Current line while CI installs Node 22,
+so it would aim the types away from the runtime.

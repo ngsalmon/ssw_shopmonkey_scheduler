@@ -1,0 +1,59 @@
+# Build context excludes. The Dockerfile does `COPY . .`, so without this file
+# everything in the repo root lands in the image.
+#
+# The one that matters: .env and credential.json are gitignored, so CI's clean
+# checkout never sees them - but CLAUDE.md documents `docker build .` for local
+# use, and a local build would bake real Shopmonkey and Google credentials into
+# an image layer.
+#
+# Keep in the context: main.py and the other runtime modules, config.yaml
+# (read at startup by main.py:445 and availability.py:47), static/, and
+# requirements.txt.
+
+# Secrets. Never in an image layer.
+.env
+.env.*
+credential*.json
+*credentials*.json
+
+# VCS. The deploy job checks out with fetch-depth: 0, so this is the entire
+# history - 3.9M of it - going into the production image for no reason.
+.git
+.gitignore
+.github
+
+# Local environments. Not used by the image (deps are installed inside it),
+# and the local venv alone is ~232M.
+.venv
+.venv.*
+**/node_modules
+__pycache__
+**/__pycache__
+*.py[cod]
+
+# Test and tooling artifacts.
+.pytest_cache
+.ruff_cache
+htmlcov
+.coverage
+playwright-report
+test-results
+
+# Not runtime code. tests/ is imported only under E2E_MODE (main.py:459,493),
+# which is not set on the Cloud Run service; scripts/ holds one-off API probes;
+# docs/ is prose. Nothing in runtime imports any of them.
+tests
+e2e
+scripts
+docs
+
+# Agent and editor state.
+.omc
+.playwright-mcp
+.claude
+.vscode
+.idea
+
+# Container files themselves.
+Dockerfile
+.dockerignore
