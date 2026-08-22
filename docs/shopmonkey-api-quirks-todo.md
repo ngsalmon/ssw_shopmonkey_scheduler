@@ -1,6 +1,6 @@
 # Shopmonkey API quirks — takeaways and TODO
 
-**Status:** P0 fixed 2026-08-22 in `36cd9c0`; doc corrections pending
+**Status:** P0 fixed 2026-08-22 in `36cd9c0`; P1 doc corrections applied 2026-08-22
 **Date:** 2026-08-21
 **Evidence:** `../shopmonkey-api-quirks` — reproduction tests 09–13, raw request
 logs under `evidence/`. Run with `pnpm test:all`.
@@ -106,7 +106,7 @@ and does not POST a new vehicle. That test fails against today's code.
 
 ---
 
-## P1 — Corrections to `docs/shopmonkey-api-query-grammar.md`
+## P1 (APPLIED) — Corrections to `docs/shopmonkey-api-query-grammar.md`
 
 The same file exists in `ssw_pl/docs/shopmonkey-api-query-grammar.md`; only the
 framing headers differ, so all three corrections apply to both copies.

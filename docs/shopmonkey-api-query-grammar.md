@@ -10,7 +10,7 @@ JSON Schema for **all 110 database models** (~231 KB).
 
 ```bash
 curl -s -H "Authorization: Bearer $SHOPMONKEY_API_TOKEN" \
-  https://api.shopmonkey.io/v3/schema
+  https://api.shopmonkey.cloud/v3/schema
 ```
 
 This is the real Postgres model, not a hand-written API doc:
@@ -26,16 +26,33 @@ appointment↔technician join table), `Labor`, `Service`, `Part`, and `Payment`.
 
 ## Filter grammar (`where`)
 
-**Honored:**
+The filter grammar is Prisma's `where` semantics. Saying that in one sentence
+documents the whole surface, and explains *why* the near-misses fail — `eq`,
+`ne` and `like` are correct almost everywhere else; Prisma spells them
+`equals`, `not` and `contains`. Verified honored/ignored sets:
 
-| Operator | Applies to | Example |
-| --- | --- | --- |
-| `gte`, `gt`, `lt`, `lte` | date/number fields | `{"startDate": {"lt": "...Z"}}` |
-| `contains` | string fields | `{"name": {"contains": "Ethan Out"}}` |
+| Honored | Silently ignored |
+| --- | --- |
+| bare scalar (shorthand for `equals`), `equals`, `not`, `in`, `notIn` | `eq`, `ne`, `neq`, `like`, `is` |
+| `gt`, `gte`, `lt`, `lte` | `$`-prefixed forms (`$eq`) |
+| `contains`, `startsWith`, `endsWith`, `mode: "insensitive"` | lowercase `and` |
+| `AND`, `OR`, `NOT` | unknown fields, relation filters, `deleted` |
 
-**Silently ignored** — these return the *entire unfiltered set* with no error:
-`eq`, `like`, `ne`, `neq`, and bare scalar values. `{"name": {"eq": "Ethan Out"}}`
-returns all 4768 rows. A bare `{"number": 8133}` returns HTTP 400.
+A **bare scalar is honored** — it is Prisma's shorthand for `equals`, not a
+dropped term: `{"name": "<a real name>"}` returns 1 of 4781,
+`{"firstName": ..., "lastName": ...}` returns 1 of 4645, and
+`{"bookable": true}` returns 21 of 194.
+
+Everything in the right-hand column returns the *entire unfiltered set* with
+HTTP 200 and no error. `{"name": {"eq": "Ethan Out"}}` returns all 4768 rows.
+
+Type mismatches are handled inconsistently, and only one of the two is loud. A
+**number** where a string is declared 400s: `Order.number` is `"type": "string"`
+in `/v3/schema`, so `{"number": 8133}` returns
+`Invalid filter value for field 'number': expected a string`, while
+`{"number": "8133"}` returns the 1 matching row. A **boolean** mismatch does
+not: `{"bookable": "true"}` returns 200 and the entire unfiltered table. The
+400 is a type error, not evidence that bare scalars are dropped.
 
 > **Always sanity-check a new filter against a row you know exists before trusting
 > a zero result.** A silently-dropped filter and a genuine zero look identical in
@@ -43,6 +60,10 @@ returns all 4768 rows. A bare `{"number": 8133}` returns HTTP 400.
 
 Unknown field names and unknown operators are also accepted and dropped without
 error.
+
+`startsWith` and `mode: "insensitive"` are capabilities we are not using — worth
+considering for the customer name lookup, which currently matches
+case-sensitively on the server and re-checks case-insensitively in memory.
 
 ## Pagination: `orderby` is lowercase, and camelCase `orderBy` is silently ignored
 
@@ -140,8 +161,14 @@ Supports a genuine filter grammar that the GET endpoint lacks — notably a
 }
 ```
 
-Note this endpoint wants `gte`/`lte`; it validates `limit` (`body/limit must be
-number`) but not `where`, so a malformed `where` degrades to returning everything.
+Note this endpoint wants `gte`/`lte`. It validates `limit` (`body/limit must be
+number`) but not `where`: `where` accepts a **fixed allowlist of fields and
+silently drops everything else**. Its own fields work — `customerId` narrows 4781
+to 8, an unmatchable one to 0, `startDate.gte` in the far future to 0 — but
+`name`, a real column that `GET /v3/appointment` filters on correctly, is
+discarded and returns all 4781 rows. Note also that dates go *inside* `where`
+here, while `search_replacement` requires top-level `dateMin`/`dateMax` and
+ignores `where`.
 
 ## Recurring appointments: use `search_replacement`
 
