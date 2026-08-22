@@ -1,5 +1,5 @@
 fastapi>=0.115,<0.142
-uvicorn[standard]>=0.32,<0.48
+uvicorn[standard]>=0.32,<0.53
 httpx>=0.28,<0.29
 pydantic>=2.10,<3
 google-api-python-client>=2.150,<3

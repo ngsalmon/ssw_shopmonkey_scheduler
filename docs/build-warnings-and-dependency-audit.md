@@ -77,7 +77,7 @@ Ranges in `requirements.txt` whose ceiling now sits below the published latest.
 | package | range | CI installs | latest | gap |
 | --- | --- | --- | --- | --- |
 | `fastapi` | `>=0.115,<0.142` | 0.141.1 | 0.141.1 | **current** |
-| `uvicorn[standard]` | `>=0.32,<0.48` | 0.47.0 | 0.52.4 | capped |
+| `uvicorn[standard]` | `>=0.32,<0.53` | 0.52.4 | 0.52.4 | **current** |
 | `structlog` | `>=26.1,<27` | 26.1.0 | 26.1.0 | **current** |
 | `httpx` | `>=0.28,<0.29` | 0.28.1 | 0.28.1 | at latest; see 1.1 |
 
