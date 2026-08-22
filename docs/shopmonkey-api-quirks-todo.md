@@ -1,6 +1,6 @@
 # Shopmonkey API quirks — takeaways and TODO
 
-**Status:** One production bug open (P0), doc corrections pending
+**Status:** P0 fixed 2026-08-22 in `36cd9c0`; doc corrections pending
 **Date:** 2026-08-21
 **Evidence:** `../shopmonkey-api-quirks` — reproduction tests 09–13, raw request
 logs under `evidence/`. Run with `pnpm test:all`.
@@ -17,11 +17,13 @@ reproduced by a test in the harness repo, against this account's real data.
 
 ---
 
-## P0 — `find_or_create_vehicle` attaches bookings to the wrong customer's vehicle
+## P0 (FIXED) — `find_or_create_vehicle` attached bookings to the wrong customer's vehicle
 
-> **Executable task:** [`vehicle-misattribution-todo.md`](vehicle-misattribution-todo.md)
-> has the patch, the tests to change and the verification steps, written to be
-> run cold. In Claude Code: `/fix-vehicle-misattribution`.
+> **Fixed** 2026-08-22 in `36cd9c0`: `customerId` is gone from the vehicle `where`
+> clause and ownership is matched in memory against `owners[]`. Kept below as the
+> record of the diagnosis. [`vehicle-misattribution-todo.md`](vehicle-misattribution-todo.md)
+> carries the patch that was applied, the tests that changed and the
+> verification steps.
 
 **Where:** `shopmonkey_client.py:621` `find_or_create_vehicle`, reached from
 `main.py:1152`; the resulting `vehicle_id` flows into order and appointment

@@ -25,11 +25,17 @@ test('widget content does not overflow viewport at mobile width @mobile', async 
   expect(bodyWidth).toBeLessThanOrEqual(widthCap + 1);
 });
 
-test('widget posts iframe height messages to the parent @mobile', async ({ page }) => {
+test('widget posts iframe height messages to the parent @mobile', async ({ page, baseURL }) => {
   // Stand up an embedding page in-memory that captures postMessage calls.
   // The widget sends { type: 'scheduler-resize', height: <px> } on every
   // significant content change (see widget.js:notifyParentHeight).
-  const port = new URL(page.url() || 'http://127.0.0.1:8081/').port || '8081';
+  // This test never navigates, so page.url() is still 'about:blank' and can
+  // never carry the server port (new URL('about:blank').port === ''). Derive
+  // the origin from the config's baseURL so the embed follows E2E_PORT.
+  // No literal fallback here on purpose: a hardcoded default is what silently
+  // pinned this test to 8081 in the first place.
+  if (!baseURL) throw new Error('baseURL must be set in playwright.config.ts');
+  const widgetOrigin = new URL(baseURL).origin;
   const embedHtml = `
     <!doctype html>
     <html><body style="margin:0;padding:0;">
@@ -39,7 +45,7 @@ test('widget posts iframe height messages to the parent @mobile', async ({ page 
           window.__messages.push(e.data);
         });
       </script>
-      <iframe id="f" src="http://127.0.0.1:${port}/" style="width:100%;height:600px;border:0;"></iframe>
+      <iframe id="f" src="${widgetOrigin}/" style="width:100%;height:600px;border:0;"></iframe>
     </body></html>
   `;
   await page.setContent(embedHtml);
