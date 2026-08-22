@@ -1,5 +1,6 @@
 """Unit tests for FastAPI endpoints using TestClient."""
 
+import asyncio
 import os
 import sys
 from contextlib import contextmanager
@@ -2105,6 +2106,104 @@ class TestReadinessProbe:
         data = response.json()
         assert data["sheets"] == "unhealthy"
         assert data["status"] == "degraded"
+
+    def test_healthy_probe_reports_no_detail(self, test_client):
+        """A stale detail on a healthy probe would have CI blame the wrong thing."""
+        data = test_client.get("/health/ready").json()
+        assert data["sheets_detail"] is None
+        assert data["shopmonkey_detail"] is None
+
+    def test_sheets_detail_carries_the_client_reason(self, test_client, mock_sheets_client):
+        """The deploy gate decides rollback from this string, so it must be the
+        client's own explanation - not a generic "unhealthy"."""
+        mock_sheets_client.health_check = AsyncMock(return_value=False)
+        mock_sheets_client.last_health_error = (
+            "FileNotFoundError: [Errno 2] No such file or directory: "
+            "'/secrets/google-credentials.json'"
+        )
+
+        response = test_client.get("/health/ready")
+
+        assert response.status_code == 503
+        data = response.json()
+        assert data["sheets"] == "unhealthy"
+        assert data["sheets_detail"] == mock_sheets_client.last_health_error
+
+    def test_shopmonkey_detail_carries_the_client_reason(self, test_client, mock_shopmonkey_client):
+        mock_shopmonkey_client.health_check = AsyncMock(return_value=False)
+        mock_shopmonkey_client.last_health_error = "ShopmonkeyAPIError (HTTP 401): unauthorized"
+
+        data = test_client.get("/health/ready").json()
+
+        assert data["shopmonkey_detail"] == "ShopmonkeyAPIError (HTTP 401): unauthorized"
+
+    def test_raised_exception_becomes_the_detail(self, test_client, mock_sheets_client):
+        mock_sheets_client.health_check = AsyncMock(side_effect=RuntimeError("no creds"))
+        data = test_client.get("/health/ready").json()
+        assert data["sheets_detail"] == "RuntimeError: no creds"
+
+    def test_non_string_reason_is_dropped_not_rendered(self, test_client, mock_sheets_client):
+        """A client whose `last_health_error` is not a string (an unconfigured
+        mock, a future client that forgets the attribute) must leave the field
+        empty rather than 500 the probe - a probe that crashes tells the deploy
+        gate nothing."""
+        mock_sheets_client.health_check = AsyncMock(return_value=False)
+        # Deliberately NOT setting last_health_error: MagicMock will invent a
+        # MagicMock for it.
+
+        response = test_client.get("/health/ready")
+
+        assert response.status_code == 503
+        assert response.json()["sheets_detail"] is None
+
+    def test_a_hung_dependency_fails_the_probe_instead_of_hanging(
+        self, test_client, mock_sheets_client
+    ):
+        """Shopmonkey retries timeouts five times with backoff; without a
+        ceiling the probe outlives the CI curl and the gate sees no body."""
+
+        async def never_returns():
+            # Seconds, not an hour: if the ceiling in `_probe_dependency` is
+            # ever removed this test must FAIL in five seconds, not hang until
+            # the CI job's own timeout. A test that detects a regression by
+            # never finishing is worse than no test.
+            await asyncio.sleep(5)
+
+        mock_sheets_client.health_check = AsyncMock(side_effect=never_returns)
+
+        with patch("main.READINESS_PROBE_TIMEOUT_SECONDS", 0.01):
+            response = test_client.get("/health/ready")
+
+        assert response.status_code == 503
+        data = response.json()
+        assert data["sheets"] == "unhealthy"
+        assert "timed out" in data["sheets_detail"]
+
+    def test_revision_is_reported_so_the_gate_can_check_what_answered(self, test_client):
+        """The deploy gate curls a domain. Without knowing which revision
+        replied it cannot tell a healthy new revision from a healthy old one."""
+        with patch.dict(os.environ, {"K_REVISION": "ssw-scheduler-00042-abc"}):
+            assert test_client.get("/health/ready").json()["revision"] == (
+                "ssw-scheduler-00042-abc"
+            )
+
+    def test_revision_is_null_off_cloud_run(self, test_client):
+        """K_REVISION is unset outside Cloud Run; the gate must read that as
+        "unknown" and skip the check, not as a mismatch that fails a deploy."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("K_REVISION", None)
+            assert test_client.get("/health/ready").json()["revision"] is None
+
+    def test_uninitialized_client_cannot_pass_the_gate(self, test_client):
+        """Startup can leave a client None (E2E wiring, a partial lifespan).
+        "unknown" must never read as healthy."""
+        with patch("main.sheets_client", None):
+            response = test_client.get("/health/ready")
+
+        assert response.status_code == 503
+        data = response.json()
+        assert data["sheets"] == "unknown"
+        assert data["sheets_detail"] == "client not initialized"
 
 
 class TestCorsOrigins:

@@ -1271,6 +1271,71 @@ class TestSheetsClientHealthCheck:
         assert await client.health_check() is False
         assert len(client._cache) == 0
 
+    @pytest.mark.asyncio
+    async def test_no_reason_recorded_before_any_check(self):
+        """Constructing a client must not need credentials, and must not
+        pretend a failure has already happened."""
+        from sheets_client import SheetsClient
+
+        client = SheetsClient(spreadsheet_id="test-id", credentials_path="/nope/missing.json")
+
+        assert client.last_health_error is None
+
+    @pytest.mark.asyncio
+    @patch("sheets_client.build")
+    async def test_records_why_the_credentials_failed(self, mock_build):
+        """The whole point of the deploy gate: an unmounted secret must be
+        distinguishable from a revoked service account or a 429."""
+        from sheets_client import SheetsClient
+
+        client = SheetsClient(
+            spreadsheet_id="test-id", credentials_path="/secrets/google-credentials.json"
+        )
+
+        with patch(
+            "sheets_client.service_account.Credentials.from_service_account_file",
+            side_effect=FileNotFoundError(
+                "[Errno 2] No such file or directory: '/secrets/google-credentials.json'"
+            ),
+        ):
+            assert await client.health_check() is False
+
+        assert client.last_health_error is not None
+        assert "FileNotFoundError" in client.last_health_error
+        assert "/secrets/google-credentials.json" in client.last_health_error
+
+    @pytest.mark.asyncio
+    @patch("sheets_client.service_account.Credentials.from_service_account_file")
+    @patch("sheets_client.build")
+    async def test_records_why_the_api_call_failed(self, mock_build, mock_creds):
+        from sheets_client import SheetsClient
+
+        service = _mock_sheet(mock_build, {"values": []})
+        _execute_mock(service).side_effect = RuntimeError("403 permission denied")
+        client = SheetsClient(spreadsheet_id="test-id", credentials_path="test.json")
+
+        assert await client.health_check() is False
+        assert client.last_health_error == "RuntimeError: 403 permission denied"
+
+    @pytest.mark.asyncio
+    @patch("sheets_client.service_account.Credentials.from_service_account_file")
+    @patch("sheets_client.build")
+    async def test_recovery_clears_the_recorded_reason(self, mock_build, mock_creds):
+        """A stale reason would have the deploy gate roll back on a dependency
+        that has already recovered."""
+        from sheets_client import SheetsClient
+
+        service = _mock_sheet(mock_build, {"values": [["Name"]]})
+        client = SheetsClient(spreadsheet_id="test-id", credentials_path="test.json")
+
+        _execute_mock(service).side_effect = RuntimeError("transient")
+        assert await client.health_check() is False
+        assert client.last_health_error is not None
+
+        _execute_mock(service).side_effect = None
+        assert await client.health_check() is True
+        assert client.last_health_error is None
+
 
 class TestSheetsClientAsyncWrappers:
     """The async wrappers must return the same results as their sync bodies."""

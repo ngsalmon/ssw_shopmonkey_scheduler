@@ -86,9 +86,16 @@ CMD ["python", "main.py"]
 ```
 
 No `COPY --chown` — that would make the app's own source writable by the uid
-that parses untrusted HTTP bodies. Prerequisite worth doing first: make
-`/health/ready` actually touch the credentials file, so the deploy gate can
-detect this class of failure at all.
+that parses untrusted HTTP bodies.
+
+**Correction (2026-08-22).** An earlier version of this section claimed the
+prerequisite was to make `/health/ready` touch the credentials file. That was
+wrong: it already did. `health_check()` (sheets_client.py:451) calls
+`_read_sheet(use_cache=False)`, which reaches `_get_service()` and forces the
+lazy credential load — a client pointed at a nonexistent path returns
+`FileNotFoundError` through the health check. The real gap was that the deploy
+gate curled `/health`, an unconditional 200 that touches nothing. Closed
+separately by pointing the gate at `/health/ready` and gating on the body.
 
 ### 1.2b No `.dockerignore` — FIXED
 

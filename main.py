@@ -635,6 +635,17 @@ class ReadinessResponse(BaseModel):
     shopmonkey: str
     sheets: str
     sheets_cache: dict | None = None
+    # Why a dependency is unhealthy, when the client could say. The deploy
+    # gate prints these on failure; without them a rollback is a guess.
+    shopmonkey_detail: str | None = None
+    sheets_detail: str | None = None
+    # Which Cloud Run revision answered. The deploy gate curls a domain, not a
+    # revision, so without this it cannot tell "the revision I just deployed is
+    # healthy" from "something older is still serving and is healthy" - and a
+    # gate that can pass on the previous revision is gating on the wrong thing.
+    # None off Cloud Run (K_REVISION unset), which callers must treat as
+    # "unknown", never as a mismatch.
+    revision: str | None = None
 
 
 LABEL_TO_DEPARTMENT: dict[str, str] = {}
@@ -1407,12 +1418,53 @@ async def schedule_page():
 
 
 # Health check endpoints
+
+# Ceiling on a single dependency probe. ShopmonkeyClient._request retries
+# timeouts five times with exponential backoff, so without this an upstream
+# outage can pin this handler - and the deploy gate waiting on it - for
+# minutes. A probe that hangs is indistinguishable from a probe that failed,
+# and the CI check needs a body to make a decision from.
+READINESS_PROBE_TIMEOUT_SECONDS = 20.0
+
+
+async def _probe_dependency(name: str, client: Any) -> tuple[str, str | None]:
+    """Run one dependency's health check. Returns (status, detail).
+
+    Never raises: reporting a broken dependency is the job, so becoming a 500
+    is a failure of the probe itself. `last_health_error` is read defensively -
+    a client that hands back a non-string (a bare mock, say) must not turn the
+    probe into a validation error.
+    """
+    if client is None:
+        return "unknown", "client not initialized"
+
+    try:
+        healthy = await asyncio.wait_for(
+            client.health_check(), timeout=READINESS_PROBE_TIMEOUT_SECONDS
+        )
+    except TimeoutError:
+        logger.warning("readiness_probe_timed_out", dependency=name)
+        return "unhealthy", f"timed out after {READINESS_PROBE_TIMEOUT_SECONDS:.0f}s"
+    except Exception as e:
+        logger.warning("readiness_probe_raised", dependency=name, error=str(e), exc_info=True)
+        return "unhealthy", f"{type(e).__name__}: {e}"
+
+    if healthy:
+        return "healthy", None
+
+    detail = getattr(client, "last_health_error", None)
+    return "unhealthy", detail if isinstance(detail, str) else None
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """
     Basic liveness probe for Cloud Run / Kubernetes.
 
-    Always returns 200 if the application is running.
+    Always returns 200 if the application is running. Deliberately touches no
+    dependency: a liveness probe that fails during a Shopmonkey outage would
+    have the platform restart perfectly good containers. Nothing may gate a
+    deploy on this endpoint - use /health/ready.
     """
     return HealthResponse(status="healthy")
 
@@ -1432,27 +1484,30 @@ async def readiness_check():
     """
     Readiness probe - checks if dependencies are available.
 
-    Use this for Kubernetes readiness probes. Returns 503 if
-    any critical dependency is unavailable.
+    Use this for Kubernetes readiness probes and for the CI deploy gate.
+    Returns 503 if any critical dependency is unavailable, with the body
+    still populated: the 503 alone conflates "this revision cannot read its
+    credentials" (roll back) with "Shopmonkey is having a moment" (do not),
+    so callers are expected to read the per-dependency fields.
+
+    Each probe performs a real call - for Sheets that is the read which forces
+    the lazy credential load - so a container that booted without its secret
+    mounted fails here, which is the only place it can be detected from
+    outside.
     """
-    shopmonkey_status = "unknown"
-    sheets_status = "unknown"
+    (shopmonkey_status, shopmonkey_detail), (sheets_status, sheets_detail) = await asyncio.gather(
+        _probe_dependency("shopmonkey", shopmonkey_client),
+        _probe_dependency("sheets", sheets_client),
+    )
+
+    # Reported whatever the sheets verdict is: on a failure, knowing whether a
+    # warm cache is still masking the outage for real traffic is the point.
     sheets_cache = None
-
-    if shopmonkey_client:
+    if sheets_client is not None:
         try:
-            shopmonkey_healthy = await shopmonkey_client.health_check()
-            shopmonkey_status = "healthy" if shopmonkey_healthy else "unhealthy"
-        except Exception:
-            shopmonkey_status = "unhealthy"
-
-    if sheets_client:
-        try:
-            sheets_healthy = await sheets_client.health_check()
-            sheets_status = "healthy" if sheets_healthy else "unhealthy"
             sheets_cache = sheets_client.get_cache_status()
         except Exception:
-            sheets_status = "unhealthy"
+            sheets_cache = None
 
     overall_status = (
         "healthy" if (shopmonkey_status == "healthy" and sheets_status == "healthy") else "degraded"
@@ -1463,9 +1518,19 @@ async def readiness_check():
         shopmonkey=shopmonkey_status,
         sheets=sheets_status,
         sheets_cache=sheets_cache,
+        shopmonkey_detail=shopmonkey_detail,
+        sheets_detail=sheets_detail,
+        revision=os.getenv("K_REVISION") or None,
     )
 
     if overall_status != "healthy":
+        logger.warning(
+            "readiness_probe_degraded",
+            shopmonkey=shopmonkey_status,
+            shopmonkey_detail=shopmonkey_detail,
+            sheets=sheets_status,
+            sheets_detail=sheets_detail,
+        )
         return JSONResponse(
             status_code=503,
             content=response.model_dump(),

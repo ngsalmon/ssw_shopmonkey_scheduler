@@ -278,6 +278,48 @@ class TestShopmonkeyClientMethods:
         with patch.object(client, "_get_client", return_value=mock_client):
             result = await client.health_check()
             assert result is False
+            assert "ShopmonkeyTimeoutError" in client.last_health_error
+
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_health_check_records_the_status_code(self):
+        """401 is a bad token in this revision (roll back); a 503 is Shopmonkey
+        (do not). The deploy gate cannot tell them apart without the code."""
+        client = ShopmonkeyClient(api_token="bad-token")
+
+        mock_response = MagicMock()
+        mock_response.status_code = 401
+        mock_response.text = "unauthorized"
+        mock_response.raise_for_status = MagicMock(
+            side_effect=httpx.HTTPStatusError("401", request=MagicMock(), response=mock_response)
+        )
+
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(return_value=mock_response)
+
+        with patch.object(client, "_get_client", return_value=mock_client):
+            assert await client.health_check() is False
+            assert "HTTP 401" in client.last_health_error
+
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_health_check_clears_a_stale_reason_on_recovery(self):
+        client = ShopmonkeyClient(api_token="test-token")
+        client.last_health_error = "ShopmonkeyTimeoutError: stale"
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"data": []}
+        mock_response.raise_for_status = MagicMock()
+
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(return_value=mock_response)
+
+        with patch.object(client, "_get_client", return_value=mock_client):
+            assert await client.health_check() is True
+            assert client.last_health_error is None
 
         await client.close()
 

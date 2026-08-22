@@ -105,6 +105,8 @@ class ShopmonkeyClient:
             raise ValueError("SHOPMONKEY_API_TOKEN is required")
 
         self._client: httpx.AsyncClient | None = None
+        # Why the last health check failed, verbatim, for the readiness probe.
+        self.last_health_error: str | None = None
         self._active_user_ids_cache: set[str] | None = None
         self._all_user_ids_cache: list[str] | None = None
         self._all_user_ids_cache_expiry: float = 0.0
@@ -826,13 +828,32 @@ class ShopmonkeyClient:
         """
         Perform a lightweight health check against the Shopmonkey API.
 
-        Returns True if the API is reachable, False otherwise.
+        Returns True if the API is reachable, False otherwise, and records the
+        reason on `last_health_error`.
+
+        The status code is the whole point of recording it: 401/403 is a bad
+        token baked into this revision and a rollback fixes it, while a timeout
+        or a 5xx is Shopmonkey being down and a rollback changes nothing. The
+        deploy gate cannot make that call from a bare False.
+
+        `ShopmonkeyTimeoutError`, `ShopmonkeyNetworkError` and
+        `ShopmonkeyRateLimitError` all subclass `ShopmonkeyAPIError`, so this
+        catches exactly what the previous tuple did.
         """
+        self.last_health_error = None
         try:
             # Try to list users with a limit of 1 as a lightweight check
             await self._request("GET", "/v3/user", params={"limit": "1"})
             return True
-        except (ShopmonkeyAPIError, ShopmonkeyTimeoutError, ShopmonkeyNetworkError):
+        except ShopmonkeyAPIError as e:
+            status = f" (HTTP {e.status_code})" if e.status_code else ""
+            self.last_health_error = f"{type(e).__name__}{status}: {e}"
+            logger.warning(
+                "shopmonkey_health_check_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+                status_code=e.status_code,
+            )
             return False
 
     async def get_appointment(self, appointment_id: str) -> dict[str, Any] | None:

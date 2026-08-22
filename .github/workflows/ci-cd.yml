@@ -136,29 +136,145 @@ jobs:
           echo "prev_sha=$PREV_SHA" >> $GITHUB_OUTPUT
 
       - name: Deploy to Cloud Run
+        id: deploy
         run: |
           gcloud run deploy $SERVICE_NAME \
             --image=${{ env.IMAGE_NAME }}:${{ github.sha }} \
             --region=$REGION \
             --quiet
 
+          # The health gate curls a domain, which resolves to whichever
+          # revision currently holds traffic. Recording the revision this
+          # deploy created lets the gate prove it probed the NEW code and not
+          # a still-serving older one. Best effort: if this comes back empty
+          # the gate skips the comparison rather than failing a good deploy.
+          NEW_REVISION=$(gcloud run services describe $SERVICE_NAME \
+            --region=$REGION \
+            --format='value(status.latestCreatedRevisionName)' 2>/dev/null || echo "")
+          echo "new_revision=$NEW_REVISION" >> $GITHUB_OUTPUT
+
       - name: Verify deployment health
         env:
           CURRENT_REVISION: ${{ steps.current.outputs.revision }}
+          NEW_REVISION: ${{ steps.deploy.outputs.new_revision }}
+          HEALTH_URL: https://scheduler.salmonspeedworx.com/health/ready
         run: |
+          # /health proves nothing: it is a static 200 that never touches
+          # Sheets or Shopmonkey, so a container that boots without its
+          # credentials mounted sails through it. /health/ready performs a real
+          # read against each dependency - and the Sheets read is what forces
+          # the lazy load of GOOGLE_APPLICATION_CREDENTIALS, so it is the only
+          # externally visible signal that the secret is actually readable.
+          #
+          # Gate on the body, not on the 503. The endpoint 503s if EITHER
+          # dependency is unhealthy, and the two deserve different answers:
+          # Sheets unhealthy is this revision's problem (its secret, its env)
+          # and rolling back fixes it, while Shopmonkey unhealthy is usually
+          # Shopmonkey - the previous revision holds the same token and calls
+          # the same API, so rolling back would discard a good deploy and fix
+          # nothing.
           sleep 10
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            https://scheduler.salmonspeedworx.com/health)
-          if [ "$HTTP_STATUS" != "200" ]; then
-            echo "::error::Health check failed (HTTP $HTTP_STATUS) — rolling back"
-            if [ -n "$CURRENT_REVISION" ]; then
-              gcloud run services update-traffic $SERVICE_NAME \
-                --region=$REGION \
-                --to-revisions="$CURRENT_REVISION"=100
+
+          ATTEMPTS=6
+          INTERVAL=10
+          WINDOW=$((ATTEMPTS * INTERVAL))
+          BODY=""
+          for attempt in $(seq 1 $ATTEMPTS); do
+            BODY=$(curl -sS --max-time 45 "$HEALTH_URL" || echo "")
+            STATUS=$(printf '%s' "$BODY" | jq -r '.status // empty' 2>/dev/null || echo "")
+            SERVED=$(printf '%s' "$BODY" | jq -r '.revision // empty' 2>/dev/null || echo "")
+            if [ "$STATUS" = "healthy" ]; then
+              # A healthy answer from the PREVIOUS revision is not a pass:
+              # traffic migration is not instant and a CDN sits in front, so
+              # without this the gate can green-light code it never probed.
+              # Skipped when either side is unknown - never fail on ignorance.
+              if [ -n "$NEW_REVISION" ] && [ -n "$SERVED" ] && [ "$SERVED" != "$NEW_REVISION" ]; then
+                echo "Attempt $attempt/$ATTEMPTS: healthy, but '$SERVED' answered, not '$NEW_REVISION' - still migrating"
+              else
+                echo "Readiness probe healthy on attempt $attempt/$ATTEMPTS (revision: ${SERVED:-unknown})"
+                exit 0
+              fi
+            fi
+            echo "Attempt $attempt/$ATTEMPTS not ready: ${BODY:-<no response>}"
+            # Retries, not a single shot: a transient 429 or a cold start must
+            # not roll back a healthy deploy. A missing credential never heals.
+            if [ "$attempt" -lt "$ATTEMPTS" ]; then sleep "$INTERVAL"; fi
+          done
+
+          echo "::group::Final /health/ready body"
+          printf '%s\n' "${BODY:-<no response>}"
+          echo "::endgroup::"
+
+          field() {
+            local value
+            value=$(printf '%s' "$BODY" | jq -r "$1 // empty" 2>/dev/null || true)
+            if [ -n "$value" ]; then printf '%s' "$value"; else printf '%s' "$2"; fi
+          }
+          SHEETS=$(field .sheets unreachable)
+          SHOPMONKEY=$(field .shopmonkey unreachable)
+          SHEETS_DETAIL=$(field .sheets_detail "no detail reported")
+          SHOPMONKEY_DETAIL=$(field .shopmonkey_detail "no detail reported")
+          SERVED_REVISION=$(field .revision unknown)
+
+          # No parseable body at all means the service did not answer. That is
+          # a deploy failure, and the previous revision did answer, so it is
+          # also the one case where rolling back is unambiguously right - but
+          # say so honestly instead of pinning it on Sheets.
+          if [ "$SHEETS" = "unreachable" ] && [ "$SHOPMONKEY" = "unreachable" ]; then
+            echo "::error::No readable /health/ready response after ${WINDOW}s - the service is not answering."
+          fi
+
+          if [ "$SHEETS" != "healthy" ]; then
+            echo "::error::Sheets dependency is '$SHEETS' after ${WINDOW}s: $SHEETS_DETAIL"
+
+            # A rate limit, a 5xx from Google or a slow probe is not this
+            # revision's fault, and the previous revision reads the same
+            # spreadsheet with the same service account - rolling back cannot
+            # fix it and throws away a good deploy. A missing or rejected
+            # credential never matches these, so the case this gate exists for
+            # still rolls back.
+            if printf '%s' "$SHEETS_DETAIL" | grep -qiE '429|rate.?limit|quota|timed out|timeout|HttpError 5[0-9][0-9]|ServiceUnavailable|InternalError'; then
+              echo "::error::NOT rolling back: that reads as transient on Google's side, not as a bad revision. Re-run once Sheets recovers."
+              echo "ROLLED_BACK=false" >> "$GITHUB_ENV"
+              exit 1
+            fi
+
+            # ROLLED_BACK is written only once the rollback has actually
+            # succeeded. Telling Slack "rolled back" while the broken revision
+            # is still serving is worse than saying nothing at all: it reports
+            # production as recovered when it is not.
+            if [ -z "$CURRENT_REVISION" ]; then
+              echo "::error::No previous revision recorded - the bad revision is STILL LIVE. Roll back by hand."
+              echo "ROLLED_BACK=false" >> "$GITHUB_ENV"
+              exit 1
+            fi
+
+            if gcloud run services update-traffic $SERVICE_NAME \
+                 --region=$REGION \
+                 --to-revisions="$CURRENT_REVISION"=100; then
+              echo "Rolled traffic back to $CURRENT_REVISION"
+              echo "ROLLED_BACK=true" >> "$GITHUB_ENV"
+            else
+              echo "::error::Rollback to $CURRENT_REVISION FAILED - the bad revision is STILL LIVE. Intervene now."
+              echo "ROLLED_BACK=false" >> "$GITHUB_ENV"
             fi
             exit 1
           fi
-          echo "Health check passed (HTTP $HTTP_STATUS)"
+
+          if [ "$SHOPMONKEY" != "healthy" ]; then
+            echo "::error::Shopmonkey dependency is '$SHOPMONKEY' after ${WINDOW}s: $SHOPMONKEY_DETAIL"
+            echo "::error::NOT rolling back: the previous revision uses the same API and the same token, so a rollback cannot fix an upstream outage. If the detail above says HTTP 401 or 403, the token in this revision is wrong - roll back by hand."
+            echo "ROLLED_BACK=false" >> "$GITHUB_ENV"
+            exit 1
+          fi
+
+          # Both dependencies read healthy, so we are here because the new
+          # revision never took traffic within the window. Rolling back to the
+          # revision that is already serving would be a no-op dressed up as a
+          # recovery.
+          echo "::error::Deploy never took traffic: '$SERVED_REVISION' is still serving, expected '$NEW_REVISION'. The new revision was never verified - investigate before re-running."
+          echo "ROLLED_BACK=false" >> "$GITHUB_ENV"
+          exit 1
 
       - name: Notify Slack
         if: success()
@@ -245,8 +361,19 @@ jobs:
           if [ -z "$SLACK_WEBHOOK_URL" ]; then exit 0; fi
           SHORT_SHA=$(echo "$GITHUB_SHA" | cut -c1-7)
 
+          # ROLLED_BACK is set by the health-check step. Saying "rolled back"
+          # when the new revision is still live is worse than saying nothing:
+          # it tells whoever reads Slack that production is back to a known
+          # good state when it is not.
+          case "${ROLLED_BACK:-}" in
+            true)  HEADER="SSW Scheduler — Deploy FAILED (rolled back)" ;;
+            false) HEADER="SSW Scheduler — Deploy FAILED (NOT rolled back, new revision is live)" ;;
+            *)     HEADER="SSW Scheduler — Deploy FAILED" ;;
+          esac
+
           jq -n \
             --arg short_sha "$SHORT_SHA" \
+            --arg header "$HEADER" \
             --arg sha_url "https://github.com/${GITHUB_REPO}/commit/${GITHUB_SHA}" \
             --arg actor "$GITHUB_ACTOR" \
             --arg run_url "https://github.com/${GITHUB_REPO}/actions/runs/${GITHUB_RUN_ID}" \
@@ -254,7 +381,7 @@ jobs:
               "blocks": [
                 {
                   "type": "header",
-                  "text": { "type": "plain_text", "text": "SSW Scheduler \u2014 Deploy FAILED (rolled back)" }
+                  "text": { "type": "plain_text", "text": $header }
                 },
                 {
                   "type": "section",

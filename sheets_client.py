@@ -49,6 +49,9 @@ class SheetsClient:
 
         self._service = None
         self._cache_ttl = cache_ttl
+        # Why the last health check failed, verbatim, for the readiness probe
+        # to report. None means "no failure since the last check".
+        self.last_health_error: str | None = None
         # Cache for sheet data: key -> (data, expiry_time)
         self._cache: TTLCache = TTLCache(maxsize=100, ttl=cache_ttl)
 
@@ -452,14 +455,35 @@ class SheetsClient:
         """
         Perform a lightweight health check against the Google Sheets API.
 
-        Returns True if the sheet is accessible, False otherwise.
+        Returns True if the sheet is accessible, False otherwise, and records
+        the reason on `last_health_error`.
+
+        The broad `except` stays deliberately - a readiness probe must report a
+        dead dependency, not become a 500 - but it no longer throws the reason
+        away. Credentials are loaded lazily by `_get_service()` on the first
+        read, so this call is the first thing in a fresh container to touch
+        GOOGLE_APPLICATION_CREDENTIALS: an unmounted secret surfaces here and
+        nowhere else. A bare `return False` reported that identically to a
+        revoked service account, a wrong spreadsheet id, and a 429 - which is
+        exactly the information the deploy gate needs to tell "roll this
+        revision back" from "wait for Google".
         """
+        self.last_health_error = None
         try:
             # Try to read just the header row
             range_name = f"'{self.TECH_DEPARTMENTS_TAB}'!A1:A1"
             await self._read_sheet(range_name, use_cache=False)
             return True
-        except Exception:
+        except Exception as e:
+            self.last_health_error = f"{type(e).__name__}: {e}"
+            logger.warning(
+                "sheets_health_check_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+                spreadsheet_id=self.spreadsheet_id,
+                credentials_path=self.credentials_path,
+                exc_info=True,
+            )
             return False
 
     def get_cache_status(self) -> dict:
