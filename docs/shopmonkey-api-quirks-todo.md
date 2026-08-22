@@ -201,10 +201,22 @@ parameter or add a startup assertion that the configured id is in
 
 ---
 
-## Cross-repo: `ssw_pl` ETL is running the broken sort form
+## Cross-repo: `ssw_pl` ETL — STALE, already fixed there
 
-Not this repo's code, but it came out of the same investigation and someone
-should carry it over.
+**This section is out of date as of 2026-08-22.** The lowercase fix landed in
+`ssw_pl` in `04a284d`: `getOrdersWithOrderBy` no longer exists, and
+`getOrders`/`getCustomers`/`getVehicles`/`getVendors`/`getUsers` all send
+lowercase `orderby` through `ShopmonkeyClient.orderbyParam`, which serialises a
+JSON object. The misleading comments described below are gone too. Verified by
+reading that repo at `f0a58e2`; do not "fix" the client there.
+
+What survives is the caveat below about completeness: `syncOrdersWithMultiPass`
+and the bail-after-N safety nets were removed on the strength of a repeatability
+probe, never measured against the `POST /v3/export` dump. That measurement is
+still owed, and is now tracked as an executable task at
+`ssw_pl/docs/shopmonkey-sort-completeness-todo.md`.
+
+The original note, kept for the record:
 
 `ssw_pl/backend/src/integrations/shopmonkey.ts:839` `getOrdersWithOrderBy` sends
 camelCase `orderBy` with a **string** value (`'updatedDate:desc'`). Both halves
