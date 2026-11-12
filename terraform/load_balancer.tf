@@ -72,23 +72,72 @@ resource "google_compute_url_map" "scheduler" {
   }
 }
 
-# Managed SSL certificate
-resource "google_compute_managed_ssl_certificate" "scheduler" {
-  name = "scheduler-ssl-cert-v2"
+# TLS certificate: Certificate Manager with DNS authorization.
+#
+# scheduler/api DNS is proxied through Cloudflare, so a classic
+# google_compute_managed_ssl_certificate can never renew (Google's load-balancer
+# validation sees Cloudflare's IPs: FAILED_NOT_VISIBLE). The old
+# scheduler-ssl-cert-v2 expired 2026-08-09 for exactly this reason.
+# DNS authorization proves ownership with an _acme-challenge CNAME instead, so
+# the cert renews while proxied. The CNAMEs live in Cloudflare (DNS-only):
+#   _acme-challenge.scheduler.salmonspeedworx.com -> <scheduler-dns-auth record>
+#   _acme-challenge.api.salmonspeedworx.com       -> <api-dns-auth record>
+# (`gcloud certificate-manager dns-authorizations list --project shopmonkey-scheduler`)
+#
+# NOTE: created with gcloud on 2026-11-12. The GCS state bucket in main.tf does
+# not exist; this infrastructure is not under Terraform state. Import before
+# any apply.
+resource "google_project_service" "certificatemanager" {
+  service = "certificatemanager.googleapis.com"
+}
 
+resource "google_certificate_manager_dns_authorization" "scheduler" {
+  name   = "scheduler-dns-auth"
+  domain = "scheduler.salmonspeedworx.com"
+}
+
+resource "google_certificate_manager_dns_authorization" "api" {
+  name   = "api-dns-auth"
+  domain = "api.salmonspeedworx.com"
+}
+
+resource "google_certificate_manager_certificate" "scheduler" {
+  name = "scheduler-api-cert"
   managed {
     domains = [
       "scheduler.salmonspeedworx.com",
-      "api.salmonspeedworx.com"
+      "api.salmonspeedworx.com",
+    ]
+    dns_authorizations = [
+      google_certificate_manager_dns_authorization.scheduler.id,
+      google_certificate_manager_dns_authorization.api.id,
     ]
   }
 }
 
+resource "google_certificate_manager_certificate_map" "scheduler" {
+  name = "scheduler-cert-map"
+}
+
+resource "google_certificate_manager_certificate_map_entry" "scheduler" {
+  name         = "scheduler-entry"
+  map          = google_certificate_manager_certificate_map.scheduler.name
+  hostname     = "scheduler.salmonspeedworx.com"
+  certificates = [google_certificate_manager_certificate.scheduler.id]
+}
+
+resource "google_certificate_manager_certificate_map_entry" "api" {
+  name         = "api-entry"
+  map          = google_certificate_manager_certificate_map.scheduler.name
+  hostname     = "api.salmonspeedworx.com"
+  certificates = [google_certificate_manager_certificate.scheduler.id]
+}
+
 # HTTPS proxy
 resource "google_compute_target_https_proxy" "scheduler" {
-  name             = "scheduler-https-proxy"
-  url_map          = google_compute_url_map.scheduler.id
-  ssl_certificates = [google_compute_managed_ssl_certificate.scheduler.id]
+  name            = "scheduler-https-proxy"
+  url_map         = google_compute_url_map.scheduler.id
+  certificate_map = "//certificatemanager.googleapis.com/${google_certificate_manager_certificate_map.scheduler.id}"
 }
 
 # HTTPS forwarding rule

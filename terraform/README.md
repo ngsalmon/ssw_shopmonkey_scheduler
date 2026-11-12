@@ -17,7 +17,7 @@ This directory contains Terraform configuration for the Shopmonkey Scheduler inf
 - **Artifact Registry**: Docker image repository
 - **Secret Manager**: API tokens and credentials
 - **Load Balancer**: HTTPS frontend with custom domains
-- **SSL Certificate**: Managed certificates for custom domains
+- **SSL Certificate**: Certificate Manager cert with DNS authorization (`_acme-challenge` CNAMEs in Cloudflare), so it renews while DNS is proxied. **State warning:** the GCS state bucket does not exist; this infrastructure was created by hand and with gcloud. Import resources before running `terraform apply`.
 - **Workload Identity**: GitHub Actions authentication
 
 ## Usage
