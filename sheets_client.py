@@ -4,15 +4,21 @@ import asyncio
 import os
 from functools import lru_cache
 
+import httplib2
 import structlog
 from cachetools import TTLCache
 from google.oauth2 import service_account
+from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.discovery import build
 
 logger = structlog.get_logger(__name__)
 
 # Default cache TTL in seconds (5 minutes)
 DEFAULT_CACHE_TTL = 300
+
+# Per-request socket timeout and retry count for Sheets reads.
+SHEETS_HTTP_TIMEOUT = 15
+SHEETS_NUM_RETRIES = 3
 
 
 class SheetsClient:
@@ -48,6 +54,7 @@ class SheetsClient:
             raise ValueError("GOOGLE_SHEETS_ID is required")
 
         self._service = None
+        self._credentials = None
         self._cache_ttl = cache_ttl
         # Why the last health check failed, verbatim, for the readiness probe
         # to report. None means "no failure since the last check".
@@ -74,8 +81,22 @@ class SheetsClient:
 
                 credentials, _ = default(scopes=["https://www.googleapis.com/auth/spreadsheets"])
 
-            self._service = build("sheets", "v4", credentials=credentials)
+            self._credentials = credentials
+            self._service = build("sheets", "v4", credentials=credentials, cache_discovery=False)
         return self._service
+
+    def _new_http(self) -> AuthorizedHttp:
+        """A fresh authorized HTTP transport for one request.
+
+        The service object built above shares a single httplib2.Http, which is
+        not thread-safe. Reads run in worker threads (asyncio.to_thread), so
+        concurrent /availability requests (the widget fetches several days at
+        once) shared one connection, and an idle connection Google had already
+        closed got reused. That surfaced as "[Errno 32] Broken pipe" and
+        "SSL: UNEXPECTED_EOF_WHILE_READING", which /availability turned into a
+        502. Google's documented fix is one Http per request/thread.
+        """
+        return AuthorizedHttp(self._credentials, http=httplib2.Http(timeout=SHEETS_HTTP_TIMEOUT))
 
     def _sync_read_sheet(self, range_name: str, use_cache: bool = True) -> list[list[str]]:
         """Synchronous implementation of sheet reading with caching."""
@@ -88,11 +109,13 @@ class SheetsClient:
 
         logger.debug("sheets_cache_miss", range_name=range_name)
         service = self._get_service()
+        # num_retries retries transient failures (connection resets, broken
+        # pipes, SSL EOF, 429/5xx) with exponential backoff.
         result = (
             service.spreadsheets()
             .values()
             .get(spreadsheetId=self.spreadsheet_id, range=range_name)
-            .execute()
+            .execute(http=self._new_http(), num_retries=SHEETS_NUM_RETRIES)
         )
         data = result.get("values", [])
 

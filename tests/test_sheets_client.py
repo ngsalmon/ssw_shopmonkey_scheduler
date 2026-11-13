@@ -1572,3 +1572,45 @@ class TestTechnicianNamedMaxIsNotASentinel:
         techs = client._sync_get_tech_departments()
 
         assert all(t["tech_name"].lower() != "max concurrency" for t in techs.values())
+
+
+class TestSheetsClientTransport:
+    """Each read gets its own HTTP transport and retries transient failures.
+
+    Regression: one shared httplib2.Http was used from worker threads, so
+    concurrent /availability requests hit "[Errno 32] Broken pipe" and
+    "SSL: UNEXPECTED_EOF_WHILE_READING" and returned 502 (2026-11-12).
+    """
+
+    @patch("sheets_client.service_account.Credentials.from_service_account_file")
+    @patch("sheets_client.build")
+    def test_execute_uses_fresh_http_and_retries(self, mock_build, mock_creds):
+        from sheets_client import SHEETS_NUM_RETRIES, SheetsClient
+
+        mock_service = _mock_sheet(mock_build, {"values": [["h"], ["row"]]})
+        client = SheetsClient(spreadsheet_id="test-id", credentials_path="test.json")
+
+        client._sync_read_sheet("'Tab'!A:B", use_cache=False)
+        client._sync_read_sheet("'Tab'!A:B", use_cache=False)
+
+        calls = _execute_mock(mock_service).call_args_list
+        assert len(calls) == 2
+        for call in calls:
+            assert call.kwargs["num_retries"] == SHEETS_NUM_RETRIES
+            assert call.kwargs["http"] is not None
+        # A new transport per request, never a shared one.
+        assert calls[0].kwargs["http"] is not calls[1].kwargs["http"]
+        assert calls[0].kwargs["http"].http is not calls[1].kwargs["http"].http
+
+    @patch("sheets_client.service_account.Credentials.from_service_account_file")
+    @patch("sheets_client.build")
+    def test_service_built_once_without_discovery_cache(self, mock_build, mock_creds):
+        from sheets_client import SheetsClient
+
+        _mock_sheet(mock_build, {"values": []})
+        client = SheetsClient(spreadsheet_id="test-id", credentials_path="test.json")
+        client._sync_read_sheet("'A'!A:B", use_cache=False)
+        client._sync_read_sheet("'B'!A:B", use_cache=False)
+
+        assert mock_build.call_count == 1
+        assert mock_build.call_args.kwargs["cache_discovery"] is False
